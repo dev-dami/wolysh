@@ -12,7 +12,7 @@ const prompt = @import("interactive/prompt.zig");
 
 const Shell = shellmod.Shell;
 
-const version_text = "wolysh 0.1.0\n";
+const version_text = "wolysh 0.2.0\n";
 
 const help_text =
     \\wsh — wolysh, a modern Unix shell
