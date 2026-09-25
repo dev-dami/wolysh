@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible problem with wolysh.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: wolysh version or commit
+      placeholder: Release tag or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Linux distribution and architecture
+      placeholder: Distribution/version, x86_64 or aarch64
+    validations:
+      required: true
+  - type: input
+    id: zig
+    attributes:
+      label: Zig version used to build
+      placeholder: Output of zig version
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the command or smallest script that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include relevant output. Remove secrets and personal data.
+    validations:
+      required: true

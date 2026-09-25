@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish Linux x86_64 release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Require a project license
+        run: test -s LICENSE
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run interactive tests
+        run: python3 tests/pty_test.py
+
+      - name: Package release archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          archive_name="wolysh-${RELEASE_TAG}-linux-x86_64"
+          stage="dist/${archive_name}"
+          mkdir -p "${stage}/examples"
+          install -m 0755 zig-out/bin/wsh "${stage}/wsh"
+          install -m 0644 README.md LICENSE "${stage}/"
+          install -m 0644 examples/config examples/demo.wsh "${stage}/examples/"
+          tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
+          sha256sum "dist/${archive_name}.tar.gz" > "dist/${archive_name}.tar.gz.sha256"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            "dist/wolysh-${RELEASE_TAG}-linux-x86_64.tar.gz" \
+            "dist/wolysh-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256" \
+            --generate-notes \
+            --verify-tag

@@ -1,0 +1,98 @@
+#!/usr/bin/env wsh
+#
+# A tour of the wolysh scripting language.
+#
+#     wsh examples/demo.wsh
+#     wsh examples/demo.wsh /tmp          # with a positional argument
+
+let root = "${1:-/tmp}"
+print "== variables =="
+print "root is $root, length ${#root}"
+
+let count = 4 * (10 + 2)
+print "4 * (10 + 2) = $count"
+
+let words = split("alpha,beta,gamma", ",")
+let joined = join(words, "/")
+print "split -> $words  (joined: $joined)"
+
+print ""
+print "== environment =="
+env DEMO_FLAG = "on"
+env DEMO_FLAG += "-again"
+print "DEMO_FLAG=$DEMO_FLAG"
+
+if env("DEMO_FLAG") == "on-again" {
+    print "env() reads it back"
+}
+
+print ""
+print "== conditionals =="
+if count > 100 {
+    print "big"
+} else if count > 10 {
+    print "medium"
+} else {
+    print "small"
+}
+
+let root_is_dir = is_dir(root)
+if exists(root) {
+    print "$root exists; is a directory: $root_is_dir"
+}
+
+print ""
+print "== loops =="
+let total = 0
+for n in 1 2 3 4 5 {
+    let total = total + n
+}
+print "sum of 1..5 is $total"
+
+let n = 0
+while n < 3 {
+    let n = n + 1
+    if n == 2 {
+        continue
+    }
+    print "iteration $n"
+}
+
+print ""
+print "== functions =="
+fn greet(who = "world") {
+    print "hello, $who"
+}
+greet
+greet dami
+
+fn is_big(x) {
+    if x > 100 {
+        return 0
+    }
+    return 1
+}
+
+if is_big(count) {
+    print "count is small"
+} else {
+    print "count is big"
+}
+
+print ""
+print "== globbing is just words =="
+let zig_files = 0
+for f in src/*.zig {
+    let zig_files = zig_files + 1
+}
+print "$zig_files zig source files"
+
+print ""
+print "== pipelines and status =="
+print "three lines" > /tmp/wsh-demo.txt
+print "as a file: $(wc -l < /tmp/wsh-demo.txt) line(s)"
+
+false || print "|| ran because the left side failed"
+true && print "&& ran because the left side succeeded"
+
+print "last status was $?"

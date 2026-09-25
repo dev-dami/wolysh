@@ -1,0 +1,8 @@
+zig-out/
+.zig-cache/
+zig-cache/
+wsh
+wsh-small
+*.o
+.commandcode/
+.DS_Store

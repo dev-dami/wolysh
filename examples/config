@@ -1,0 +1,63 @@
+# wolysh configuration
+#
+# This file is wsh source. It runs once at startup of an interactive shell
+# before the first prompt, so anything here can define functions, aliases,
+# variables and environment.
+
+# --- environment ------------------------------------------------------------
+
+env EDITOR = "hx"
+env PAGER = "less"
+
+if exists("/usr/local/bin") {
+    env PATH += ":/usr/local/bin"
+}
+
+# --- prompt -----------------------------------------------------------------
+#
+# Leave `prompt` empty for the built-in prompt:
+#     ~/projects main ❯
+#
+# Set it to override, with $variables and $(...) expanded:
+#
+# prompt = "$USER@$host $cwd ❯ "
+
+# Toggle the git branch in the built-in prompt.
+let git_prompt = true
+
+# --- interactive behaviour --------------------------------------------------
+
+# let autosuggest = true      # inline history suggestions
+# let highlight = true        # syntax highlighting
+# let completion = true       # tab completion
+
+# --- aliases ----------------------------------------------------------------
+
+alias ll = ls -lah
+alias gs = git status --short
+alias gd = git diff
+alias .. = cd ..
+
+# --- functions --------------------------------------------------------------
+
+fn mkcd(dir) {
+    mkdir -p $dir
+    cd $dir
+}
+
+fn gc(msg = "wip") {
+    git add -A
+    git commit -m $msg
+}
+
+fn up(n = 1) {
+    let step = 0
+    while step < n {
+        cd ..
+        let step = step + 1
+    }
+}
+
+# --- history ----------------------------------------------------------------
+
+let history_limit = 5000
