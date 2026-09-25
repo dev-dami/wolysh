@@ -1,6 +1,8 @@
+![Minimal sheep logo for wolysh](assets/sheep-logo.svg)
+
 # wolysh (`wsh`)
 
-**Familiar commands. Better scripts. One small Linux shell.**
+**A fast, readable Linux shell built to grow into a fish/Bash alternative.**
 
 wolysh combines everyday Linux commands with a readable scripting language.
 Commands stay commands; arithmetic, conditions, loops, and functions get their
@@ -19,6 +21,10 @@ The release archive includes the shell, examples, license, and checksum.
 - Run familiar commands, pipes, redirects, and globs.
 - Write scripts with expressions, `if`, loops, and functions.
 - Use built-in completion, syntax highlighting, history suggestions, and `Ctrl-R`.
+- Get typo suggestions with a Bloom-style prefilter; normal command lookup
+  skips fuzzy work.
+- Cache recent misses for fast inline corrections on the next attempt.
+- Use quick `la` and `lh` shortcuts for common `ls` options.
 - Manage foreground/background jobs with `Ctrl-Z`, `bg`, and `fg`.
 
 ```text

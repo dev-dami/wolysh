@@ -34,6 +34,8 @@ let git_prompt = true
 # --- aliases ----------------------------------------------------------------
 
 alias ll = ls -lah
+alias la = ls -A
+alias lh = ls -lh
 alias gs = git status --short
 alias gd = git diff
 alias .. = cd ..

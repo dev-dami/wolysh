@@ -76,7 +76,11 @@ split, and a quoted `"*"` remains literal. Comments start with `#`.
 ## Interactive shell
 
 The line editor provides syntax highlighting, history suggestions, tab
-completion for commands/paths/variables, and a git-aware prompt.
+completion for commands/paths/variables, typo suggestions for command names,
+and a git-aware prompt. Fuzzy matching uses a Bloom-style character filter
+before bounded edit-distance checks; regular command lookup does not run it.
+The shell caches up to 64 recent failed command names per session and can show
+their best correction inline; press Right to accept it.
 
 | Key | Action |
 | --- | --- |
@@ -91,7 +95,9 @@ completion for commands/paths/variables, and a git-aware prompt.
 `jobs`, `fg`, `bg`, and `wait` support `%1`, `%+`, and command prefixes.
 Foreground jobs receive the terminal and run in their own process groups.
 
-Builtins include `cd`, `pwd`, `echo`, `print`, `exit`, `export`, `unset`,
+Interactive shells define `la` as `ls -A` and `lh` as `ls -lh` by default;
+configuration can override either alias. Builtins include `cd`, `pwd`, `echo`,
+`print`, `exit`, `export`, `unset`,
 `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `history`, `read`, `test`,
 `source`, and `eval`. Other commands resolve through `PATH`.
 

@@ -15,6 +15,7 @@ const jobs = @import("jobs.zig");
 const history = @import("history.zig");
 const fs = @import("fs.zig");
 const proc = @import("proc.zig");
+const command_cache = @import("command_cache.zig");
 
 /// Runs `$(...)` and returns its stdout. Installed by `exec.zig`, which breaks
 /// the otherwise circular dependency between expansion and execution.
@@ -41,6 +42,7 @@ pub const Shell = struct {
 
     jobs: jobs.Table,
     hist: history.History,
+    command_cache: command_cache.Cache = .{},
 
     cwd: []u8,
     last_status: u8 = 0,
@@ -179,6 +181,7 @@ pub const Shell = struct {
 
         self.jobs.deinit(self.gpa);
         self.hist.deinit(self.gpa);
+        self.command_cache.deinit(self.gpa);
         if (self.cwd.len != 0) self.gpa.free(self.cwd);
         if (self.hostname.len != 0) self.gpa.free(self.hostname);
         if (self.history_path.len != 0) self.gpa.free(self.history_path);

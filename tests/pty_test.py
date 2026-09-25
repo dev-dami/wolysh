@@ -167,7 +167,42 @@ def main():
     s.send(b"\x15")  # Ctrl-U to clear the line
     s.drain(0.2)
 
-    # 5. file completion
+    # 5. typo completion and safe command-not-found suggestions
+    s.send("gti\t")
+    s.drain()
+    plain = strip_ansi(s.buf)
+    check("tab corrects a transposed command name", b"git " in plain, repr(plain[-200:]))
+    s.send(b"\x15")
+    s.drain(0.2)
+    s.clear()
+    s.send("gti\r")
+    check(
+        "unknown command suggests the likely command",
+        s.read_until(b"did you mean: git"),
+        repr(strip_ansi(s.buf[-300:])),
+    )
+    s.clear()
+    s.read_until(b"\xe2\x9d\xaf")
+    s.send("gt")
+    s.drain()
+    plain = strip_ansi(s.buf)
+    check("cached correction appears while typing", b"gt  => git" in plain, repr(plain[-200:]))
+    s.send(b"\x1b[C")
+    s.drain()
+    plain = strip_ansi(s.buf)
+    check("Right accepts the cached command fix", plain.rstrip().endswith(b"git"), repr(plain[-200:]))
+    s.send(b"\x15")
+    s.drain(0.2)
+
+    # 6. common ls shortcuts are available by default
+    s.clear()
+    s.send("la\r")
+    check("la lists hidden files", s.read_until(b".gitignore"), repr(strip_ansi(s.buf[-300:])))
+    s.clear()
+    s.send("lh\r")
+    check("lh uses long human-readable listing", s.read_until(b"README.md"), repr(strip_ansi(s.buf[-300:])))
+
+    # 7. file completion
     s.clear()
     s.send("cat src/lex\t")
     s.drain()
@@ -176,16 +211,16 @@ def main():
     s.send(b"\x15")
     s.drain(0.2)
 
-    # 6. history via Up arrow
+    # 8. history via Up arrow
     s.clear()
     s.send(b"\x1b[A")
     s.drain()
     plain = strip_ansi(s.buf)
-    check("up arrow recalls history", b"echo interact" in plain or b"cat src/lex" in plain, repr(plain[-200:]))
+    check("up arrow recalls history", b"lh" in plain or b"echo interact" in plain or b"cat src/lex" in plain, repr(plain[-200:]))
     s.send(b"\x15")
     s.drain(0.2)
 
-    # 7. Ctrl-C abandons the line
+    # 9. Ctrl-C abandons the line
     s.clear()
     s.send("this should not run")
     s.drain(0.2)

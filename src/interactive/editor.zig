@@ -226,7 +226,12 @@ pub const Editor = struct {
             self.body.writer.writeAll(self.buf.items) catch {};
         }
 
-        const suggestion = self.currentSuggestion();
+        const correction = self.currentCachedCorrection();
+        var correction_text: [320]u8 = undefined;
+        const suggestion = if (correction) |name|
+            std.fmt.bufPrint(&correction_text, "  => {s}", .{name}) catch null
+        else
+            self.currentSuggestion();
         // All of this is measured in *display columns*, not bytes: the
         // highlighted body carries ANSI escapes and the prompt marker is a
         // multi-byte code point. Counting bytes parked the cursor far from the
@@ -407,11 +412,22 @@ pub const Editor = struct {
     }
 
     fn acceptSuggestionOrMoveRight(self: *Editor) void {
+        if (self.currentCachedCorrection()) |command| {
+            self.setLine(command);
+            return;
+        }
         if (self.currentSuggestion()) |remaining| {
             self.insertSlice(remaining);
             return;
         }
         self.moveRight();
+    }
+
+    fn currentCachedCorrection(self: *Editor) ?[]const u8 {
+        if (!self.sh.config.autosuggest or self.cursor != self.buf.items.len or self.buf.items.len == 0) return null;
+        if (self.hist_index != null) return null;
+        if (std.mem.indexOfAny(u8, self.buf.items, " \t|&;<>()/\\") != null) return null;
+        return self.sh.command_cache.correction(self.buf.items);
     }
 
     // --- completion ---------------------------------------------------------
@@ -644,6 +660,20 @@ test "autosuggestion comes from history" {
     try std.testing.expectEqualStrings("eckout main", ed.currentSuggestion().?);
     ed.acceptSuggestionOrMoveRight();
     try std.testing.expectEqualStrings("git checkout main", ed.buf.items);
+}
+
+test "cached command correction appears inline and Right accepts it" {
+    var sh = try Shell.initBare(std.testing.allocator);
+    defer sh.deinit();
+    try sh.command_cache.remember(sh.gpa, "gti", &.{.{ .name = "git", .distance = 1 }});
+
+    var ed = Editor.init(&sh, -1, -1);
+    defer ed.deinit();
+    ed.setLine("gt");
+
+    try std.testing.expectEqualStrings("git", ed.currentCachedCorrection().?);
+    ed.acceptSuggestionOrMoveRight();
+    try std.testing.expectEqualStrings("git", ed.buf.items);
 }
 
 test "history navigation stashes the in-progress line" {

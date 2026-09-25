@@ -12,6 +12,7 @@ const builtins = @import("builtins.zig");
 const proc = @import("proc.zig");
 const value = @import("value.zig");
 const fs = @import("fs.zig");
+const command_suggest = @import("command_suggest.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -899,9 +900,7 @@ fn runSingle(
 
 fn launchStage(sh: *Shell, arena: std.mem.Allocator, argv: []const []const u8, fds: Fds) Error!proc.Stage {
     const resolved = try proc.resolve(arena, argv[0], sh.pathEnv()) orelse {
-        var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "wsh: command not found: {s}\n", .{argv[0]}) catch return error.CommandNotFound;
-        sys.writeStr(sh.default_err, msg);
+        reportCommandNotFound(sh, arena, argv[0]);
         return error.CommandNotFound;
     };
 
@@ -995,10 +994,35 @@ fn dispatch(sh: *Shell, argv: []const []const u8) u8 {
 
     if (sh.getFunc(name)) |source| return callFunction(sh, name, source, argv);
 
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "wsh: command not found: {s}\n", .{name}) catch return 127;
-    sys.writeStr(sh.default_err, msg);
+    reportCommandNotFound(sh, sh.scratch(), name);
     return 127;
+}
+
+fn reportCommandNotFound(sh: *Shell, arena: std.mem.Allocator, name: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "wsh: command not found: {s}\n", .{name}) catch return;
+    sys.writeStr(sh.default_err, msg);
+
+    if (sh.command_cache.lookup(name)) |cached| {
+        printCommandSuggestions(sh, cached.matches);
+        return;
+    }
+
+    const matches = command_suggest.find(sh, arena, name) catch return;
+    if (sh.interactive) sh.command_cache.remember(sh.gpa, name, matches) catch {
+        sys.writeStr(sh.default_err, "wsh: unable to cache command suggestions\n");
+    };
+    printCommandSuggestions(sh, matches);
+}
+
+fn printCommandSuggestions(sh: *Shell, matches: []const command_suggest.Match) void {
+    if (matches.len == 0) return;
+    sys.writeStr(sh.default_err, "wsh: did you mean: ");
+    for (matches, 0..) |match, index| {
+        if (index != 0) sys.writeStr(sh.default_err, ", ");
+        sys.writeStr(sh.default_err, match.name);
+    }
+    sys.writeStr(sh.default_err, "?\n");
 }
 
 fn builtinSource(sh: *Shell, argv: []const []const u8) u8 {

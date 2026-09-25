@@ -213,6 +213,8 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
     takeControllingTerminal(sh);
 
     setupPaths(sh, gpa) catch {};
+    sh.setAlias("la", "ls -A") catch return 1;
+    sh.setAlias("lh", "ls -lh") catch return 1;
     if (!no_config) loadConfig(sh);
     loadHistory(sh);
 

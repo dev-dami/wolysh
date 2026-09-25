@@ -5,6 +5,7 @@ const linux = std.os.linux;
 const shellmod = @import("../shell.zig");
 const builtins = @import("../builtins.zig");
 const fs = @import("../fs.zig");
+const command_suggest = @import("../command_suggest.zig");
 
 const Shell = shellmod.Shell;
 
@@ -56,7 +57,16 @@ pub fn complete(sh: *Shell, arena: std.mem.Allocator, line: []const u8, cursor: 
     }
 
     if (isCommandPosition(line, start)) {
+        const command_count = items.items.len;
         try completeCommands(sh, arena, word, &items);
+        if (items.items.len == command_count and word.len >= 2 and std.mem.indexOfScalar(u8, word, '/') == null) {
+            if (sh.command_cache.lookup(word)) |cached| {
+                for (cached.matches) |match| try items.append(arena, try std.fmt.allocPrint(arena, "{s} ", .{match.name}));
+            } else {
+                const matches = try command_suggest.find(sh, arena, word);
+                for (matches) |match| try items.append(arena, try std.fmt.allocPrint(arena, "{s} ", .{match.name}));
+            }
+        }
     }
     try completePaths(sh, arena, word, &items);
 
