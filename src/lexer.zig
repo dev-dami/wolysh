@@ -6,7 +6,8 @@
 //! * `.word` mode — used for command words. A token runs from the start of a
 //!   word to the next unquoted whitespace or metacharacter, and quotes stay in
 //!   the token text because the expander interprets them later. `=`, `[`, `]`,
-//!   `(`, `+`, `-`, `*` and `/` are ordinary word characters here, so
+//!   embedded parentheses, `+`, `-`, `*` and `/` are ordinary word characters
+//!   here, so
 //!   `cargo build --target=x`, `*.rs` and `ls -la` all lex as single words.
 //!
 //! * `.expr` mode — used inside language constructs. Quotes become string
@@ -41,6 +42,7 @@ pub const Tag = enum {
     out,
     out_append,
     in,
+    here_doc,
     lbrace,
     rbrace,
 
@@ -71,7 +73,7 @@ pub const Tag = enum {
 
     pub fn isOperator(self: Tag) bool {
         return switch (self) {
-            .lparen, .rparen, .lbracket, .rbracket, .assign, .plus_assign, .minus_assign, .plus, .minus, .star, .slash, .percent, .eq, .ne, .lt, .le, .gt, .ge, .bang, .comma, .dot, .pipepipe, .ampamp, .amp, .pipe => true,
+            .lparen, .rparen, .lbracket, .rbracket, .assign, .plus_assign, .minus_assign, .plus, .minus, .star, .slash, .percent, .eq, .ne, .lt, .le, .gt, .ge, .bang, .comma, .dot, .here_doc, .pipepipe, .ampamp, .amp, .pipe => true,
             else => false,
         };
     }
@@ -86,6 +88,7 @@ pub const Token = struct {
     /// Brace depth *before* this token was lexed, so the parser can rewind a
     /// token in a different mode without double-counting braces.
     depth_before: u16,
+    group_depth_before: u16,
 };
 
 pub const State = struct {
@@ -93,6 +96,7 @@ pub const State = struct {
     line: usize,
     mode: Mode,
     depth: u16,
+    group_depth: u16,
 };
 
 fn isSpace(c: u8) bool {
@@ -125,13 +129,14 @@ pub const Lexer = struct {
     line: usize = 1,
     mode: Mode = .word,
     depth: u16 = 0,
+    group_depth: u16 = 0,
 
     pub fn init(src: []const u8) Lexer {
         return .{ .src = src };
     }
 
     pub fn save(self: *const Lexer) State {
-        return .{ .pos = self.pos, .line = self.line, .mode = self.mode, .depth = self.depth };
+        return .{ .pos = self.pos, .line = self.line, .mode = self.mode, .depth = self.depth, .group_depth = self.group_depth };
     }
 
     pub fn restore(self: *Lexer, s: State) void {
@@ -139,6 +144,7 @@ pub const Lexer = struct {
         self.line = s.line;
         self.mode = s.mode;
         self.depth = s.depth;
+        self.group_depth = s.group_depth;
     }
 
     fn tok(self: *Lexer, tag: Tag, start: usize, depth_before: u16) Token {
@@ -148,6 +154,7 @@ pub const Lexer = struct {
             .start = start,
             .line = self.line,
             .depth_before = depth_before,
+            .group_depth_before = self.group_depth,
         };
     }
 
@@ -158,7 +165,7 @@ pub const Lexer = struct {
         return isSpace(self.src[p - 1]) or self.src[p - 1] == '\n';
     }
 
-   /// Skips whitespace, line continuations and comments. Returns whether any
+    /// Skips whitespace, line continuations and comments. Returns whether any
     /// whitespace was crossed.
     fn skipTrivia(self: *Lexer) void {
         while (self.pos < self.src.len) {
@@ -227,6 +234,10 @@ pub const Lexer = struct {
             },
             '<' => {
                 self.pos += 1;
+                if (self.mode == .word and self.pos < self.src.len and self.src[self.pos] == '<') {
+                    self.pos += 1;
+                    return self.tok(.here_doc, start, depth_before);
+                }
                 if (self.pos < self.src.len and self.src[self.pos] == '=' and self.mode == .expr) {
                     self.pos += 1;
                     return self.tok(.le, start, depth_before);
@@ -300,10 +311,20 @@ pub const Lexer = struct {
             '(' => if (self.mode == .expr) {
                 self.pos += 1;
                 return self.tok(.lparen, start, depth_before);
+            } else {
+                self.pos += 1;
+                const token = self.tok(.lparen, start, depth_before);
+                self.group_depth += 1;
+                return token;
             },
             ')' => if (self.mode == .expr) {
                 self.pos += 1;
                 return self.tok(.rparen, start, depth_before);
+            } else {
+                self.pos += 1;
+                const token = self.tok(.rparen, start, depth_before);
+                if (self.group_depth > 0) self.group_depth -= 1;
+                return token;
             },
             '[' => if (self.mode == .expr) {
                 self.pos += 1;
@@ -410,6 +431,7 @@ pub const Lexer = struct {
             .start = start,
             .line = self.line,
             .depth_before = depth_before,
+            .group_depth_before = self.group_depth,
         };
     }
 
@@ -449,8 +471,20 @@ pub const Lexer = struct {
 
     /// Scans a bare command word, keeping quotes and escapes in the text.
     fn scanWord(self: *Lexer, start: usize, depth_before: u16) Token {
+        var embedded_parens: usize = 0;
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
+            if (self.group_depth > 0 and c == '(') {
+                embedded_parens += 1;
+                self.pos += 1;
+                continue;
+            }
+            if (c == ')' and self.group_depth > 0) {
+                if (embedded_parens == 0) break;
+                embedded_parens -= 1;
+                self.pos += 1;
+                continue;
+            }
             if (isSpace(c) or isStructural(c)) break;
             if (c == '\\') {
                 if (self.pos + 1 < self.src.len) {
@@ -503,6 +537,15 @@ test "structural operators" {
     try std.testing.expectEqual(Tag.semi, lx.next().tag);
     try std.testing.expectEqual(Tag.word, lx.next().tag);
     try std.testing.expectEqual(Tag.amp, lx.next().tag);
+}
+
+test "embedded parentheses do not close a command group" {
+    var lx = Lexer.init("(echo foo(bar))");
+    try std.testing.expectEqual(Tag.lparen, lx.next().tag);
+    try std.testing.expectEqualStrings("echo", lx.next().text);
+    try std.testing.expectEqualStrings("foo(bar)", lx.next().text);
+    try std.testing.expectEqual(Tag.rparen, lx.next().tag);
+    try std.testing.expectEqual(Tag.eof, lx.next().tag);
 }
 
 test "expression mode" {

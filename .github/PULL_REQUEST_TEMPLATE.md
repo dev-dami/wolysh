@@ -7,6 +7,7 @@
 - [ ] `zig build test`
 - [ ] `zig build -Doptimize=ReleaseFast`
 - [ ] `python3 tests/pty_test.py`
+- [ ] `python3 tests/shell_compat_test.py`
 
 ## Notes
 

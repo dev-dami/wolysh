@@ -67,11 +67,35 @@ example, use `let length = len("abc")`, not `print len("abc")`.
 $var  ${var}  ${#var}  ${var:-fallback}  ${var:+alt}
 $?  $$  $!  $0  $1  $2  $#
 $(command)  `command`  "quoted"  'literal'  ~  ~/path
-*  ?  [abc]  >  >>  <  2>  2>>  |  &&  ||  &  ;
+*  ?  [abc]  >  >>  <  2>  2>>  2>&1  <<WORD  |  &&  ||  &  ;
 ```
 
 Field splitting and globbing apply to unquoted expansions. `"$value"` does not
 split, and a quoted `"*"` remains literal. Comments start with `#`.
+
+Redirections apply from left to right, so `command 2>&1 >out.txt` sends stderr
+to the original stdout and stdout to the file. An unquoted here-document
+delimiter enables variable and command substitution; quoting any part of the
+delimiter keeps the body literal:
+
+```text
+cat <<EOF
+Hello, $USER
+EOF
+
+cat <<'EOF'
+The text $USER stays literal.
+EOF
+```
+
+Parenthesized command groups run in a child shell process. Variable, directory,
+and exit-state changes inside them do not affect the parent; groups can be
+pipeline stages:
+
+```text
+(cd /tmp; pwd)
+(printf 'hello\n') | wc -l
+```
 
 ## Interactive shell
 
@@ -109,7 +133,8 @@ See [`examples/config`](../examples/config) for a working example.
 
 ## Known limitations
 
-- No subshells, heredocs, `$((...))`, `2>&1`, or brace expansion.
+- No `$((...))` arithmetic expansion, tab-stripping `<<-` here-documents, or
+  brace expansion.
 - Aliases expand words only; use a function for pipelines or redirects.
 - The editor counts each Unicode code point as one column, so wide or combining
   characters may render imperfectly.

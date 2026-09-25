@@ -39,6 +39,13 @@ pub const Stage = struct {
     child_fn: ?*const fn (*anyopaque) noreturn = null,
     child_ctx: ?*anyopaque = null,
     stdio: Stdio = .{},
+    redirects: []const Redirection = &.{},
+};
+
+pub const Redirection = struct {
+    target: i32,
+    source: i32,
+    close_source: bool = false,
 };
 
 pub const LaunchOptions = struct {
@@ -153,13 +160,24 @@ fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, pgid: 
     if (pgid != 0) _ = linux.setpgid(0, pgid);
     resetSignals();
 
-    sys.dup2(fd_in, 0);
-    sys.dup2(fd_out, 1);
-    sys.dup2(stage.stdio.err, 2);
+    const saved_in = sys.duplicate(fd_in) orelse linux.exit(126);
+    const saved_out = sys.duplicate(fd_out) orelse linux.exit(126);
+    const saved_err = sys.duplicate(stage.stdio.err) orelse linux.exit(126);
+    sys.dup2(saved_in, 0);
+    sys.dup2(saved_out, 1);
+    sys.dup2(saved_err, 2);
+    sys.closeFd(saved_in);
+    sys.closeFd(saved_out);
+    sys.closeFd(saved_err);
 
     for (pipes) |fds| {
         _ = linux.close(fds[0]);
         _ = linux.close(fds[1]);
+    }
+
+    for (stage.redirects) |redirect| {
+        sys.dup2(redirect.source, redirect.target);
+        if (redirect.close_source) sys.closeFd(redirect.source);
     }
 
     if (stage.child_fn) |f| f(stage.child_ctx.?);
@@ -237,7 +255,13 @@ pub fn launch(arena: std.mem.Allocator, stages: []const Stage, options: LaunchOp
         _ = linux.close(p[1]);
     }
 
-    return .{ .pgid = if (pgid == 0) pids[0] else pgid, .pids = pids };
+    const process_group = if (pgid != 0)
+        pgid
+    else if (options.new_group)
+        pids[0]
+    else
+        (sys.getpgid(0) orelse pids[0]);
+    return .{ .pgid = process_group, .pids = pids };
 }
 
 pub fn signalProcess(pid: i32, sig: linux.SIG) void {

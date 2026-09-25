@@ -57,6 +57,12 @@ pub fn expandLiteral(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u
     return arena.dupe(u8, ex.buf.items);
 }
 
+pub fn expandHereDoc(sh: *shell.Shell, arena: std.mem.Allocator, body: []const u8) Error![]const u8 {
+    var ex = Expander{ .sh = sh, .arena = arena, .mode = .literal };
+    try ex.scanHereDoc(body);
+    return arena.dupe(u8, ex.buf.items);
+}
+
 /// Expands a whole command's words into a flat argument list.
 ///
 /// Arguments differ from the command name in one way: a bare identifier that
@@ -266,6 +272,39 @@ pub const Expander = struct {
             if (c == '\\' and i + 1 < content.len) {
                 switch (content[i + 1]) {
                     '$', '"', '\\', '`' => {
+                        try self.appendQuoted(content[i + 1 .. i + 2]);
+                        i += 2;
+                    },
+                    '\n' => i += 2,
+                    else => {
+                        try self.appendQuoted("\\");
+                        i += 1;
+                    },
+                }
+                continue;
+            }
+            if (c == '$') {
+                try self.scanDollar(content, &i, true);
+                continue;
+            }
+            if (c == '`') {
+                const end = std.mem.indexOfScalarPos(u8, content, i + 1, '`') orelse content.len;
+                try self.substitute(content[i + 1 .. end], true);
+                i = if (end < content.len) end + 1 else content.len;
+                continue;
+            }
+            try self.appendQuoted(content[i .. i + 1]);
+            i += 1;
+        }
+    }
+
+    fn scanHereDoc(self: *Expander, content: []const u8) Error!void {
+        var i: usize = 0;
+        while (i < content.len) {
+            const c = content[i];
+            if (c == '\\' and i + 1 < content.len) {
+                switch (content[i + 1]) {
+                    '$', '`', '\\' => {
                         try self.appendQuoted(content[i + 1 .. i + 2]);
                         i += 2;
                     },

@@ -12,10 +12,11 @@ From the repository root, run:
 zig build test
 zig build -Doptimize=ReleaseFast
 python3 tests/pty_test.py
+python3 tests/shell_compat_test.py
 ```
 
-The PTY tests expect the ReleaseFast binary at `zig-out/bin/wsh` by default. To
-test another binary, set `WSH=/absolute/path/to/wsh`.
+The test suites expect the ReleaseFast binary at `zig-out/bin/wsh` by default.
+To run the PTY tests against another binary, set `WSH=/absolute/path/to/wsh`.
 
 ## Pull requests
 

@@ -138,6 +138,23 @@ pub fn dup2(old: fd_t, new: fd_t) void {
     _ = linux.dup3(old, new, 0);
 }
 
+pub fn duplicate(fd: fd_t) ?fd_t {
+    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 3);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return @intCast(rc);
+}
+
+pub fn createAnonymousFile(bytes: []const u8) ?fd_t {
+    const rc = linux.memfd_create("wsh-heredoc", linux.MFD.CLOEXEC);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: fd_t = @intCast(rc);
+    if (writeAll(fd, bytes) != .ok or linux.errno(linux.lseek(fd, 0, linux.SEEK.SET)) != .SUCCESS) {
+        closeFd(fd);
+        return null;
+    }
+    return fd;
+}
+
 /// Both open helpers set `CLOEXEC`: a descriptor opened for one redirect must
 /// not leak into the other processes of a pipeline, where it would keep a pipe
 /// or file alive. `dup2` onto 0/1/2 clears the flag where it matters.
