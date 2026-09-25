@@ -49,7 +49,7 @@ jobs:
           install -m 0644 assets/terminal-session.png assets/benchmarks.svg assets/sheep-logo.png "${stage}/assets/"
           install -m 0644 docs/language.md "${stage}/docs/"
           tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
-          sha256sum "dist/${archive_name}.tar.gz" > "dist/${archive_name}.tar.gz.sha256"
+          (cd dist && sha256sum "${archive_name}.tar.gz" > "${archive_name}.tar.gz.sha256")
 
       - name: Publish GitHub release
         env:
