@@ -34,6 +34,9 @@ const help_text =
     \\  for f in src/*.rs { ... }
     \\  while n < 10 { let n = n + 1 }
     \\  fn build(mode = "debug") { cargo build --profile $mode }
+    \\  (cd /tmp; pwd)               run an isolated subshell
+    \\  command 2>&1 | grep error    merge stderr into stdout
+    \\  command <<EOF               read a here-document
     \\
 ;
 

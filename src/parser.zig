@@ -49,6 +49,7 @@ pub const Parser = struct {
     tok: lexer.Token,
     err_msg: []const u8 = "",
     err_tok: lexer.Token = undefined,
+    pending_heredocs: std.ArrayList(*ast.Redirect) = .empty,
 
     pub fn init(arena: std.mem.Allocator, src: []const u8) Parser {
         var lex = lexer.Lexer.init(src);
@@ -110,6 +111,7 @@ pub const Parser = struct {
         self.lex.pos = self.tok.start;
         self.lex.line = self.tok.line;
         self.lex.depth = self.tok.depth_before;
+        self.lex.group_depth = self.tok.group_depth_before;
         self.tok = self.lex.next();
     }
 
@@ -118,11 +120,17 @@ pub const Parser = struct {
     }
 
     fn parseStmtList(self: *Parser, out: *std.ArrayList(ast.Stmt)) Error!void {
+        const heredoc_baseline = self.pending_heredocs.items.len;
         while (true) {
             self.setMode(.word);
             self.skipSeparators();
-            if (self.tok.tag == .eof or self.tok.tag == .rbrace) break;
+            if (self.tok.tag == .eof or self.tok.tag == .rbrace or self.tok.tag == .rparen) break;
             try out.append(self.arena, try self.parseStmt());
+            if (self.tok.tag == .newline and self.pending_heredocs.items.len > heredoc_baseline) {
+                try self.consumePendingHereDocs(heredoc_baseline);
+            } else if (self.tok.tag == .eof and self.pending_heredocs.items.len > heredoc_baseline) {
+                return self.fail("expected a newline before the here-document body");
+            }
         }
     }
 
@@ -150,7 +158,11 @@ pub const Parser = struct {
                 }
             }
         }
-        return .{ .pipeline = try self.parseChain() };
+        return .{ .pipeline = try self.parseCommandChain() };
+    }
+
+    fn parseCommandChain(self: *Parser) Error!ast.Pipeline {
+        return self.parseChain();
     }
 
     // --- language constructs -------------------------------------------------
@@ -309,13 +321,13 @@ pub const Parser = struct {
         self.advance(); // `alias`
         if (self.tok.tag != .word or !isIdentifier(self.tok.text)) {
             self.restore(saved);
-            return .{ .pipeline = try self.parseChain() };
+            return .{ .pipeline = try self.parseCommandChain() };
         }
         const name = self.tok.text;
         self.advance();
         if (!isKeyword(self.tok, "=")) {
             self.restore(saved);
-            return .{ .pipeline = try self.parseChain() };
+            return .{ .pipeline = try self.parseCommandChain() };
         }
         self.advance();
         const value = std.mem.trim(u8, self.restOfLine(), " \t\r");
@@ -402,41 +414,174 @@ pub const Parser = struct {
         self.setMode(.word);
         var words: std.ArrayList(ast.Word) = .empty;
         var redirects: std.ArrayList(ast.Redirect) = .empty;
+        var last_word: ?lexer.Token = null;
+        var subshell: ?[]ast.Stmt = null;
 
         while (true) {
             switch (self.tok.tag) {
                 .word => {
+                    if (subshell != null) return self.fail("unexpected word after a subshell");
+                    last_word = self.tok;
                     try words.append(self.arena, self.tok.text);
                     self.advance();
                 },
-                .out, .out_append => {
-                    var kind: ast.RedirectKind = if (self.tok.tag == .out) .out else .out_append;
-                    if (words.items.len > 0 and eql(words.items[words.items.len - 1], "2")) {
-                        words.items.len -= 1;
-                        kind = if (self.tok.tag == .out) .err_out else .err_append;
+                .lparen => {
+                    if (subshell != null or words.items.len != 0 or redirects.items.len != 0) {
+                        return self.fail("a subshell must start a command");
                     }
                     self.advance();
+                    var stmts: std.ArrayList(ast.Stmt) = .empty;
+                    try self.parseStmtList(&stmts);
+                    if (self.tok.tag != .rparen) return self.fail("expected ')' to close the subshell");
+                    self.advance();
+                    subshell = try stmts.toOwnedSlice(self.arena);
+                },
+                .out, .out_append => {
+                    const op = self.tok.tag;
+                    var kind: ast.RedirectKind = if (op == .out) .out else .out_append;
+                    const adjacent_word = if (last_word) |word|
+                        word.start + word.text.len == self.tok.start
+                    else
+                        false;
+                    if (adjacent_word and words.items.len > 0 and
+                        (eql(words.items[words.items.len - 1], "2") or eql(words.items[words.items.len - 1], "1")))
+                    {
+                        const fd_word = words.items[words.items.len - 1];
+                        words.items.len -= 1;
+                        kind = if (eql(fd_word, "2"))
+                            (if (op == .out) .err_out else .err_append)
+                        else
+                            (if (op == .out) .out else .out_append);
+                    }
+                    last_word = null;
+                    self.advance();
+                    if (self.tok.tag == .amp) {
+                        self.advance();
+                        if (self.tok.tag != .word or self.tok.text.len != 1 or self.tok.text[0] < '0' or self.tok.text[0] > '2') {
+                            return self.fail("expected a file descriptor after '&'");
+                        }
+                        const dup_kind: ast.RedirectKind = if (kind == .err_out or kind == .err_append) .err_dup else .out_dup;
+                        try redirects.append(self.arena, .{ .kind = dup_kind, .target = self.tok.text });
+                        self.advance();
+                        continue;
+                    }
                     if (self.tok.tag != .word) return self.fail("expected a file name after the redirect");
                     try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text });
+                    last_word = null;
                     self.advance();
                 },
                 .in => {
+                    last_word = null;
                     self.advance();
                     if (self.tok.tag != .word) return self.fail("expected a file name after '<'");
                     try redirects.append(self.arena, .{ .kind = .in, .target = self.tok.text });
+                    last_word = null;
                     self.advance();
+                },
+                .here_doc => {
+                    self.advance();
+                    if (self.tok.tag != .word) return self.fail("expected a delimiter after '<<'");
+                    const delimiter = parseHereDocDelimiter(self.arena, self.tok.text) catch return self.fail("invalid here-document delimiter");
+                    try redirects.append(self.arena, .{
+                        .kind = .here_doc,
+                        .target = delimiter.text,
+                        .expand_body = delimiter.expand,
+                    });
+                    self.advance();
+                    last_word = null;
                 },
                 else => break,
             }
         }
 
-        if (words.items.len == 0 and redirects.items.len == 0) {
+        if (words.items.len == 0 and redirects.items.len == 0 and subshell == null) {
             return self.fail("expected a command");
         }
-        return .{
+        const command = ast.Command{
             .words = try words.toOwnedSlice(self.arena),
             .redirects = try redirects.toOwnedSlice(self.arena),
+            .subshell = subshell,
         };
+        for (command.redirects) |*redirect| {
+            if (redirect.kind == .here_doc) try self.pending_heredocs.append(self.arena, redirect);
+        }
+        return command;
+    }
+
+    const HereDocDelimiter = struct { text: []const u8, expand: bool };
+
+    fn parseHereDocDelimiter(arena: std.mem.Allocator, raw: []const u8) Error!HereDocDelimiter {
+        var text: std.ArrayList(u8) = .empty;
+        var quote: u8 = 0;
+        var expand = true;
+        var i: usize = 0;
+        while (i < raw.len) {
+            const c = raw[i];
+            if (c == '\\' and quote != '\'' and i + 1 < raw.len) {
+                const next = raw[i + 1];
+                if (next == '\n') {
+                    i += 2;
+                    continue;
+                }
+                if (quote != '"' or next == '$' or next == '`' or next == '"' or next == '\\') {
+                    expand = false;
+                    try text.append(arena, next);
+                    i += 2;
+                    continue;
+                }
+            }
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                } else {
+                    try text.append(arena, c);
+                }
+                i += 1;
+                continue;
+            }
+            if (c == '\'' or c == '"') {
+                quote = c;
+                expand = false;
+            } else {
+                try text.append(arena, c);
+            }
+            i += 1;
+        }
+        if (quote != 0) return error.SyntaxError;
+        return .{ .text = try text.toOwnedSlice(arena), .expand = expand };
+    }
+
+    fn consumePendingHereDocs(self: *Parser, first_pending: usize) Error!void {
+        if (self.tok.tag != .newline) return self.fail("expected a newline before the here-document body");
+
+        var cursor = self.lex.pos;
+        var line = self.lex.line;
+        for (self.pending_heredocs.items[first_pending..]) |redirect| {
+            const body_start = cursor;
+            var found = false;
+            while (cursor <= self.lex.src.len) {
+                const line_start = cursor;
+                const line_end = std.mem.indexOfScalarPos(u8, self.lex.src, cursor, '\n') orelse self.lex.src.len;
+                var current = self.lex.src[line_start..line_end];
+                if (current.len > 0 and current[current.len - 1] == '\r') current = current[0 .. current.len - 1];
+                if (std.mem.eql(u8, current, redirect.target)) {
+                    redirect.body = self.lex.src[body_start..line_start];
+                    cursor = if (line_end < self.lex.src.len) line_end + 1 else line_end;
+                    if (line_end < self.lex.src.len) line += 1;
+                    found = true;
+                    break;
+                }
+                if (line_end == self.lex.src.len) break;
+                cursor = line_end + 1;
+                line += 1;
+            }
+            if (!found) return self.fail("unterminated here-document");
+        }
+
+        self.lex.pos = cursor;
+        self.lex.line = line;
+        self.tok = self.lex.next();
+        self.pending_heredocs.items.len = first_pending;
     }
 
     // --- expressions --------------------------------------------------------
@@ -714,6 +859,92 @@ test "parse background and redirects" {
     const prog = try p.parseProgram();
     try std.testing.expect(prog.stmts[0].pipeline.background);
     try std.testing.expectEqual(ast.RedirectKind.err_out, prog.stmts[1].pipeline.commands[0].redirects[0].kind);
+}
+
+test "parse ordered file descriptor duplication" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "echo hi 2>&1 > out.txt");
+    const prog = try p.parseProgram();
+    const redirects = prog.stmts[0].pipeline.commands[0].redirects;
+    try std.testing.expectEqual(@as(usize, 2), redirects.len);
+    try std.testing.expectEqual(ast.RedirectKind.err_dup, redirects[0].kind);
+    try std.testing.expectEqualStrings("1", redirects[0].target);
+    try std.testing.expectEqual(ast.RedirectKind.out, redirects[1].kind);
+    try std.testing.expectEqualStrings("out.txt", redirects[1].target);
+}
+
+test "parse here-document body and quoted delimiter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\cat <<EOF
+        \\body $value
+        \\EOF
+        \\cat <<'LITERAL'
+        \\$value
+        \\LITERAL
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), prog.stmts.len);
+    const expanded = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expectEqual(ast.RedirectKind.here_doc, expanded.kind);
+    try std.testing.expect(expanded.expand_body);
+    try std.testing.expectEqualStrings("body $value\n", expanded.body);
+    const literal = prog.stmts[1].pipeline.commands[0].redirects[0];
+    try std.testing.expect(!literal.expand_body);
+    try std.testing.expectEqualStrings("$value\n", literal.body);
+}
+
+test "parse here-document delimiter quote removal preserves ordinary double-quoted backslashes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cat <<\"\\EOF\"\nbody\n\\EOF");
+    const prog = try p.parseProgram();
+    const redirect = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expectEqualStrings("\\EOF", redirect.target);
+    try std.testing.expect(!redirect.expand_body);
+    try std.testing.expectEqualStrings("body\n", redirect.body);
+}
+
+test "parse empty quoted here-document delimiter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cat <<''\nbody\n\n");
+    const prog = try p.parseProgram();
+    const redirect = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expectEqualStrings("", redirect.target);
+    try std.testing.expectEqualStrings("body\n", redirect.body);
+}
+
+test "parse multiple here-documents after a semicolon-separated command line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\cat <<FIRST <<'SECOND'; echo done
+        \\first body
+        \\FIRST
+        \\$HOME
+        \\SECOND
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), prog.stmts.len);
+    const redirects = prog.stmts[0].pipeline.commands[0].redirects;
+    try std.testing.expectEqual(@as(usize, 2), redirects.len);
+    try std.testing.expectEqualStrings("first body\n", redirects[0].body);
+    try std.testing.expectEqualStrings("$HOME\n", redirects[1].body);
+}
+
+test "parse nested subshells and piped command groups" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "(echo first; (echo nested)) | cat");
+    const prog = try p.parseProgram();
+    const pipeline = prog.stmts[0].pipeline;
+    try std.testing.expectEqual(@as(usize, 2), pipeline.commands.len);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.commands[0].subshell.?.len);
+    const nested = pipeline.commands[0].subshell.?[1].pipeline.commands[0].subshell.?;
+    try std.testing.expectEqual(@as(usize, 1), nested.len);
 }
 
 test "parse break and continue" {

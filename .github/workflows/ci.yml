@@ -29,3 +29,6 @@ jobs:
 
       - name: Run interactive tests
         run: python3 tests/pty_test.py
+
+      - name: Run shell compatibility tests
+        run: python3 tests/shell_compat_test.py

@@ -37,9 +37,12 @@ class Session:
         self.buf = b""
 
     def read_until(self, needle, timeout=TIMEOUT):
+        return self.read_until_count(needle, 1, timeout)
+
+    def read_until_count(self, needle, count, timeout=TIMEOUT):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if needle in self.buf:
+            if self.buf.count(needle) >= count:
                 return True
             r, _, _ = select.select([self.fd], [], [], 0.2)
             if r:
@@ -50,7 +53,7 @@ class Session:
                 if not chunk:
                     return False
                 self.buf += chunk
-        return needle in self.buf
+        return self.buf.count(needle) >= count
 
     def send(self, data):
         os.write(self.fd, data if isinstance(data, bytes) else data.encode())
@@ -242,6 +245,51 @@ def main():
     s.drain(0.2)
     s.send("}\r")
     check("block executes after closing brace", s.read_until(b"inside-block"))
+
+    # 8b. a here-document stays in continuation mode until its delimiter,
+    # and its body is data even when it looks like shell syntax.
+    s.clear()
+    s.send("cat <<'WSH_LITERAL'\r")
+    check("here-document opens the continuation prompt", s.read_until(b"\xe2\x80\xa6"),
+          repr(strip_ansi(s.buf[-200:])))
+    s.clear()
+    s.send("first heredoc line\r")
+    check("here-document body keeps the continuation prompt", s.read_until(b"\xe2\x80\xa6"),
+          repr(strip_ansi(s.buf[-200:])))
+    heredoc_body = "if true { print '$HOME | > # \"quoted\"'; }"
+    s.clear()
+    s.send(heredoc_body + "\r")
+    check("syntax-looking heredoc line remains in continuation", s.read_until(b"\xe2\x80\xa6"),
+          repr(strip_ansi(s.buf[-200:])))
+    s.clear()
+    s.send("WSH_LITERAL\r")
+    body_seen = s.read_until(heredoc_body.encode())
+    output = strip_ansi(s.buf).replace(b"\r\n", b"\n")
+    expected_body = b"first heredoc line\n" + heredoc_body.encode() + b"\n"
+    check("multiline heredoc body is emitted literally", body_seen and expected_body in output,
+          repr(output[-300:]))
+
+    # 8c. a subshell keeps terminal input in the foreground and returns control.
+    s.clear()
+    s.send("(cat; echo SUBSHELL_DONE)\r")
+    s.drain(0.3)
+    initial = strip_ansi(s.buf)
+    initial_lines = [line.strip() for line in initial.replace(b"\r", b"").split(b"\n")]
+    still_running = b"SUBSHELL_DONE" not in initial_lines
+    check("subshell waits for terminal input", still_running, repr(initial[-200:]))
+    s.send("subshell-terminal-input\r")
+    echoed = s.read_until_count(b"subshell-terminal-input", 2)
+    check("subshell cat reads and echoes terminal input", echoed, repr(strip_ansi(s.buf[-300:])))
+    s.clear()
+    s.send(b"\x04")
+    finished = s.read_until(b"SUBSHELL_DONE")
+    prompt_recovered = s.read_until(b"\xe2\x9d\xaf")
+    plain = strip_ansi(s.buf)
+    done_at = plain.find(b"SUBSHELL_DONE")
+    prompt_at = plain.find(b"\xe2\x9d\xaf", done_at)
+    check("Ctrl-D finishes subshell and restores parent prompt",
+          finished and prompt_recovered and done_at >= 0 and prompt_at > done_at,
+          repr(plain[-300:]))
 
     # 9. job control: background job + jobs builtin
     s.clear()

@@ -19,6 +19,7 @@ The release archive includes the shell, examples, license, and checksum.
 ## Why wolysh
 
 - Run familiar commands, pipes, redirects, and globs.
+- Merge stderr with stdout, feed commands with here-documents, and isolate work in subshells.
 - Write scripts with expressions, `if`, loops, and functions.
 - Use built-in completion, syntax highlighting, history suggestions, and `Ctrl-R`.
 - Get typo suggestions with a Bloom-style prefilter; normal command lookup
@@ -59,8 +60,8 @@ To install the source build, run `sudo install -m 0755 zig-out/bin/wsh /usr/loca
 
 ## Project status
 
-Early stage and not a Bash or POSIX drop-in. Current gaps include subshells,
-heredocs, `$((...))`, `2>&1`, and brace expansion. See the [language guide](docs/language.md)
+Early stage and not a Bash or POSIX drop-in. Current gaps include `$((...))`
+and brace expansion. See the [language guide](docs/language.md)
 for features, configuration, key bindings, and known limitations.
 
 - [Contributing](CONTRIBUTING.md)

@@ -76,10 +76,24 @@ pub fn isComplete(src: []const u8) bool {
     var brackets: i32 = 0;
     var last: lexer.Tag = .eof;
     var last_text: []const u8 = "";
+    var heredoc_delimiters: [64][]const u8 = undefined;
+    var heredoc_count: usize = 0;
+    var needs_heredoc_delimiter = false;
 
     while (true) {
         const tok = lx.next();
-        if (tok.tag == .eof) break;
+        if (tok.tag == .eof) {
+            if (heredoc_count != 0 or needs_heredoc_delimiter) return false;
+            break;
+        }
+        if (needs_heredoc_delimiter) {
+            if (tok.tag != .word or heredoc_count == heredoc_delimiters.len) return false;
+            heredoc_delimiters[heredoc_count] = tok.text;
+            heredoc_count += 1;
+            needs_heredoc_delimiter = false;
+        } else if (tok.tag == .here_doc) {
+            needs_heredoc_delimiter = true;
+        }
         switch (tok.tag) {
             .lbrace => braces += 1,
             .rbrace => braces -= 1,
@@ -89,8 +103,15 @@ pub fn isComplete(src: []const u8) bool {
             .rbracket => brackets -= 1,
             else => {},
         }
+        const previous = last;
         last = tok.tag;
         last_text = tok.text;
+        if (tok.tag == .newline and heredoc_count > 0 and !expectsMore(previous)) {
+            const skipped = skipHereDocBodies(src, lx.pos, heredoc_delimiters[0..heredoc_count]) orelse return false;
+            lx.pos = skipped.pos;
+            lx.line += skipped.lines;
+            heredoc_count = 0;
+        }
     }
 
     if (braces > 0 or parens > 0 or brackets > 0) return false;
@@ -113,7 +134,7 @@ fn wordExpectsMore(text: []const u8) bool {
 /// Tokens that cannot end a statement because something must follow them.
 fn expectsMore(tag: lexer.Tag) bool {
     return switch (tag) {
-        .pipe, .pipepipe, .ampamp, .lbrace, .lparen, .lbracket, .in, .out, .out_append => true,
+        .pipe, .pipepipe, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .out, .out_append => true,
         .assign, .plus_assign, .minus_assign => true,
         .plus, .minus, .star, .slash, .percent => true,
         .eq, .ne, .lt, .le, .gt, .ge => true,
@@ -127,20 +148,166 @@ fn quotesBalanced(src: []const u8) bool {
     var i: usize = 0;
     var in_single = false;
     var in_double = false;
+    var line_start: usize = 0;
+    var heredoc_delimiters: [64][]const u8 = undefined;
+    var heredoc_count: usize = 0;
     while (i < src.len) {
         const c = src[i];
+        if (c == '#' and !in_single and !in_double and
+            (i == 0 or std.ascii.isWhitespace(src[i - 1])))
+        {
+            while (i < src.len and src[i] != '\n') i += 1;
+            continue;
+        }
         if (c == '\\' and !in_single and i + 1 < src.len) {
             i += 2;
+            continue;
+        }
+        if (c == '<' and !in_single and !in_double and i + 1 < src.len and src[i + 1] == '<') {
+            if (heredoc_count == heredoc_delimiters.len) return false;
+            const marker = rawHereDocDelimiter(src, i + 2) orelse return false;
+            heredoc_delimiters[heredoc_count] = marker.raw;
+            heredoc_count += 1;
+            i = marker.end;
             continue;
         }
         if (c == '\'' and !in_double) {
             in_single = !in_single;
         } else if (c == '"' and !in_single) {
             in_double = !in_double;
+        } else if (c == '\n') {
+            if (heredoc_count > 0 and !continuedLine(src[line_start..i])) {
+                const skipped = skipHereDocBodies(src, i + 1, heredoc_delimiters[0..heredoc_count]) orelse return false;
+                i = skipped.pos;
+                heredoc_count = 0;
+                line_start = i;
+                in_single = false;
+                in_double = false;
+                continue;
+            }
+            line_start = i + 1;
         }
         i += 1;
     }
-    return !in_single and !in_double;
+    return !in_single and !in_double and heredoc_count == 0;
+}
+
+const RawDelimiter = struct { raw: []const u8, end: usize };
+
+fn rawHereDocDelimiter(src: []const u8, from: usize) ?RawDelimiter {
+    var start = from;
+    while (start < src.len and (src[start] == ' ' or src[start] == '\t')) start += 1;
+    if (start == src.len or src[start] == '\n') return null;
+    var i = start;
+    var quote: u8 = 0;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (c == '\\' and quote != '\'' and i + 1 < src.len) {
+            i += 1;
+            continue;
+        }
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+        } else if (std.ascii.isWhitespace(c) or c == '<' or c == '>' or c == '|' or c == '&' or c == ';') {
+            break;
+        }
+    }
+    if (quote != 0 or i == start) return null;
+    return .{ .raw = src[start..i], .end = i };
+}
+
+fn hereDocDelimiterMatches(raw: []const u8, line: []const u8) bool {
+    var raw_index: usize = 0;
+    var line_index: usize = 0;
+    var quote: u8 = 0;
+    while (raw_index < raw.len) {
+        const c = raw[raw_index];
+        if (c == '\\' and quote != '\'' and raw_index + 1 < raw.len) {
+            const next = raw[raw_index + 1];
+            if (next == '\n') {
+                raw_index += 2;
+                continue;
+            }
+            if (quote != '"' or next == '$' or next == '`' or next == '"' or next == '\\') {
+                raw_index += 1;
+                if (line_index >= line.len or raw[raw_index] != line[line_index]) return false;
+                raw_index += 1;
+                line_index += 1;
+                continue;
+            }
+        }
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            } else {
+                if (line_index >= line.len or c != line[line_index]) return false;
+                line_index += 1;
+            }
+            raw_index += 1;
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+        } else {
+            if (line_index >= line.len or c != line[line_index]) return false;
+            line_index += 1;
+        }
+        raw_index += 1;
+    }
+    return quote == 0 and line_index == line.len;
+}
+
+const SkippedHereDocs = struct { pos: usize, lines: usize };
+
+fn skipHereDocBodies(src: []const u8, start: usize, delimiters: []const []const u8) ?SkippedHereDocs {
+    var cursor = start;
+    var lines: usize = 0;
+    for (delimiters) |delimiter| {
+        var found = false;
+        while (cursor <= src.len) {
+            const line_start = cursor;
+            const line_end = std.mem.indexOfScalarPos(u8, src, cursor, '\n') orelse src.len;
+            var line = src[line_start..line_end];
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (hereDocDelimiterMatches(delimiter, line)) {
+                cursor = if (line_end < src.len) line_end + 1 else line_end;
+                if (line_end < src.len) lines += 1;
+                found = true;
+                break;
+            }
+            if (line_end == src.len) break;
+            cursor = line_end + 1;
+            lines += 1;
+        }
+        if (!found) return null;
+    }
+    return .{ .pos = cursor, .lines = lines };
+}
+
+fn continuedLine(line: []const u8) bool {
+    var lx = lexer.Lexer.init(line);
+    var last: ?lexer.Token = null;
+    while (true) {
+        const tok = lx.next();
+        if (tok.tag == .eof) break;
+        last = tok;
+    }
+    const token = last orelse return false;
+    switch (token.tag) {
+        .pipe, .pipepipe, .ampamp => return true,
+        else => {},
+    }
+
+    const trimmed = std.mem.trimEnd(u8, line, " \t\r");
+    if (token.start + token.text.len != trimmed.len) return false;
+    var slashes: usize = 0;
+    var i = trimmed.len;
+    while (i > 0 and trimmed[i - 1] == '\\') : (i -= 1) slashes += 1;
+    return slashes % 2 == 1;
 }
 
 // --- statements -------------------------------------------------------------
@@ -669,8 +836,7 @@ fn evalCall(sh: *Shell, arena: std.mem.Allocator, callee: []const u8, args: []co
     }
 
     if (try proc.resolve(arena, callee, sh.pathEnv()) != null) {
-        const fds = Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
-        const stage = try launchStage(sh, arena, argv, fds);
+        const stage = try launchStage(sh, arena, argv, &.{});
         return Value{ .boolean = runForeground(sh, arena, &.{stage}, callee) == 0 };
     }
 
@@ -684,10 +850,10 @@ fn evalCall(sh: *Shell, arena: std.mem.Allocator, callee: []const u8, args: []co
 /// the misuse check below can name them, and covered by a test that fails if
 /// this list and `evalCall` drift apart.
 const expression_function_names = [_][]const u8{
-    "exists",    "is_dir",   "is_file",       "is_link",   "len",      "empty",
-    "int",       "str",      "abs",           "min",       "max",      "upper",
-    "lower",     "trim",     "basename",      "dirname",   "env",      "contains",
-    "starts_with", "ends_with", "split",      "join",
+    "exists",      "is_dir",    "is_file",  "is_link", "len", "empty",
+    "int",         "str",       "abs",      "min",     "max", "upper",
+    "lower",       "trim",      "basename", "dirname", "env", "contains",
+    "starts_with", "ends_with", "split",    "join",
 };
 
 pub fn isExpressionFunction(name: []const u8) bool {
@@ -780,6 +946,14 @@ const ChildPayload = struct {
     argv: []const []const u8,
 };
 
+const MissingCommandPayload = struct { message: []const u8 };
+
+fn childReportMissingCommand(ctx_ptr: *anyopaque) noreturn {
+    const payload: *MissingCommandPayload = @ptrCast(@alignCast(ctx_ptr));
+    sys.writeStr(2, payload.message);
+    linux.exit(127);
+}
+
 fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool) u8 {
     const arena = sh.scratch();
     if (commands.len == 0) return 0;
@@ -792,6 +966,12 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool) u8 {
 
     var stages: std.ArrayList(proc.Stage) = .empty;
     for (commands) |cmd| {
+        if (cmd.subshell) |stmts| {
+            const prepared = applyRedirects(sh, arena, cmd, &opened) catch |err| return exprError(sh, err);
+            const stage = makeSubshellStage(sh, arena, stmts, prepared.redirects) catch |err| return exprError(sh, err);
+            stages.append(arena, stage) catch return 1;
+            continue;
+        }
         if (misuseOfExpressionFunction(cmd.words)) |name| {
             reportExpressionFunctionMisuse(sh, name);
             return 2;
@@ -801,9 +981,9 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool) u8 {
         expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return exprError(sh, err);
         if (argv.items.len == 0) continue;
 
-        const fds = applyRedirects(sh, arena, cmd, &opened) catch |err| return exprError(sh, err);
+        const prepared = applyRedirects(sh, arena, cmd, &opened) catch |err| return exprError(sh, err);
         const call_argv = argv.toOwnedSlice(arena) catch return 1;
-        const stage = makeStage(sh, arena, call_argv, fds) catch |err| return exprError(sh, err);
+        const stage = makeStage(sh, arena, call_argv, prepared.redirects) catch |err| return exprError(sh, err);
         stages.append(arena, stage) catch return 1;
     }
 
@@ -815,17 +995,49 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool) u8 {
 }
 
 /// Builds a stage that either execs a program or runs shell code in the child.
-fn makeStage(sh: *Shell, arena: std.mem.Allocator, argv: []const []const u8, fds: Fds) Error!proc.Stage {
+fn makeStage(sh: *Shell, arena: std.mem.Allocator, argv: []const []const u8, redirects: []const proc.Redirection) Error!proc.Stage {
     if (isInternal(sh, argv[0])) {
         const payload = try arena.create(ChildPayload);
         payload.* = .{ .sh = sh, .argv = argv };
         return .{
             .child_fn = childExecute,
             .child_ctx = payload,
-            .stdio = .{ .in = fds.in, .out = fds.out, .err = fds.err },
+            .stdio = .{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err },
+            .redirects = redirects,
         };
     }
-    return try launchStage(sh, arena, argv, fds);
+    return try launchStage(sh, arena, argv, redirects);
+}
+
+const SubshellPayload = struct {
+    sh: *Shell,
+    stmts: []ast.Stmt,
+};
+
+fn makeSubshellStage(sh: *Shell, arena: std.mem.Allocator, stmts: []ast.Stmt, redirects: []const proc.Redirection) Error!proc.Stage {
+    const payload = try arena.create(SubshellPayload);
+    payload.* = .{ .sh = sh, .stmts = stmts };
+    return .{
+        .child_fn = childExecuteSubshell,
+        .child_ctx = payload,
+        .stdio = .{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err },
+        .redirects = redirects,
+    };
+}
+
+fn childExecuteSubshell(ctx_ptr: *anyopaque) noreturn {
+    const payload: *SubshellPayload = @ptrCast(@alignCast(ctx_ptr));
+    const sh = payload.sh;
+    sh.default_in = 0;
+    sh.default_out = 1;
+    sh.default_err = 2;
+    sh.job_control = false;
+    sh.tty_fd = -1;
+    sh.should_exit = false;
+    sh.return_pending = false;
+    sh.break_pending = false;
+    sh.continue_pending = false;
+    linux.exit(runStmts(sh, payload.stmts));
 }
 
 fn isInternal(sh: *Shell, name: []const u8) bool {
@@ -869,10 +1081,16 @@ fn runSingle(
     var argv: std.ArrayList([]const u8) = .empty;
     expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return exprError(sh, err);
 
-    const fds = applyRedirects(sh, arena, cmd, opened) catch |err| return exprError(sh, err);
+    const prepared = applyRedirects(sh, arena, cmd, opened) catch |err| return exprError(sh, err);
 
     // `> file` with no command just creates the file.
-    if (argv.items.len == 0) return 0;
+    if (argv.items.len == 0 and cmd.subshell == null) return 0;
+
+    if (cmd.subshell) |stmts| {
+        const stage = makeSubshellStage(sh, arena, stmts, prepared.redirects) catch |err| return exprError(sh, err);
+        if (background) return startBackground(sh, arena, &.{stage}, pipelineText(arena, &.{cmd}) catch "subshell");
+        return runForeground(sh, arena, &.{stage}, pipelineText(arena, &.{cmd}) catch "subshell");
+    }
 
     const call_argv = argv.toOwnedSlice(arena) catch return 1;
     const name = call_argv[0];
@@ -882,9 +1100,9 @@ fn runSingle(
         // Temporary defaults make the redirects visible to the nested commands
         // a function or `source` will run.
         const saved = Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
-        sh.default_in = fds.in;
-        sh.default_out = fds.out;
-        sh.default_err = fds.err;
+        sh.default_in = prepared.fds.in;
+        sh.default_out = prepared.fds.out;
+        sh.default_err = prepared.fds.err;
         defer {
             sh.default_in = saved.in;
             sh.default_out = saved.out;
@@ -893,15 +1111,21 @@ fn runSingle(
         return dispatch(sh, call_argv);
     }
 
-    const stage = makeStage(sh, arena, call_argv, fds) catch |err| return exprError(sh, err);
+    const stage = makeStage(sh, arena, call_argv, prepared.redirects) catch |err| return exprError(sh, err);
     if (background) return startBackground(sh, arena, &.{stage}, text);
     return runForeground(sh, arena, &.{stage}, text);
 }
 
-fn launchStage(sh: *Shell, arena: std.mem.Allocator, argv: []const []const u8, fds: Fds) Error!proc.Stage {
+fn launchStage(sh: *Shell, arena: std.mem.Allocator, argv: []const []const u8, redirects: []const proc.Redirection) Error!proc.Stage {
     const resolved = try proc.resolve(arena, argv[0], sh.pathEnv()) orelse {
-        reportCommandNotFound(sh, arena, argv[0]);
-        return error.CommandNotFound;
+        const payload = try arena.create(MissingCommandPayload);
+        payload.* = .{ .message = try commandNotFoundMessage(sh, arena, argv[0]) };
+        return .{
+            .child_fn = childReportMissingCommand,
+            .child_ctx = payload,
+            .stdio = .{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err },
+            .redirects = redirects,
+        };
     };
 
     const exec = try arena.create(proc.Exec);
@@ -921,7 +1145,8 @@ fn launchStage(sh: *Shell, arena: std.mem.Allocator, argv: []const []const u8, f
 
     return .{
         .exec = exec,
-        .stdio = .{ .in = fds.in, .out = fds.out, .err = fds.err },
+        .stdio = .{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err },
+        .redirects = redirects,
     };
 }
 
@@ -938,7 +1163,7 @@ fn startBackground(sh: *Shell, arena: std.mem.Allocator, stages: []const proc.St
 }
 
 fn runForeground(sh: *Shell, arena: std.mem.Allocator, stages: []const proc.Stage, text: []const u8) u8 {
-    const launched = proc.launch(arena, stages, .{}) catch |err| return exprError(sh, err);
+    const launched = proc.launch(arena, stages, .{ .new_group = sh.job_control }) catch |err| return exprError(sh, err);
     const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, true) catch return 1;
     const outcome = sh.waitForeground(job);
 
@@ -999,30 +1224,31 @@ fn dispatch(sh: *Shell, argv: []const []const u8) u8 {
 }
 
 fn reportCommandNotFound(sh: *Shell, arena: std.mem.Allocator, name: []const u8) void {
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "wsh: command not found: {s}\n", .{name}) catch return;
-    sys.writeStr(sh.default_err, msg);
-
-    if (sh.command_cache.lookup(name)) |cached| {
-        printCommandSuggestions(sh, cached.matches);
-        return;
-    }
-
-    const matches = command_suggest.find(sh, arena, name) catch return;
-    if (sh.interactive) sh.command_cache.remember(sh.gpa, name, matches) catch {
-        sys.writeStr(sh.default_err, "wsh: unable to cache command suggestions\n");
-    };
-    printCommandSuggestions(sh, matches);
+    const message = commandNotFoundMessage(sh, arena, name) catch return;
+    sys.writeStr(sh.default_err, message);
 }
 
-fn printCommandSuggestions(sh: *Shell, matches: []const command_suggest.Match) void {
-    if (matches.len == 0) return;
-    sys.writeStr(sh.default_err, "wsh: did you mean: ");
-    for (matches, 0..) |match, index| {
-        if (index != 0) sys.writeStr(sh.default_err, ", ");
-        sys.writeStr(sh.default_err, match.name);
+fn commandNotFoundMessage(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    var message: std.ArrayList(u8) = .empty;
+    const initial = try std.fmt.allocPrint(arena, "wsh: command not found: {s}\n", .{name});
+    try message.appendSlice(arena, initial);
+
+    const matches = if (sh.command_cache.lookup(name)) |cached| cached.matches else blk: {
+        const found = command_suggest.find(sh, arena, name) catch return try message.toOwnedSlice(arena);
+        if (sh.interactive) sh.command_cache.remember(sh.gpa, name, found) catch {
+            try message.appendSlice(arena, "wsh: unable to cache command suggestions\n");
+        };
+        break :blk found;
+    };
+    if (matches.len > 0) {
+        try message.appendSlice(arena, "wsh: did you mean: ");
+        for (matches, 0..) |match, index| {
+            if (index != 0) try message.appendSlice(arena, ", ");
+            try message.appendSlice(arena, match.name);
+        }
+        try message.appendSlice(arena, "?\n");
     }
-    sys.writeStr(sh.default_err, "?\n");
+    return try message.toOwnedSlice(arena);
 }
 
 fn builtinSource(sh: *Shell, argv: []const []const u8) u8 {
@@ -1111,48 +1337,73 @@ fn callFunction(sh: *Shell, name: []const u8, source: []const u8, argv: []const 
 
 // --- redirects --------------------------------------------------------------
 
+const PreparedRedirects = struct {
+    fds: Fds,
+    redirects: []const proc.Redirection,
+};
+
 fn applyRedirects(
     sh: *Shell,
     arena: std.mem.Allocator,
     cmd: ast.Command,
     opened: *std.ArrayList(i32),
-) Error!Fds {
+) Error!PreparedRedirects {
     var fds = Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
-    if (cmd.redirects.len == 0) return fds;
+    if (cmd.redirects.len == 0) return .{ .fds = fds, .redirects = &.{} };
+    var actions: std.ArrayList(proc.Redirection) = .empty;
 
     for (cmd.redirects) |redirect| {
+        if (redirect.kind.duplicates()) {
+            const source = redirect.target[0] - '0';
+            const mapped_source = switch (source) {
+                0 => fds.in,
+                1 => fds.out,
+                2 => fds.err,
+                else => return error.ExecutionFailed,
+            };
+            switch (redirect.kind.fd()) {
+                1 => fds.out = mapped_source,
+                2 => fds.err = mapped_source,
+                else => return error.ExecutionFailed,
+            }
+            try actions.append(arena, .{ .target = redirect.kind.fd(), .source = source });
+            continue;
+        }
         const target = try expand_mod.expandLiteral(sh, arena, redirect.target);
         const z = try arena.dupeZ(u8, target);
 
-        const fd = if (redirect.kind.isInput())
+        const fd = if (redirect.kind == .here_doc) blk: {
+            const body = if (redirect.expand_body)
+                try expand_mod.expandHereDoc(sh, arena, redirect.body)
+            else
+                redirect.body;
+            break :blk sys.createAnonymousFile(body);
+        } else if (redirect.kind.isInput())
             sys.openRead(z.ptr)
         else
             sys.openWrite(z.ptr, redirect.kind.append());
 
         if (fd == null) {
+            if (redirect.kind == .here_doc) {
+                sys.writeStr(sh.default_err, "wsh: cannot prepare here-document\n");
+                return error.ExecutionFailed;
+            }
             var buf: [512]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot open file\n", .{target}) catch return error.ExecutionFailed;
             sys.writeStr(sh.default_err, msg);
             return error.ExecutionFailed;
         }
 
-        // A later redirect for the same descriptor replaces the earlier one.
-        const previous = switch (redirect.kind) {
-            .in => fds.in,
-            .err_out, .err_append => fds.err,
-            else => fds.out,
-        };
-        if (previous > 2) sys.closeFd(previous);
-
         switch (redirect.kind) {
-            .in => fds.in = fd.?,
+            .in, .here_doc => fds.in = fd.?,
             .err_out, .err_append => fds.err = fd.?,
             else => fds.out = fd.?,
         }
         try opened.append(arena, fd.?);
+        try actions.append(arena, .{ .target = redirect.kind.fd(), .source = fd.?, .close_source = true });
     }
 
-    return fds;
+    return .{ .fds = fds, .redirects = try actions.toOwnedSlice(arena) };
 }
 
 // --- aliases ----------------------------------------------------------------
@@ -1199,12 +1450,16 @@ fn pipelineText(arena: std.mem.Allocator, commands: []const ast.Command) ![]cons
             if (j != 0) try out.append(arena, ' ');
             try out.appendSlice(arena, word);
         }
+        if (cmd.subshell != null) try out.appendSlice(arena, "(subshell)");
         for (cmd.redirects) |r| {
             const op = switch (r.kind) {
                 .in => " < ",
+                .here_doc => " << ",
                 .out_append => " >> ",
                 .err_out => " 2> ",
                 .err_append => " 2>> ",
+                .out_dup => " >&",
+                .err_dup => " 2>&",
                 else => " > ",
             };
             try out.appendSlice(arena, op);
@@ -1513,6 +1768,89 @@ test "redirects write to files" {
     _ = fs.removeFile(z);
 }
 
+test "2>&1 merges stderr into pipeline stdout" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const out = try collectOutput(&sh, "/bin/sh -c 'printf out; printf err >&2' 2>&1 | /bin/cat\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("outerr", out);
+}
+
+test "2>&1 preserves redirection order" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-redirect-order-test.txt";
+    var source: [256]u8 = undefined;
+    const command = try std.fmt.bufPrint(&source, "/bin/sh -c 'printf out; printf err >&2' 2>&1 > {s}\n", .{path});
+    const out = try collectOutput(&sh, command);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("err", out);
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    const data = (try fs.readFileAlloc(testing.allocator, z, 1024)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("out", data);
+    _ = fs.removeFile(z);
+}
+
+test "here-documents expand variables and preserve quoted bodies" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const src =
+        \\let value = "expanded"
+        \\cat <<EOF
+        \\$value
+        \\EOF
+        \\cat <<'LITERAL'
+        \\$value
+        \\LITERAL
+    ;
+    const out = try collectOutput(&sh, src);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("expanded\n$value\n", out);
+}
+
+test "multiple here-documents on a semicolon-separated line use the final input" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const src =
+        \\cat <<FIRST <<SECOND; echo done
+        \\first body
+        \\FIRST
+        \\second body
+        \\SECOND
+    ;
+    const out = try collectOutput(&sh, src);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("second body\ndone\n", out);
+}
+
+test "subshells isolate state and work in pipelines" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const src =
+        \\let value = "parent"
+        \\(let value = "child"; echo $value)
+        \\echo $value
+        \\(echo piped) | /bin/cat
+    ;
+    const out = try collectOutput(&sh, src);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("child\nparent\npiped\n", out);
+    try testing.expectEqualStrings("parent", sh.getVar("value").?.string);
+}
+
 test "the expression function list matches what evalCall implements" {
     var sh = try Shell.initBare(testing.allocator);
     defer sh.deinit();
@@ -1550,6 +1888,15 @@ test "isComplete distinguishes open constructs from real errors" {
 
     // Open constructs keep the prompt reading.
     try testing.expect(!isComplete("echo \"unterminated"));
+    try testing.expect(!isComplete("cat <<EOF\nbody"));
+    try testing.expect(isComplete("cat <<\"\\EOF\"\nbody\n\\EOF\n"));
+    try testing.expect(isComplete("cat <<''\nbody\n\n"));
+    try testing.expect(isComplete("cat <<EOF # |\n' unmatched body quote\nEOF\n"));
+    try testing.expect(isComplete("cat <<EOF\n}\"\nEOF\n"));
+    try testing.expect(isComplete("# a comment <<NOT_A_HEREDOC\n"));
+    try testing.expect(isComplete("cat <<EOF |\ncat\nbody\nEOF\n"));
+    try testing.expect(!isComplete("(echo hi"));
+    try testing.expect(isComplete("(echo hi)"));
     try testing.expect(!isComplete("echo hi |"));
     try testing.expect(!isComplete("let x ="));
     try testing.expect(isComplete("alias ll"));

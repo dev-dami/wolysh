@@ -16,33 +16,44 @@ pub const RedirectKind = enum {
     out,
     out_append,
     in,
+    here_doc,
     err_out,
     err_append,
+    out_dup,
+    err_dup,
 
     pub fn fd(self: RedirectKind) i32 {
         return switch (self) {
-            .err_out, .err_append => 2,
+            .in, .here_doc => 0,
+            .err_out, .err_append, .err_dup => 2,
             else => 1,
         };
     }
 
     pub fn isInput(self: RedirectKind) bool {
-        return self == .in;
+        return self == .in or self == .here_doc;
     }
 
     pub fn append(self: RedirectKind) bool {
         return self == .out_append or self == .err_append;
+    }
+
+    pub fn duplicates(self: RedirectKind) bool {
+        return self == .out_dup or self == .err_dup;
     }
 };
 
 pub const Redirect = struct {
     kind: RedirectKind,
     target: Word,
+    body: []const u8 = "",
+    expand_body: bool = true,
 };
 
 pub const Command = struct {
     words: []Word,
     redirects: []Redirect,
+    subshell: ?[]Stmt = null,
 };
 
 pub const ChainOp = enum { and_, or_ };
