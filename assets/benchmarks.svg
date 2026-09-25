@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="590" viewBox="0 0 960 590" role="img" aria-labelledby="title description">
+  <title id="title">wolysh local performance measurements</title>
+  <desc id="description">Four separately scaled horizontal bar charts compare startup time, a 20,000-iteration loop, interactive idle memory, and wolysh binary build sizes.</desc>
+  <style>
+    text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+    .title { font-size: 25px; font-weight: 700; }
+    .subtitle { font-size: 13px; fill: #475569; }
+    .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1; }
+    .heading { font-size: 16px; font-weight: 650; }
+    .label { font-size: 14px; }
+    .value { font-size: 13px; font-weight: 650; }
+    .wsh { fill: #0891b2; }
+    .bash { fill: #64748b; }
+  </style>
+  <rect width="960" height="590" fill="#ffffff" />
+  <text class="title" x="32" y="42">Measured performance</text>
+  <text class="subtitle" x="32" y="67">Local results; lower is better. Each panel uses its own scale.</text>
+
+  <rect class="panel" x="24" y="91" width="444" height="208" />
+  <text class="heading" x="44" y="123">Startup · 500 runs (-c true)</text>
+  <text class="label" x="44" y="168">wolysh</text>
+  <rect class="wsh" x="145" y="151" width="121" height="23" />
+  <text class="value" x="276" y="168">1.14 ms</text>
+  <text class="label" x="44" y="211">Bash</text>
+  <rect class="bash" x="145" y="194" width="229" height="23" />
+  <text class="value" x="384" y="211">2.16 ms</text>
+
+  <rect class="panel" x="492" y="91" width="444" height="208" />
+  <text class="heading" x="512" y="123">Loop · 20,000 iterations</text>
+  <text class="label" x="512" y="168">wolysh</text>
+  <rect class="wsh" x="613" y="151" width="30" height="23" />
+  <text class="value" x="653" y="168">15 ms</text>
+  <text class="label" x="512" y="211">Bash</text>
+  <rect class="bash" x="613" y="194" width="240" height="23" />
+  <text class="value" x="863" y="211">120 ms</text>
+
+  <rect class="panel" x="24" y="319" width="444" height="208" />
+  <text class="heading" x="44" y="351">Interactive idle memory</text>
+  <text class="label" x="44" y="396">wolysh</text>
+  <rect class="wsh" x="145" y="379" width="41" height="23" />
+  <text class="value" x="196" y="396">0.7 MB</text>
+  <text class="label" x="44" y="439">Bash</text>
+  <rect class="bash" x="145" y="422" width="244" height="23" />
+  <text class="value" x="399" y="439">4.2 MB</text>
+
+  <rect class="panel" x="492" y="319" width="444" height="208" />
+  <text class="heading" x="512" y="351">wolysh binary size</text>
+  <text class="label" x="512" y="396">ReleaseFast</text>
+  <rect class="wsh" x="613" y="379" width="234" height="23" />
+  <text class="value" x="857" y="396">312 KB</text>
+  <text class="label" x="512" y="439">ReleaseSmall</text>
+  <rect class="wsh" x="613" y="422" width="151" height="23" opacity="0.62" />
+  <text class="value" x="774" y="439">201 KB</text>
+
+  <text class="subtitle" x="24" y="565">Single development machine; workload-specific measurements, not a standardized benchmark.</text>
+</svg>
