@@ -1,4 +1,4 @@
-![Minimal sheep logo for wolysh](assets/sheep-logo.svg)
+<p><img src="assets/sheep-logo.png" alt="wolysh sheep logo" width="64" /></p>
 
 # wolysh (`wsh`)
 
