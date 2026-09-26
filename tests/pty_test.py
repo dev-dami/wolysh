@@ -214,6 +214,14 @@ def main():
     s.send(b"\x15")
     s.drain(0.2)
 
+    s.clear()
+    s.send("cat readme\t")
+    s.drain()
+    plain = strip_ansi(s.buf)
+    check("tab completes paths case-insensitively", b"cat README.md" in plain, repr(plain[-300:]))
+    s.send(b"\x15")
+    s.drain(0.2)
+
     # 8. history via Up arrow
     s.clear()
     s.send(b"\x1b[A")
@@ -245,6 +253,22 @@ def main():
     s.drain(0.2)
     s.send("}\r")
     check("block executes after closing brace", s.read_until(b"inside-block"))
+
+    # The whole unfinished construct stays in the editor buffer, so Up/Down
+    # can move between its source lines instead of recalling history.
+    s.clear()
+    s.send("if true {\r")
+    s.read_until(b"\xe2\x80\xa6")
+    s.send("print first\r")
+    s.read_until(b"\xe2\x80\xa6")
+    s.send("print second\x1b[A!\r")
+    s.read_until(b"\xe2\x80\xa6")
+    s.send("}\r")
+    s.read_until(b"second")
+    s.drain(0.2)
+    output = strip_ansi(s.buf).replace(b"\r\n", b"\n")
+    check("Up edits the preceding line in a multiline block", b"first!\nsecond\n" in output,
+          repr(output[-300:]))
 
     # 8b. a here-document stays in continuation mode until its delimiter,
     # and its body is data even when it looks like shell syntax.

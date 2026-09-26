@@ -14,7 +14,10 @@ own syntax. It is written in Zig and uses native Linux process and job control.
 
 The release archive includes the shell, examples, license, and checksum.
 
-![wolysh running in a terminal](assets/terminal-session.png)
+<p align="center">
+  <img src="assets/terminal-session.png" alt="wolysh interactive prompt" width="48%" />
+  <img src="assets/terminal-script-example.png" alt="wolysh running a script and cargo build" width="48%" />
+</p>
 
 ## Why wolysh
 
@@ -38,7 +41,7 @@ if workers > 4 {
 
 ## Performance snapshot
 
-![Bar charts of measured startup, loop, memory, and binary-size results](assets/benchmarks.svg)
+![Dark comparison charts for startup, loops, idle memory, and binary size](assets/benchmarks.svg)
 
 Measurements are from one development machine, not a standardized benchmark.
 The loop result covers this 20,000-iteration workload; results vary by machine

@@ -22,6 +22,14 @@ fn isSeparator(c: u8) bool {
     return std.mem.indexOfScalar(u8, separators, c) != null;
 }
 
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    if (prefix.len > text.len) return false;
+    for (text[0..prefix.len], prefix) |text_byte, prefix_byte| {
+        if (std.ascii.toLower(text_byte) != std.ascii.toLower(prefix_byte)) return false;
+    }
+    return true;
+}
+
 /// Start of the whitespace-delimited word containing `cursor`.
 fn wordStart(line: []const u8, cursor: usize) usize {
     var i = cursor;
@@ -87,8 +95,29 @@ fn quote(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (text) |c| {
         switch (c) {
-            ' ', '\t', '"', '\'', '$', '*', '?', '[', ']', '\\', '(', ')', '{', '}',
-            '&', '|', ';', '<', '>', '#', '!', '~', '`',
+            ' ',
+            '\t',
+            '"',
+            '\'',
+            '$',
+            '*',
+            '?',
+            '[',
+            ']',
+            '\\',
+            '(',
+            ')',
+            '{',
+            '}',
+            '&',
+            '|',
+            ';',
+            '<',
+            '>',
+            '#',
+            '!',
+            '~',
+            '`',
             => {
                 try out.append(arena, '\\');
                 try out.append(arena, c);
@@ -196,7 +225,7 @@ fn completePaths(sh: *Shell, arena: std.mem.Allocator, word: []const u8, items: 
 
     while (handle.next()) |entry| {
         if (!allow_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
-        if (!std.mem.startsWith(u8, entry.name, base)) continue;
+        if (!startsWithIgnoreCase(entry.name, base)) continue;
 
         const is_dir = entry.kind == .dir;
         const name = if (quoted) try arena.dupe(u8, entry.name) else try quote(arena, entry.name);
@@ -240,6 +269,10 @@ test "completion finds files and commands" {
     const paths = try complete(&sh, arena, "src/lex", 7);
     try std.testing.expect(paths.items.len >= 1);
     try std.testing.expectEqualStrings("src/lexer.zig ", paths.items[0]);
+
+    const case_paths = try complete(&sh, arena, "readme", 6);
+    try std.testing.expectEqual(@as(usize, 1), case_paths.items.len);
+    try std.testing.expectEqualStrings("README.md ", case_paths.items[0]);
 }
 
 test "completion of variables" {

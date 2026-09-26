@@ -14,6 +14,8 @@ const highlight = @import("highlight.zig");
 const complete = @import("complete.zig");
 
 const Shell = shellmod.Shell;
+pub const IsComplete = *const fn ([]const u8) bool;
+pub const WriteContinuationPrompt = *const fn (*std.Io.Writer, *Shell, usize) anyerror!void;
 
 const Key = union(enum) {
     eof,
@@ -33,7 +35,6 @@ const Key = union(enum) {
     page_down,
     unknown,
 };
-
 
 /// Display width of `text` in terminal columns, ignoring ANSI escape sequences.
 /// Each UTF-8 code point counts as one column, which is correct for the prompt,
@@ -74,6 +75,10 @@ pub const Editor = struct {
     last_rows: usize = 0,
     /// Scratch buffer for the highlighted body, reused between frames.
     body: std.Io.Writer.Allocating,
+    frame: std.Io.Writer.Allocating,
+    command_frame_active: bool = false,
+    command_cursor_row: usize = 0,
+    command_end_row: usize = 0,
     /// Set when the last line was cancelled with Ctrl-C.
     interrupted: bool = false,
 
@@ -83,6 +88,7 @@ pub const Editor = struct {
             .in_fd = in_fd,
             .out_fd = out_fd,
             .body = .init(sh.gpa),
+            .frame = .init(sh.gpa),
         };
     }
 
@@ -90,6 +96,7 @@ pub const Editor = struct {
         self.buf.deinit(self.sh.gpa);
         self.stashed.deinit(self.sh.gpa);
         self.body.deinit();
+        self.frame.deinit();
     }
 
     /// Reads one line, with editing when stdin is a terminal. Returns null at
@@ -142,6 +149,109 @@ pub const Editor = struct {
                 .page_up, .page_down, .unknown => {},
             }
             self.render(prompt_text);
+        }
+    }
+
+    pub fn readCommand(
+        self: *Editor,
+        prompt_text: []const u8,
+        is_complete: IsComplete,
+        write_continuation: WriteContinuationPrompt,
+    ) ?[]const u8 {
+        self.buf.clearRetainingCapacity();
+        self.cursor = 0;
+        self.hist_index = null;
+        self.stashed.clearRetainingCapacity();
+        self.interrupted = false;
+        self.last_rows = 0;
+        self.command_frame_active = false;
+        self.command_cursor_row = 0;
+        self.command_end_row = 0;
+
+        var raw = term.RawMode.enable(self.in_fd) orelse return self.readCommandPlain(is_complete);
+        defer raw.disable();
+
+        self.updateWidth();
+        self.renderCommand(prompt_text, write_continuation);
+
+        while (true) {
+            const key = self.readKey();
+            switch (key) {
+                .eof => {
+                    if (self.buf.items.len == 0) {
+                        sys.writeStr(self.out_fd, "\r\n");
+                        return null;
+                    }
+                    self.deleteAtCursor();
+                },
+                .byte => |byte| {
+                    if (byte == '\r' or byte == '\n') {
+                        if (is_complete(self.buf.items)) {
+                            self.cursor = self.buf.items.len;
+                            self.renderCommand(prompt_text, write_continuation);
+                            self.write("\r\n");
+                            return self.buf.items;
+                        }
+                        self.cursor = self.buf.items.len;
+                        self.renderCommand(prompt_text, write_continuation);
+                        self.write("\r\n");
+                        self.buf.append(self.sh.gpa, '\n') catch return null;
+                        self.cursor = self.buf.items.len;
+                        self.hist_index = null;
+                        self.command_cursor_row = self.command_end_row + 1;
+                        self.command_frame_active = true;
+                        self.renderCommand(prompt_text, write_continuation);
+                        continue;
+                    }
+                    switch (self.handleByte(byte)) {
+                        .handled => {},
+                        .cancel => return self.buf.items,
+                        .submit => return self.buf.items,
+                        .eof => return null,
+                    }
+                },
+                .escape => {},
+                .alt => |character| switch (character) {
+                    'b', 'B' => self.moveWordLeft(),
+                    'f', 'F' => self.moveWordRight(),
+                    'd', 'D' => self.killWord(),
+                    else => {},
+                },
+                .left => self.moveLeft(),
+                .right => self.acceptSuggestionOrMoveRight(),
+                .home => self.cursor = 0,
+                .end => self.cursor = self.buf.items.len,
+                .delete => self.deleteAtCursor(),
+                .word_left => self.moveWordLeft(),
+                .word_right => self.moveWordRight(),
+                .up => self.moveVertical(-1),
+                .down => self.moveVertical(1),
+                .page_up, .page_down, .unknown => {},
+            }
+            self.renderCommand(prompt_text, write_continuation);
+        }
+    }
+
+    fn readCommandPlain(self: *Editor, is_complete: IsComplete) ?[]const u8 {
+        while (true) {
+            const line_start = self.buf.items.len;
+            while (true) {
+                const byte = term.readByte(self.in_fd) orelse {
+                    if (self.buf.items.len == 0) return null;
+                    self.cursor = self.buf.items.len;
+                    return self.buf.items;
+                };
+                if (byte == '\n') break;
+                self.buf.append(self.sh.gpa, byte) catch return null;
+            }
+            if (self.buf.items.len > line_start and self.buf.items[self.buf.items.len - 1] == '\r') {
+                self.buf.items.len -= 1;
+            }
+            if (is_complete(self.buf.items)) {
+                self.cursor = self.buf.items.len;
+                return self.buf.items;
+            }
+            self.buf.append(self.sh.gpa, '\n') catch return null;
         }
     }
 
@@ -281,6 +391,116 @@ pub const Editor = struct {
         self.last_rows = end_row;
     }
 
+    fn renderCommand(self: *Editor, prompt_text: []const u8, write_continuation: WriteContinuationPrompt) void {
+        self.updateWidth();
+        self.frame.writer.end = 0;
+
+        var continuation: std.Io.Writer.Allocating = .init(self.sh.gpa);
+        defer continuation.deinit();
+
+        var line_start: usize = 0;
+        var line_index: usize = 0;
+        var visual_start: usize = 0;
+        var cursor_row: usize = 0;
+        var cursor_col: usize = 0;
+        var cursor_found = false;
+        var end_row: usize = 0;
+        var end_col: usize = 0;
+        const multiline = std.mem.indexOfScalar(u8, self.buf.items, '\n') != null;
+
+        while (line_start <= self.buf.items.len) : (line_index += 1) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.buf.items, line_start, '\n') orelse self.buf.items.len;
+            const text = self.buf.items[line_start..line_end];
+            continuation.writer.end = 0;
+            if (line_index == 0) {
+                tryWrite(&self.frame.writer, prompt_text);
+            } else {
+                write_continuation(&continuation.writer, self.sh, line_index) catch {};
+                tryWrite(&self.frame.writer, continuation.writer.buffered());
+            }
+            const prompt_width = if (line_index == 0)
+                displayWidth(prompt_text)
+            else
+                displayWidth(continuation.writer.buffered());
+
+            if (!cursor_found and self.cursor >= line_start and self.cursor <= line_end) {
+                const position = prompt_width + displayWidth(self.buf.items[line_start..self.cursor]);
+                cursor_row = visual_start + position / self.width;
+                cursor_col = position % self.width;
+                cursor_found = true;
+            }
+
+            if (self.sh.config.highlight) {
+                highlight.render(&self.frame.writer, self.sh, text) catch {};
+            } else {
+                self.frame.writer.writeAll(text) catch {};
+            }
+
+            const line_width = prompt_width + displayWidth(text);
+            if (line_end < self.buf.items.len) {
+                self.frame.writer.writeAll("\r\n") catch {};
+                visual_start += line_width / self.width + 1;
+                line_start = line_end + 1;
+                continue;
+            }
+
+            var correction_text: [320]u8 = undefined;
+            const suggestion = if (!multiline) blk: {
+                if (self.currentCachedCorrection()) |name| {
+                    break :blk std.fmt.bufPrint(&correction_text, "  => {s}", .{name}) catch null;
+                }
+                break :blk self.currentSuggestion();
+            } else null;
+            const hint_width = if (suggestion) |text_hint| displayWidth(text_hint) else 0;
+            if (suggestion) |hint| {
+                self.frame.writer.writeAll(highlight.gray) catch {};
+                self.frame.writer.writeAll(hint) catch {};
+                self.frame.writer.writeAll(highlight.reset) catch {};
+            }
+
+            const final_width = line_width + hint_width;
+            end_row = visual_start + final_width / self.width;
+            end_col = final_width % self.width;
+            break;
+        }
+
+        if (!cursor_found) {
+            cursor_row = end_row;
+            cursor_col = end_col;
+        }
+
+        self.write("\r");
+        if (self.command_frame_active and self.command_cursor_row > 0) {
+            var up: [64]u8 = undefined;
+            const sequence = std.fmt.bufPrint(&up, "\x1b[{d}A", .{self.command_cursor_row}) catch "";
+            self.write(sequence);
+        }
+        self.write("\x1b[J");
+        self.write(self.frame.writer.buffered());
+
+        self.write("\r");
+        var scratch: [64]u8 = undefined;
+        if (end_row > cursor_row) {
+            const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}A", .{end_row - cursor_row}) catch "";
+            self.write(sequence);
+        } else if (cursor_row > end_row) {
+            const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}B", .{cursor_row - end_row}) catch "";
+            self.write(sequence);
+        }
+        if (cursor_col > 0) {
+            const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}C", .{cursor_col}) catch "";
+            self.write(sequence);
+        }
+
+        self.command_frame_active = true;
+        self.command_cursor_row = cursor_row;
+        self.command_end_row = end_row;
+    }
+
+    fn tryWrite(writer: *std.Io.Writer, text: []const u8) void {
+        writer.writeAll(text) catch {};
+    }
+
     fn write(self: *Editor, text: []const u8) void {
         sys.writeStr(self.out_fd, text);
     }
@@ -320,6 +540,46 @@ pub const Editor = struct {
 
     fn moveRight(self: *Editor) void {
         if (self.cursor < self.buf.items.len) self.cursor += 1;
+    }
+
+    fn moveVertical(self: *Editor, direction: i8) void {
+        const previous_newline = std.mem.lastIndexOfScalar(u8, self.buf.items[0..self.cursor], '\n');
+        const line_start = if (previous_newline) |index| index + 1 else 0;
+        const line_end = std.mem.indexOfScalarPos(u8, self.buf.items, line_start, '\n') orelse self.buf.items.len;
+        const column = displayWidth(self.buf.items[line_start..self.cursor]);
+
+        if (direction < 0) {
+            if (line_start == 0) {
+                self.historyPrev();
+                return;
+            }
+            const previous_end = line_start - 1;
+            const previous_start = if (std.mem.lastIndexOfScalar(u8, self.buf.items[0..previous_end], '\n')) |index|
+                index + 1
+            else
+                0;
+            self.cursor = previous_start + byteOffsetAtColumn(self.buf.items[previous_start..previous_end], column);
+            return;
+        }
+
+        if (line_end == self.buf.items.len) {
+            self.historyNext();
+            return;
+        }
+        const next_start = line_end + 1;
+        const next_end = std.mem.indexOfScalarPos(u8, self.buf.items, next_start, '\n') orelse self.buf.items.len;
+        self.cursor = next_start + byteOffsetAtColumn(self.buf.items[next_start..next_end], column);
+    }
+
+    fn byteOffsetAtColumn(text: []const u8, column: usize) usize {
+        var offset: usize = 0;
+        var current_column: usize = 0;
+        while (offset < text.len and current_column < column) {
+            const sequence_len = std.unicode.utf8ByteSequenceLength(text[offset]) catch 1;
+            offset += @min(sequence_len, text.len - offset);
+            current_column += 1;
+        }
+        return offset;
     }
 
     fn moveWordLeft(self: *Editor) void {
@@ -694,6 +954,21 @@ test "history navigation stashes the in-progress line" {
     try std.testing.expectEqualStrings("second", ed.buf.items);
     ed.historyNext();
     try std.testing.expectEqualStrings("draft", ed.buf.items);
+}
+
+test "up and down move between lines in a multiline command" {
+    var sh = try Shell.initBare(std.testing.allocator);
+    defer sh.deinit();
+    var ed = Editor.init(&sh, -1, -1);
+    defer ed.deinit();
+
+    ed.setLine("if true {\nprint first\nprint second");
+    ed.moveVertical(-1);
+    ed.insertByte('!');
+    try std.testing.expectEqualStrings("if true {\nprint first!\nprint second", ed.buf.items);
+
+    ed.moveVertical(1);
+    try std.testing.expectEqual(ed.buf.items.len, ed.cursor);
 }
 
 test "display width ignores colour codes and counts code points" {

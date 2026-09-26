@@ -1,56 +1,116 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="590" viewBox="0 0 960 590" role="img" aria-labelledby="title description">
-  <title id="title">wolysh local performance measurements</title>
-  <desc id="description">Four separately scaled horizontal bar charts compare startup time, a 20,000-iteration loop, interactive idle memory, and wolysh binary build sizes.</desc>
+  <title id="title">wolysh performance snapshot</title>
+  <desc id="description">Dark comparison dashboard showing startup, loop, idle memory, and binary-size measurements. Bars use a separate scale in each panel.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#193027" stroke-width="1" opacity="0.38" />
+    </pattern>
+    <linearGradient id="wsh" x1="0" x2="1">
+      <stop offset="0" stop-color="#b7ef67" />
+      <stop offset="1" stop-color="#47d7a2" />
+    </linearGradient>
+    <linearGradient id="small" x1="0" x2="1">
+      <stop offset="0" stop-color="#72e7bd" />
+      <stop offset="1" stop-color="#b7ef67" />
+    </linearGradient>
+  </defs>
   <style>
-    text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
-    .title { font-size: 25px; font-weight: 700; }
-    .subtitle { font-size: 13px; fill: #475569; }
-    .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1; }
-    .heading { font-size: 16px; font-weight: 650; }
-    .label { font-size: 14px; }
-    .value { font-size: 13px; font-weight: 650; }
-    .wsh { fill: #0891b2; }
-    .bash { fill: #64748b; }
+    text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; fill: #edf6f0; }
+    .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 1.6px; fill: #b7ef67; }
+    .title { font-size: 29px; font-weight: 750; letter-spacing: -0.7px; }
+    .subtitle { font-size: 13px; fill: #94aaa0; }
+    .panel { fill: #101a17; stroke: #24362f; stroke-width: 1; }
+    .heading { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; }
+    .context { font-size: 11px; fill: #8fa39a; }
+    .label { font-size: 12px; fill: #bdcbc4; }
+    .value { font-size: 12px; font-weight: 700; }
+    .badge { fill: #1a3024; stroke: #355b3d; stroke-width: 1; }
+    .badge-text { font-size: 10px; font-weight: 750; letter-spacing: 0.5px; fill: #c9f18a; }
+    .track { fill: #1d2a25; }
+    .wsh { fill: url(#wsh); }
+    .bash { fill: #53645d; }
+    .small { fill: url(#small); }
+    .foot { font-size: 11px; fill: #81958c; }
   </style>
-  <rect width="960" height="590" fill="#ffffff" />
-  <text class="title" x="32" y="42">Measured performance</text>
-  <text class="subtitle" x="32" y="67">Local results; lower is better. Each panel uses its own scale.</text>
 
-  <rect class="panel" x="24" y="91" width="444" height="208" />
-  <text class="heading" x="44" y="123">Startup · 500 runs (-c true)</text>
-  <text class="label" x="44" y="168">wolysh</text>
-  <rect class="wsh" x="145" y="151" width="121" height="23" />
-  <text class="value" x="276" y="168">1.14 ms</text>
-  <text class="label" x="44" y="211">Bash</text>
-  <rect class="bash" x="145" y="194" width="229" height="23" />
-  <text class="value" x="384" y="211">2.16 ms</text>
+  <rect width="960" height="590" fill="#09100d" />
+  <rect width="960" height="590" fill="url(#grid)" />
+  <path d="M0 105 H960" stroke="#20352b" stroke-width="1" />
 
-  <rect class="panel" x="492" y="91" width="444" height="208" />
-  <text class="heading" x="512" y="123">Loop · 20,000 iterations</text>
-  <text class="label" x="512" y="168">wolysh</text>
-  <rect class="wsh" x="613" y="151" width="30" height="23" />
-  <text class="value" x="653" y="168">15 ms</text>
-  <text class="label" x="512" y="211">Bash</text>
-  <rect class="bash" x="613" y="194" width="240" height="23" />
-  <text class="value" x="863" y="211">120 ms</text>
+  <text class="eyebrow" x="28" y="30">WOLYSH / PERFORMANCE</text>
+  <text class="title" x="28" y="66">Small shell. Serious speed.</text>
+  <text class="subtitle" x="28" y="88">Local Linux x86_64 measurements · lower is better · per-panel scales</text>
+  <rect x="740" y="31" width="192" height="29" rx="14.5" fill="#14221c" stroke="#2c4337" />
+  <circle cx="758" cy="45.5" r="4" fill="#b7ef67" />
+  <text class="context" x="770" y="49">MEASURED · NOT STANDARDIZED</text>
 
-  <rect class="panel" x="24" y="319" width="444" height="208" />
-  <text class="heading" x="44" y="351">Interactive idle memory</text>
-  <text class="label" x="44" y="396">wolysh</text>
-  <rect class="wsh" x="145" y="379" width="41" height="23" />
-  <text class="value" x="196" y="396">0.7 MB</text>
-  <text class="label" x="44" y="439">Bash</text>
-  <rect class="bash" x="145" y="422" width="244" height="23" />
-  <text class="value" x="399" y="439">4.2 MB</text>
+  <g>
+    <rect class="panel" x="24" y="126" width="444" height="194" rx="14" />
+    <rect x="24" y="145" width="3" height="38" rx="1.5" fill="#b7ef67" />
+    <text class="heading" x="44" y="154">Startup</text>
+    <text class="context" x="44" y="174">500 runs · -c true</text>
+    <rect class="badge" x="335" y="139" width="112" height="26" rx="13" />
+    <text class="badge-text" x="391" y="156" text-anchor="middle">1.9× FASTER</text>
+    <text class="label" x="44" y="221">wolysh</text>
+    <rect class="track" x="132" y="207" width="190" height="13" rx="6.5" />
+    <rect class="wsh" x="132" y="207" width="100" height="13" rx="6.5" />
+    <text class="value" x="334" y="220">1.14 ms</text>
+    <text class="label" x="44" y="264">Bash</text>
+    <rect class="track" x="132" y="250" width="190" height="13" rx="6.5" />
+    <rect class="bash" x="132" y="250" width="190" height="13" rx="6.5" />
+    <text class="value" x="334" y="263">2.16 ms</text>
+  </g>
 
-  <rect class="panel" x="492" y="319" width="444" height="208" />
-  <text class="heading" x="512" y="351">wolysh binary size</text>
-  <text class="label" x="512" y="396">ReleaseFast</text>
-  <rect class="wsh" x="613" y="379" width="234" height="23" />
-  <text class="value" x="857" y="396">312 KB</text>
-  <text class="label" x="512" y="439">ReleaseSmall</text>
-  <rect class="wsh" x="613" y="422" width="151" height="23" opacity="0.62" />
-  <text class="value" x="774" y="439">201 KB</text>
+  <g>
+    <rect class="panel" x="492" y="126" width="444" height="194" rx="14" />
+    <rect x="492" y="145" width="3" height="38" rx="1.5" fill="#b7ef67" />
+    <text class="heading" x="512" y="154">Loop throughput</text>
+    <text class="context" x="512" y="174">20,000 iterations</text>
+    <rect class="badge" x="827" y="139" width="92" height="26" rx="13" />
+    <text class="badge-text" x="873" y="156" text-anchor="middle">8× FASTER</text>
+    <text class="label" x="512" y="221">wolysh</text>
+    <rect class="track" x="600" y="207" width="190" height="13" rx="6.5" />
+    <rect class="wsh" x="600" y="207" width="24" height="13" rx="6.5" />
+    <text class="value" x="802" y="220">15 ms</text>
+    <text class="label" x="512" y="264">Bash</text>
+    <rect class="track" x="600" y="250" width="190" height="13" rx="6.5" />
+    <rect class="bash" x="600" y="250" width="190" height="13" rx="6.5" />
+    <text class="value" x="802" y="263">120 ms</text>
+  </g>
 
-  <text class="subtitle" x="24" y="565">Single development machine; workload-specific measurements, not a standardized benchmark.</text>
+  <g>
+    <rect class="panel" x="24" y="340" width="444" height="194" rx="14" />
+    <rect x="24" y="359" width="3" height="38" rx="1.5" fill="#b7ef67" />
+    <text class="heading" x="44" y="368">Interactive idle memory</text>
+    <text class="context" x="44" y="388">Resident memory · shell at rest</text>
+    <rect class="badge" x="335" y="353" width="112" height="26" rx="13" />
+    <text class="badge-text" x="391" y="370" text-anchor="middle">6× LESS RAM</text>
+    <text class="label" x="44" y="435">wolysh</text>
+    <rect class="track" x="132" y="421" width="190" height="13" rx="6.5" />
+    <rect class="wsh" x="132" y="421" width="32" height="13" rx="6.5" />
+    <text class="value" x="334" y="434">0.7 MB</text>
+    <text class="label" x="44" y="478">Bash</text>
+    <rect class="track" x="132" y="464" width="190" height="13" rx="6.5" />
+    <rect class="bash" x="132" y="464" width="190" height="13" rx="6.5" />
+    <text class="value" x="334" y="477">4.2 MB</text>
+  </g>
+
+  <g>
+    <rect class="panel" x="492" y="340" width="444" height="194" rx="14" />
+    <rect x="492" y="359" width="3" height="38" rx="1.5" fill="#72e7bd" />
+    <text class="heading" x="512" y="368">Binary size</text>
+    <text class="context" x="512" y="388">Release build variants</text>
+    <rect class="badge" x="803" y="353" width="116" height="26" rx="13" />
+    <text class="badge-text" x="861" y="370" text-anchor="middle">36% SMALLER</text>
+    <text class="label" x="512" y="435">ReleaseFast</text>
+    <rect class="track" x="612" y="421" width="178" height="13" rx="6.5" />
+    <rect class="wsh" x="612" y="421" width="178" height="13" rx="6.5" />
+    <text class="value" x="802" y="434">312 KB</text>
+    <text class="label" x="512" y="478">ReleaseSmall</text>
+    <rect class="track" x="612" y="464" width="178" height="13" rx="6.5" />
+    <rect class="small" x="612" y="464" width="115" height="13" rx="6.5" />
+    <text class="value" x="802" y="477">201 KB</text>
+  </g>
+
+  <text class="foot" x="24" y="566">One development machine; workload-specific measurements, not a standardized benchmark.</text>
 </svg>

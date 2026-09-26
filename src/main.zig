@@ -224,9 +224,6 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
     var editor_state = editor_mod.Editor.init(sh, 0, 2);
     defer editor_state.deinit();
 
-    var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(gpa);
-
     var prompt_allocating: std.Io.Writer.Allocating = .init(gpa);
     defer prompt_allocating.deinit();
 
@@ -237,35 +234,21 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         sh.reapJobs();
         sh.notifyFinishedJobs(2);
 
-        line.clearRetainingCapacity();
-
-        // First line, then continuation lines while the construct is open.
         prompt_allocating.writer.end = 0;
         prompt.write(&prompt_allocating.writer, sh) catch {};
-        const first = editor_state.readLine(prompt_allocating.writer.buffered()) orelse {
+        const source = editor_state.readCommand(
+            prompt_allocating.writer.buffered(),
+            exec.isComplete,
+            prompt.writeContinuation,
+        ) orelse {
             sys.writeStr(1, "\n");
             break;
         };
         if (editor_state.interrupted) continue;
-        line.appendSlice(gpa, first) catch break;
+        if (source.len == 0) continue;
 
-        var depth: usize = 0;
-        while (!exec.isComplete(line.items)) {
-            depth += 1;
-            prompt_allocating.writer.end = 0;
-            prompt.writeContinuation(&prompt_allocating.writer, sh, depth) catch {};
-            const next = editor_state.readLine(prompt_allocating.writer.buffered()) orelse break;
-            if (editor_state.interrupted) {
-                line.clearRetainingCapacity();
-                break;
-            }
-            line.append(gpa, '\n') catch break;
-            line.appendSlice(gpa, next) catch break;
-        }
-        if (line.items.len == 0) continue;
-
-        sh.hist.add(gpa, line.items) catch {};
-        _ = exec.runSource(sh, line.items);
+        sh.hist.add(gpa, source) catch {};
+        _ = exec.runSource(sh, source);
         // `let prompt = ...` or `let autosuggest = false` should take effect
         // on the very next prompt.
         sh.applyConfig();
