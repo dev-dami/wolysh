@@ -2,37 +2,37 @@
   <title id="title">wolysh performance relative to reference measurements</title>
   <desc id="description">A dark dumbbell plot shows each wolysh result as a percentage of Bash or ReleaseFast, with lower values better. Startup is 53 percent, loop time 13 percent, memory 17 percent, and ReleaseSmall binary size 64 percent of the reference.</desc>
   <style>
-    text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; fill: #edf3ef; }
-    .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; fill: #b7ef67; }
+    text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; fill: #f2f2f2; }
+    .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; fill: #e8e8e8; }
     .title { font-size: 29px; font-weight: 750; letter-spacing: -0.6px; }
-    .subtitle { font-size: 13px; fill: #9aa9a2; }
-    .meta { font-size: 10px; font-weight: 650; letter-spacing: 0.7px; fill: #9aa9a2; }
-    .column { font-size: 10px; font-weight: 700; letter-spacing: 1px; fill: #889891; }
-    .tick { font-size: 10px; fill: #81918a; }
-    .row { fill: #111a17; stroke: #27352f; stroke-width: 1; }
+    .subtitle { font-size: 13px; fill: #b3b3b3; }
+    .meta { font-size: 10px; font-weight: 650; letter-spacing: 0.7px; fill: #a0a0a0; }
+    .column { font-size: 10px; font-weight: 700; letter-spacing: 1px; fill: #a6a6a6; }
+    .tick { font-size: 10px; fill: #898989; }
+    .row { fill: #111111; stroke: #292929; stroke-width: 1; }
     .metric { font-size: 13px; font-weight: 700; letter-spacing: 0.35px; }
-    .detail { font-size: 11px; fill: #aab7b0; }
-    .wolysh-text { fill: #c8f28d; }
-    .connector { stroke: #596961; stroke-width: 2; }
-    .point { fill: #b7ef67; stroke: #09100d; stroke-width: 3; }
-    .point-label { font-size: 11px; font-weight: 750; fill: #c8f28d; }
-    .reference { fill: #09100d; stroke: #a1afa8; stroke-width: 2; }
-    .guide { stroke: #405048; stroke-width: 1; stroke-dasharray: 3 5; }
-    .change { font-size: 19px; font-weight: 750; fill: #b7ef67; }
-    .change-detail { font-size: 10px; fill: #9aa9a2; }
-    .foot { font-size: 11px; fill: #83928b; }
+    .detail { font-size: 11px; fill: #b0b0b0; }
+    .wolysh-text { fill: #f2f2f2; }
+    .connector { stroke: #5e5e5e; stroke-width: 2; }
+    .point { fill: #f2f2f2; stroke: #000000; stroke-width: 3; }
+    .point-label { font-size: 11px; font-weight: 750; fill: #f2f2f2; }
+    .reference { fill: #000000; stroke: #b8b8b8; stroke-width: 2; }
+    .guide { stroke: #505050; stroke-width: 1; stroke-dasharray: 3 5; }
+    .change { font-size: 19px; font-weight: 750; fill: #f2f2f2; }
+    .change-detail { font-size: 10px; fill: #a0a0a0; }
+    .foot { font-size: 11px; fill: #898989; }
   </style>
 
-  <rect width="960" height="570" fill="#0b100e" />
+  <rect width="960" height="570" fill="#000000" />
 
   <text class="eyebrow" x="28" y="31">WOLYSH / PERFORMANCE</text>
   <text class="title" x="28" y="67">The shell, measured.</text>
   <text class="subtitle" x="28" y="91">Dot position is the share of its reference result. Lower is better.</text>
-  <rect x="681" y="24" width="251" height="30" rx="15" fill="#121b17" stroke="#2a3831" />
-  <circle cx="699" cy="39" r="4" fill="#b7ef67" />
+  <rect x="681" y="24" width="251" height="30" rx="15" fill="#111111" stroke="#333333" />
+  <circle cx="699" cy="39" r="4" fill="#f2f2f2" />
   <text class="meta" x="711" y="43">LOCAL RESULTS · SINGLE DEV MACHINE</text>
 
-  <circle cx="704" cy="112" r="5" fill="#b7ef67" />
+  <circle cx="704" cy="112" r="5" fill="#f2f2f2" />
   <text class="detail" x="716" y="116">wolysh result</text>
   <circle cx="824" cy="112" r="5" class="reference" />
   <text class="detail" x="836" y="116">reference · 100%</text>
