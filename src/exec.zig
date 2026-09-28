@@ -22,6 +22,13 @@ const Value = value.Value;
 
 pub const Error = expand_mod.Error || std.Io.Writer.Error || error{ CommandNotFound, ExecutionFailed };
 
+/// How many loops are currently executing. `break N`/`continue N` count from
+/// the innermost one.
+var loop_depth: u32 = 0;
+/// Enclosing loops a pending `break`/`continue` still has to reach.
+var break_level: u32 = 0;
+var continue_level: u32 = 0;
+
 /// Parses and runs `src`, returning the resulting status.
 pub fn runSource(sh: *Shell, src: []const u8) u8 {
     const arena = sh.scratch();
@@ -33,6 +40,14 @@ pub fn runSource(sh: *Shell, src: []const u8) u8 {
     };
     const status = runStmts(sh, program.stmts);
     sh.last_status = status;
+    // A `break`/`continue` with no enclosing loop must not leak into the next
+    // command line.
+    if (loop_depth == 0) {
+        sh.break_pending = false;
+        sh.continue_pending = false;
+        break_level = 0;
+        continue_level = 0;
+    }
     return status;
 }
 
@@ -59,6 +74,7 @@ pub const isComplete = completeness.isComplete;
 pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     var status: u8 = 0;
     for (stmts) |stmt| {
+        sh.runPendingTraps();
         status = runStmt(sh, stmt);
         sh.last_status = status;
         if (sh.should_exit or sh.return_pending or sh.break_pending or sh.continue_pending) break;
@@ -73,21 +89,27 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
 
         .var_decl => |decl| {
             const v = evalExpr(sh, arena, decl.value) catch |err| return exprError(sh, err);
-            sh.setVar(decl.name, v) catch return 1;
+            sh.assignVar(decl.name, v) catch |err| {
+                if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
+                return 1;
+            };
             return 0;
         },
 
         .env_assign => |assign| {
             const v = evalExpr(sh, arena, assign.value) catch |err| return exprError(sh, err);
             const text = v.renderAlloc(arena) catch return 1;
-            switch (assign.op) {
-                .set => sh.setEnv(assign.name, text) catch return 1,
-                .append => {
+            const final = switch (assign.op) {
+                .set => text,
+                .append => blk: {
                     const existing = sh.getEnv(assign.name) orelse "";
-                    const joined = std.fmt.allocPrint(arena, "{s}{s}", .{ existing, text }) catch return 1;
-                    sh.setEnv(assign.name, joined) catch return 1;
+                    break :blk std.fmt.allocPrint(arena, "{s}{s}", .{ existing, text }) catch return 1;
                 },
-            }
+            };
+            sh.assignEnv(assign.name, final) catch |err| {
+                if (err == error.ReadonlyVariable) reportReadonly(sh, assign.name);
+                return 1;
+            };
             return 0;
         },
 
@@ -117,13 +139,15 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
             return sh.return_code;
         },
 
-        .break_ => {
+        .break_ => |count| {
             sh.break_pending = true;
+            break_level = if (loop_depth == 0) 1 else @min(count, loop_depth);
             return 0;
         },
 
-        .continue_ => {
+        .continue_ => |count| {
             sh.continue_pending = true;
+            continue_level = if (loop_depth == 0) 1 else @min(count, loop_depth);
             return 0;
         },
 
@@ -141,8 +165,12 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             sys.writeStr(sh.default_err, "wsh: out of memory\n");
             return 1;
         },
-        error.UnsupportedArithmetic => {
-            sys.writeStr(sh.default_err, "wsh: $((...)) is not supported; use `let` for arithmetic\n");
+        error.InvalidArithmetic => {
+            sys.writeStr(sh.default_err, "wsh: arithmetic syntax error\n");
+            return 2;
+        },
+        error.DivisionByZero => {
+            sys.writeStr(sh.default_err, "wsh: division by zero\n");
             return 2;
         },
         error.UnterminatedSubstitution => {
@@ -154,6 +182,10 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             return 1;
         },
         error.ExecutionFailed => return 1,
+        error.ReadonlyVariable => {
+            sys.writeStr(sh.default_err, "wsh: readonly variable\n");
+            return 1;
+        },
         else => {
             var buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{@errorName(err)}) catch "wsh: error\n";
@@ -161,6 +193,12 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             return 2;
         },
     }
+}
+
+fn reportReadonly(sh: *Shell, name: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "wsh: {s}: readonly variable\n", .{name}) catch return;
+    sys.writeStr(sh.default_err, msg);
 }
 
 fn statusFromValue(v: Value) u8 {
@@ -179,6 +217,39 @@ fn statusFromValue(v: Value) u8 {
     };
 }
 
+/// What the loop boundary should do with a pending `break`/`continue`.
+const LoopControl = enum {
+    none,
+    /// The innermost loop handles it.
+    here,
+    /// The count reaches further out: stop this loop and pass it upward.
+    outer,
+};
+
+fn takeBreak(sh: *Shell) LoopControl {
+    if (!sh.break_pending and break_level == 0) return .none;
+    sh.break_pending = false;
+    if (break_level > 1) {
+        break_level -= 1;
+        sh.break_pending = true;
+        return .outer;
+    }
+    break_level = 0;
+    return .here;
+}
+
+fn takeContinue(sh: *Shell) LoopControl {
+    if (!sh.continue_pending and continue_level == 0) return .none;
+    sh.continue_pending = false;
+    if (continue_level > 1) {
+        continue_level -= 1;
+        sh.continue_pending = true;
+        return .outer;
+    }
+    continue_level = 0;
+    return .here;
+}
+
 fn runFor(sh: *Shell, loop: ast.For) u8 {
     const outer = sh.scratch();
     // Items are expanded in the enclosing arena so they survive the per
@@ -192,7 +263,11 @@ fn runFor(sh: *Shell, loop: ast.For) u8 {
     defer iter_arena.deinit();
     const saved = sh.scratch_override;
     sh.scratch_override = iter_arena.allocator();
-    defer sh.scratch_override = saved;
+    defer {
+        sh.scratch_override = saved;
+        loop_depth -= 1;
+    }
+    loop_depth += 1;
 
     var status: u8 = 0;
     for (items.items) |item| {
@@ -200,14 +275,12 @@ fn runFor(sh: *Shell, loop: ast.For) u8 {
         sh.setVar(loop.name, .{ .string = item }) catch return 1;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
-        if (sh.break_pending) {
-            sh.break_pending = false;
-            break;
-        }
-        if (sh.continue_pending) {
-            sh.continue_pending = false;
-            continue;
-        }
+        const brk = takeBreak(sh);
+        if (brk == .here) break;
+        if (brk == .outer) return status;
+        const next = takeContinue(sh);
+        if (next == .here) continue;
+        if (next == .outer) return status;
         if (sh.should_exit or sh.return_pending) break;
     }
     return status;
@@ -220,7 +293,11 @@ fn runWhile(sh: *Shell, loop: ast.While) u8 {
     defer iter_arena.deinit();
     const saved = sh.scratch_override;
     sh.scratch_override = iter_arena.allocator();
-    defer sh.scratch_override = saved;
+    defer {
+        sh.scratch_override = saved;
+        loop_depth -= 1;
+    }
+    loop_depth += 1;
 
     var status: u8 = 0;
     while (true) {
@@ -229,14 +306,12 @@ fn runWhile(sh: *Shell, loop: ast.While) u8 {
         if (!cond.truthy()) break;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
-        if (sh.break_pending) {
-            sh.break_pending = false;
-            break;
-        }
-        if (sh.continue_pending) {
-            sh.continue_pending = false;
-            continue;
-        }
+        const brk = takeBreak(sh);
+        if (brk == .here) break;
+        if (brk == .outer) return status;
+        const next = takeContinue(sh);
+        if (next == .here) continue;
+        if (next == .outer) return status;
         if (sh.should_exit or sh.return_pending) break;
     }
     return status;
@@ -307,6 +382,7 @@ pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator)
 /// Called once at startup to wire command substitution into expansion.
 pub fn install(sh: *Shell) void {
     sh.subst_runner = substitutionRunner;
+    sh.trap_runner = runSource;
 }
 
 // --- tests ------------------------------------------------------------------
@@ -672,6 +748,28 @@ test "isComplete distinguishes open constructs from real errors" {
     try testing.expect(isComplete("if true {\n echo hi\n}"));
 }
 
+test "isComplete knows about groups, here-strings and tab-stripping here-documents" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    try testing.expect(!isComplete("{ echo hi"));
+    try testing.expect(isComplete("{ echo hi; }"));
+    try testing.expect(isComplete("{ echo hi; } && echo done"));
+    try testing.expect(!isComplete("{ cd /tmp;"));
+    try testing.expect(isComplete("/bin/echo {} ${HOME}"));
+
+    try testing.expect(!isComplete("cmd &>"));
+    try testing.expect(isComplete("cmd &> out.txt"));
+    try testing.expect(isComplete("cmd &>> out.txt"));
+
+    try testing.expect(!isComplete("cat <<<"));
+    try testing.expect(isComplete("cat <<<word"));
+    try testing.expect(!isComplete("cat <<-EOF\n\tbody"));
+    try testing.expect(isComplete("cat <<-EOF\n\tbody\n\tEOF\n"));
+    try testing.expect(isComplete("cat <<-EOF # |\n\tbody\n\tEOF\n"));
+}
+
 test "a shell function can be called from an expression" {
     var sh = try Shell.initBare(testing.allocator);
     defer sh.deinit();
@@ -723,4 +821,319 @@ test "pipelines connect stdout to stdin" {
     const out = try collectOutput(&sh, "/bin/echo hello | /bin/cat\n");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("hello\n", out);
+}
+
+test "break N leaves N enclosing loops" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const source =
+        \\for i in a b {
+        \\    for j in 1 2 {
+        \\        echo inner
+        \\        break 2
+        \\    }
+        \\    echo outer-body
+        \\}
+        \\echo done
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("inner\ndone\n", out);
+}
+
+test "continue N resumes the Nth enclosing loop" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const source =
+        \\for i in a b {
+        \\    for j in 1 2 {
+        \\        echo inner
+        \\        continue 2
+        \\    }
+        \\    echo outer-body
+        \\}
+        \\echo done
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("inner\ninner\ndone\n", out);
+}
+
+test "break N deeper than the loop nest stops every loop" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const source =
+        \\for i in a b {
+        \\    echo once
+        \\    break 5
+        \\}
+        \\echo done
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("once\ndone\n", out);
+}
+
+test "brace groups run in the current shell" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const source =
+        \\let value = "parent"
+        \\{ let value = "child"; echo $value }
+        \\echo $value
+        \\{ echo grouped; } | /bin/cat
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("child\nchild\ngrouped\n", out);
+    try testing.expectEqualStrings("child", sh.getVar("value").?.string);
+}
+
+test "brace groups change directory in the current shell" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const original = (try fs.getCwd(testing.allocator)) orelse return;
+    defer testing.allocator.free(original);
+    defer {
+        var buf: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "cd {s}\n", .{original})) |restore| {
+            _ = runSource(&sh, restore);
+        } else |_| {}
+    }
+
+    const out = try collectOutput(&sh, "{ cd /; pwd }\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("/\n", out);
+    try testing.expectEqualStrings("/", sh.cwd);
+}
+
+test "a brace group honours redirections" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-group-redirect-test.txt";
+    var buf: [256]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf, "{{ echo grouped; }} > {s}\n", .{path});
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, source));
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    const data = (try fs.readFileAlloc(testing.allocator, z, 1024)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("grouped\n", data);
+    _ = fs.removeFile(z);
+}
+
+test "! inverts a pipeline status" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    try testing.expectEqual(@as(u8, 1), runSource(&sh, "! true\n"));
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, "! false\n"));
+    // `! !` cancels out, so the pipeline's own status stands.
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, "! ! true\n"));
+    try testing.expectEqual(@as(u8, 1), runSource(&sh, "! ! false\n"));
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, "! true || echo fallback\n"));
+
+    // A pipeline killed by a signal counts as a failure, so `!` succeeds. The
+    // shell's own "Killed" notice is sent to /dev/null to keep the log clean.
+    const null_fd = sys.openWrite("/dev/null", false).?;
+    const saved_err = sh.default_err;
+    sh.default_err = null_fd;
+    const status = runSource(&sh, "! /bin/sh -c 'kill -9 $$'\n");
+    sh.default_err = saved_err;
+    _ = linux.close(null_fd);
+    try testing.expectEqual(@as(u8, 0), status);
+}
+
+test "command-prefix assignments are temporary" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const out = try collectOutput(&sh, "FOO=bar /bin/sh -c 'echo $FOO'\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("bar\n", out);
+    try testing.expect(sh.getEnv("FOO") == null);
+    try testing.expect(sh.getVar("FOO") == null);
+
+    // A builtin run in-process sees it too, and the value is expanded.
+    const expanded = try collectOutput(&sh, "let who = \"ada\"\nWHO=$who eval 'echo $WHO'\n");
+    defer testing.allocator.free(expanded);
+    try testing.expectEqualStrings("ada\n", expanded);
+    try testing.expect(sh.getEnv("WHO") == null);
+
+    // `KEEP` is already exported, so a bare assignment updates it.
+    _ = runSource(&sh, "export KEEP=\"/tmp\"\n");
+    _ = runSource(&sh, "KEEP=kept\n");
+    try testing.expectEqualStrings("kept", sh.getEnv("KEEP").?);
+
+    // An assignment is only a prefix when it comes before the command word.
+    const out2 = try collectOutput(&sh, "/bin/echo FOO=bar\n");
+    defer testing.allocator.free(out2);
+    try testing.expectEqualStrings("FOO=bar\n", out2);
+}
+
+test "a bare assignment persists in the shell" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const out = try collectOutput(&sh, "FOO=persisted\necho $FOO\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("persisted\n", out);
+    try testing.expectEqualStrings("persisted", sh.getVar("FOO").?.string);
+}
+
+test "redirects beyond the standard descriptors" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-fd3-test.txt";
+    var buf: [320]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf, "/bin/sh -c 'echo to3 >&3' 3> {s}\n", .{path});
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, source));
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    const data = (try fs.readFileAlloc(testing.allocator, z, 1024)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("to3\n", data);
+    _ = fs.removeFile(z);
+}
+
+test "descriptor duplication from a numbered descriptor" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-dup3-test.txt";
+    var buf: [320]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf, "/bin/sh -c 'echo err >&2' 3>{s} 2>&3\n", .{path});
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, source));
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    const data = (try fs.readFileAlloc(testing.allocator, z, 1024)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("err\n", data);
+    _ = fs.removeFile(z);
+}
+
+test "a closed numbered descriptor is gone in the child" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-close-test.txt";
+    var buf: [480]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf, "/bin/sh -c 'if [ -e /dev/fd/3 ]; then echo open; else echo closed; fi' 3>{s} 3>&-\n", .{path});
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("closed\n", out);
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    _ = fs.removeFile(z);
+}
+
+test "&> redirects stdout and stderr to the same file" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-amp-test.txt";
+    var buf: [320]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf, "/bin/sh -c 'echo out; echo err >&2' &> {s}\n", .{path});
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, source));
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    const data = (try fs.readFileAlloc(testing.allocator, z, 1024)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("out\nerr\n", data);
+    _ = fs.removeFile(z);
+}
+
+test "$0 keeps naming the shell inside a function" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+    sh.script_name = "myscript";
+
+    const source =
+        \\fn show(who) {
+        \\    echo $0 $1
+        \\}
+        \\show ada
+        \\echo $0
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("myscript ada\nmyscript\n", out);
+}
+
+test "source passes positional parameters" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-source-test.sh";
+    var buf: [320]u8 = undefined;
+    const setup = try std.fmt.bufPrint(&buf, "echo 'echo $1 $2' > {s}\n", .{path});
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, setup));
+
+    var run: [320]u8 = undefined;
+    const call = try std.fmt.bufPrint(&run, "source {s} a b\n", .{path});
+    const sourced = try collectOutput(&sh, call);
+    defer testing.allocator.free(sourced);
+    try testing.expectEqualStrings("a b\n", sourced);
+    try testing.expectEqual(@as(usize, 0), sh.positional.len);
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    _ = fs.removeFile(z);
+}
+
+test "tab-stripping here-documents feed the body" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const out = try collectOutput(&sh, "cat <<-EOF\n\tone\n\t\ttwo\n\tEOF\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("one\ntwo\n", out);
+}
+
+test "here-strings feed the expanded word" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const out = try collectOutput(&sh, "cat <<<hello\nlet v = \"a b\"\ncat <<<\"$v\"\ncat <<<$v\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hello\na b\na b\n", out);
+}
+
+test "braces that belong to a word are left alone" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const out = try collectOutput(&sh, "let x = \"v\"\necho ${x}-suffix\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("v-suffix\n", out);
 }

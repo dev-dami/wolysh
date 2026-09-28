@@ -104,6 +104,11 @@ fn builtinSource(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8
         sys.writeStr(sh.default_err, msg);
         return 1;
     };
+    // Extra arguments become the sourced file's positional parameters for the
+    // duration of the run; `$0` is left alone.
+    const saved_positional = sh.positional;
+    defer sh.positional = saved_positional;
+    sh.positional = if (argv.len > 2) argv[2..] else &.{};
     return run_source(sh, data);
 }
 

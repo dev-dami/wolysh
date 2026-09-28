@@ -86,6 +86,26 @@ pub fn isTty(fd: fd_t) bool {
     return posix.tcgetattr(fd) != error.NotATerminal;
 }
 
+/// `access(2)` permission check against the real uid/gid. Modes follow the
+/// kernel: 4 = read, 2 = write, 1 = execute.
+pub fn canAccess(path: [:0]const u8, mode: u32) bool {
+    const rc = linux.faccessat(linux.AT.FDCWD, path.ptr, mode, 0);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+/// Size in bytes of a file, or null when it cannot be stat'ed.
+pub fn fileSize(path: [:0]const u8) ?u64 {
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .SIZE = true }, &st);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return st.size;
+}
+
+/// File-creation mask. Returns the previous mask, like `umask(2)`.
+pub fn umask(mask: u32) u32 {
+    return @truncate(linux.syscall1(.umask, mask));
+}
+
 pub const WinSize = struct { cols: u16, rows: u16 };
 
 pub fn windowSize(fd: fd_t) ?WinSize {
@@ -195,11 +215,11 @@ pub const StringBuilder = struct {
         return &self.allocating.writer;
     }
 
-    pub fn append(self: *StringBuilder, bytes: []const u8) std.mem.Allocator.Error!void {
+    pub fn append(self: *StringBuilder, bytes: []const u8) std.Io.Writer.Error!void {
         try self.allocating.writer.writeAll(bytes);
     }
 
-    pub fn appendByte(self: *StringBuilder, b: u8) std.mem.Allocator.Error!void {
+    pub fn appendByte(self: *StringBuilder, b: u8) std.Io.Writer.Error!void {
         try self.allocating.writer.writeByte(b);
     }
 
@@ -207,7 +227,7 @@ pub const StringBuilder = struct {
         try self.allocating.writer.splatByteAll(b, n);
     }
 
-    pub fn print(self: *StringBuilder, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
+    pub fn print(self: *StringBuilder, comptime fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
         try self.allocating.writer.print(fmt, args);
     }
 

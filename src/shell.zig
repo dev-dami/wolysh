@@ -31,6 +31,19 @@ pub const Config = struct {
     history_limit: usize = 5000,
 };
 
+/// Bit `N` is set when signal `N + 1` arrives. Written only from a signal
+/// handler, which is why it is a lock-free atomic rather than shell state.
+var trap_pending: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Handler installed for every trapped signal. Must stay async-signal-safe:
+/// it only sets a bit for `Shell.runPendingTraps` to pick up later.
+pub fn trapHandler(sig: linux.SIG) callconv(.c) void {
+    const number = @intFromEnum(sig);
+    if (number >= 1 and number <= Shell.max_signal) {
+        _ = trap_pending.fetchOr(@as(u64, 1) << @intCast(number - 1), .monotonic);
+    }
+}
+
 pub const Shell = struct {
     gpa: std.mem.Allocator,
 
@@ -39,6 +52,16 @@ pub const Shell = struct {
     /// Function name -> source text of its `fn` declaration.
     funcs: std.StringHashMap([]const u8),
     aliases: std.StringHashMap([]const u8),
+    /// Names locked by `readonly`; `setVar`/`setEnv` refuse to rebind them.
+    readonly: std.StringHashMap(void),
+    /// Saved bindings for nested `local` scopes, outermost frame first.
+    scopes: std.ArrayList(Scope) = .empty,
+    /// Trap handler source per signal number, indexed by `sig - 1`.
+    traps: [max_signal]?[]const u8 = [_]?[]const u8{null} ** max_signal,
+    /// Runs a trap handler's source; installed by `exec.zig` (see `install`).
+    trap_runner: ?*const fn (*Shell, []const u8) u8 = null,
+    /// Directories saved by `pushd`; index 0 is the most recent.
+    dir_stack: std.ArrayList([]const u8) = .empty,
 
     jobs: jobs.Table,
     hist: history.History,
@@ -97,6 +120,19 @@ pub const Shell = struct {
     subst_runner: ?SubstFn = null,
 
     pub const max_call_depth = 256;
+    pub const max_signal = 64;
+    pub const max_dirs = 32;
+
+    /// One `local` scope: the bindings it shadowed, innermost last.
+    pub const Scope = struct {
+        saved: std.ArrayList(SavedVar) = .empty,
+    };
+
+    pub const SavedVar = struct {
+        name: []const u8,
+        was_set: bool,
+        previous: value.Value = .none,
+    };
 
     fn blank(gpa: std.mem.Allocator) Shell {
         return .{
@@ -105,6 +141,7 @@ pub const Shell = struct {
             .env = std.StringHashMap([]const u8).init(gpa),
             .funcs = std.StringHashMap([]const u8).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
+            .readonly = std.StringHashMap(void).init(gpa),
             .jobs = .{},
             .hist = .{},
             .cwd = &.{},
@@ -179,6 +216,26 @@ pub const Shell = struct {
         }
         self.aliases.deinit();
 
+        var rit = self.readonly.iterator();
+        while (rit.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.readonly.deinit();
+
+        for (self.scopes.items) |*scope| {
+            for (scope.saved.items) |saved| {
+                self.gpa.free(saved.name);
+                freeValue(self.gpa, saved.previous);
+            }
+            scope.saved.deinit(self.gpa);
+        }
+        self.scopes.deinit(self.gpa);
+
+        for (self.traps) |maybe| {
+            if (maybe) |text| self.gpa.free(text);
+        }
+
+        for (self.dir_stack.items) |dir| self.gpa.free(dir);
+        self.dir_stack.deinit(self.gpa);
+
         self.jobs.deinit(self.gpa);
         self.hist.deinit(self.gpa);
         self.command_cache.deinit(self.gpa);
@@ -223,12 +280,185 @@ pub const Shell = struct {
     }
 
     pub fn unsetVar(self: *Shell, name: []const u8) bool {
+        if (self.isReadonly(name)) return false;
         if (self.vars.fetchRemove(name)) |kv| {
             self.gpa.free(kv.key);
             freeValue(self.gpa, kv.value);
             return true;
         }
         return false;
+    }
+
+    // --- readonly -----------------------------------------------------------
+
+    pub fn markReadonly(self: *Shell, name: []const u8) !void {
+        if (self.readonly.contains(name)) return;
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.readonly.put(owned, {});
+    }
+
+    pub fn isReadonly(self: *const Shell, name: []const u8) bool {
+        return self.readonly.contains(name);
+    }
+
+    /// `setVar` for a name the user asked for: refuses a `readonly` binding.
+    /// Builtins use this; the internal assignment paths do not, so restoring a
+    /// shadowed binding still works.
+    pub fn assignVar(self: *Shell, name: []const u8, val: value.Value) !void {
+        if (self.isReadonly(name)) return error.ReadonlyVariable;
+        return self.setVar(name, val);
+    }
+
+    /// `setEnv` counterpart of `assignVar`.
+    pub fn assignEnv(self: *Shell, name: []const u8, val: []const u8) !void {
+        if (self.isReadonly(name)) return error.ReadonlyVariable;
+        return self.setEnv(name, val);
+    }
+
+    // --- local scopes -------------------------------------------------------
+
+    /// Pushes a scope for `local`. The function executor calls this on entry to
+    /// a function body and `endScope` on the way out.
+    pub fn beginScope(self: *Shell) !void {
+        try self.scopes.append(self.gpa, .{});
+    }
+
+    /// Restores every binding the innermost scope shadowed.
+    pub fn endScope(self: *Shell) void {
+        if (self.scopes.items.len == 0) return;
+        var scope = self.scopes.pop().?;
+        while (scope.saved.pop()) |saved| {
+            if (saved.was_set) {
+                self.setVar(saved.name, saved.previous) catch {};
+            } else if (self.vars.fetchRemove(saved.name)) |kv| {
+                self.gpa.free(kv.key);
+                freeValue(self.gpa, kv.value);
+            }
+            self.gpa.free(saved.name);
+            freeValue(self.gpa, saved.previous);
+        }
+        scope.saved.deinit(self.gpa);
+    }
+
+    /// `local name=value`: remembers the enclosing binding, then assigns.
+    pub fn setLocal(self: *Shell, name: []const u8, val: value.Value) !void {
+        if (self.scopes.items.len != 0) try self.rememberLocal(name);
+        try self.setVar(name, val);
+    }
+
+    fn rememberLocal(self: *Shell, name: []const u8) !void {
+        const scope = &self.scopes.items[self.scopes.items.len - 1];
+        for (scope.saved.items) |saved| {
+            if (std.mem.eql(u8, saved.name, name)) return;
+        }
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        const previous = self.getVar(name);
+        const copy = if (previous) |v| try cloneValue(self.gpa, v) else value.Value.none;
+        errdefer if (previous != null) freeValue(self.gpa, copy);
+        try scope.saved.append(self.gpa, .{
+            .name = owned,
+            .was_set = previous != null,
+            .previous = copy,
+        });
+    }
+
+    // --- traps --------------------------------------------------------------
+
+    pub fn setTrap(self: *Shell, sig: u32, handler: []const u8) !void {
+        if (sig == 0 or sig > max_signal) return error.InvalidSignal;
+        const owned = try self.gpa.dupe(u8, handler);
+        errdefer self.gpa.free(owned);
+        if (self.traps[sig - 1]) |old| self.gpa.free(old);
+        self.traps[sig - 1] = owned;
+    }
+
+    pub fn getTrap(self: *const Shell, sig: u32) ?[]const u8 {
+        if (sig == 0 or sig > max_signal) return null;
+        return self.traps[sig - 1];
+    }
+
+    pub fn clearTrap(self: *Shell, sig: u32) bool {
+        if (sig == 0 or sig > max_signal) return false;
+        if (self.traps[sig - 1]) |old| {
+            self.gpa.free(old);
+            self.traps[sig - 1] = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// Runs handlers for signals caught since the last call. Safe to call
+    /// between statements; a no-op until `exec.zig` installs `trap_runner`.
+    pub fn runPendingTraps(self: *Shell) void {
+        const runner = self.trap_runner orelse return;
+        const bits = trap_pending.swap(0, .monotonic);
+        if (bits == 0) return;
+        var sig: u32 = 1;
+        while (sig <= max_signal) : (sig += 1) {
+            const bit: u6 = @intCast(sig - 1);
+            if ((bits >> bit) & 1 == 0) continue;
+            const handler = self.getTrap(sig) orelse continue;
+            if (handler.len == 0) continue;
+            self.last_status = runner(self, handler);
+        }
+    }
+
+    // --- directory stack ----------------------------------------------------
+
+    /// `pushd <dir>`: remembers the current directory, then changes to `dir`.
+    pub fn pushDir(self: *Shell, path: [:0]const u8) !bool {
+        const previous = (try fs.getCwd(self.gpa)) orelse (try self.gpa.dupe(u8, self.cwd));
+        errdefer self.gpa.free(previous);
+        if (!try self.setCwd(path)) {
+            self.gpa.free(previous);
+            return false;
+        }
+        if (self.dir_stack.items.len >= max_dirs) {
+            const oldest = self.dir_stack.orderedRemove(self.dir_stack.items.len - 1);
+            self.gpa.free(oldest);
+        }
+        try self.dir_stack.insert(self.gpa, 0, previous);
+        return true;
+    }
+
+    /// `pushd` with no argument: swaps the current directory with the top.
+    pub fn swapDirs(self: *Shell) !bool {
+        if (self.dir_stack.items.len == 0) return false;
+        const top = self.dir_stack.items[0];
+        const z = try self.gpa.dupeZ(u8, top);
+        defer self.gpa.free(z);
+        const previous = (try fs.getCwd(self.gpa)) orelse (try self.gpa.dupe(u8, self.cwd));
+        errdefer self.gpa.free(previous);
+        if (!try self.setCwd(z)) {
+            self.gpa.free(previous);
+            return false;
+        }
+        self.gpa.free(self.dir_stack.items[0]);
+        self.dir_stack.items[0] = previous;
+        return true;
+    }
+
+    /// `popd`: drops the top of the stack and changes to it.
+    pub fn popDir(self: *Shell) !bool {
+        if (self.dir_stack.items.len == 0) return false;
+        const top = self.dir_stack.orderedRemove(0);
+        defer self.gpa.free(top);
+        const z = try self.gpa.dupeZ(u8, top);
+        defer self.gpa.free(z);
+        return self.setCwd(z);
+    }
+
+    /// Replaces a leading `$HOME` with `~`, for `dirs` and the prompt.
+    pub fn shortenHome(self: *const Shell, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+        const home = self.getEnv("HOME") orelse return path;
+        if (home.len == 0) return path;
+        if (std.mem.eql(u8, path, home)) return "~";
+        if (path.len > home.len and std.mem.startsWith(u8, path, home) and path[home.len] == '/') {
+            return std.fmt.allocPrint(arena, "~{s}", .{path[home.len..]});
+        }
+        return path;
     }
 
     /// Variable names, for completion.
@@ -621,4 +851,61 @@ test "variables are deep-copied and freed" {
     a.free(source);
 
     try std.testing.expectEqualStrings("hello", vars.get("greeting").?.string);
+}
+
+test "local scopes restore shadowed bindings" {
+    const a = std.testing.allocator;
+    var sh = try Shell.initBare(a);
+    defer sh.deinit();
+
+    try sh.setVar("x", .{ .string = "outer" });
+    try sh.beginScope();
+    try sh.setLocal("x", .{ .string = "inner" });
+    try sh.setLocal("y", .{ .string = "fresh" });
+    try std.testing.expectEqualStrings("inner", sh.getVar("x").?.string);
+    try std.testing.expectEqualStrings("fresh", sh.getVar("y").?.string);
+    sh.endScope();
+
+    try std.testing.expectEqualStrings("outer", sh.getVar("x").?.string);
+    try std.testing.expect(sh.getVar("y") == null);
+}
+
+test "readonly names reject writes and removal" {
+    const a = std.testing.allocator;
+    var sh = try Shell.initBare(a);
+    defer sh.deinit();
+
+    try sh.setVar("locked", .{ .string = "kept" });
+    try sh.markReadonly("locked");
+    try std.testing.expectError(error.ReadonlyVariable, sh.assignVar("locked", .{ .string = "no" }));
+    try std.testing.expectError(error.ReadonlyVariable, sh.assignEnv("locked", "no"));
+    try std.testing.expect(!sh.unsetVar("locked"));
+    try std.testing.expectEqualStrings("kept", sh.getVar("locked").?.string);
+}
+
+test "traps are stored and cleared by signal number" {
+    const a = std.testing.allocator;
+    var sh = try Shell.initBare(a);
+    defer sh.deinit();
+
+    try sh.setTrap(2, "echo interrupted");
+    try std.testing.expectEqualStrings("echo interrupted", sh.getTrap(2).?);
+    try std.testing.expect(sh.clearTrap(2));
+    try std.testing.expect(sh.getTrap(2) == null);
+    try std.testing.expectError(error.InvalidSignal, sh.setTrap(0, "x"));
+}
+
+test "shortenHome collapses the home prefix" {
+    const a = std.testing.allocator;
+    var sh = try Shell.initBare(a);
+    defer sh.deinit();
+    try sh.setEnv("HOME", "/home/dev");
+
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("~", try sh.shortenHome(arena, "/home/dev"));
+    try std.testing.expectEqualStrings("~/src", try sh.shortenHome(arena, "/home/dev/src"));
+    try std.testing.expectEqualStrings("/home/devother", try sh.shortenHome(arena, "/home/devother"));
 }

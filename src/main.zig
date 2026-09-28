@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const build_options = @import("build_options");
 const sys = @import("sys.zig");
 const shellmod = @import("shell.zig");
 const exec = @import("exec.zig");
@@ -12,7 +13,7 @@ const prompt = @import("interactive/prompt.zig");
 
 const Shell = shellmod.Shell;
 
-const version_text = "wolysh 0.2.0\n";
+const version_text = "wolysh " ++ build_options.version ++ "\n";
 
 const help_text =
     \\wsh — wolysh, a modern Unix shell

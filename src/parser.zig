@@ -38,6 +38,34 @@ fn isKeyword(t: lexer.Token, kw: []const u8) bool {
     return t.tag == .word and eql(t.text, kw);
 }
 
+/// A descriptor number small enough to track, e.g. `3` in `3>file`.
+fn parseSmallFd(text: []const u8) ?i32 {
+    if (text.len == 0) return null;
+    var value: i32 = 0;
+    for (text) |c| {
+        if (c < '0' or c > '9') return null;
+        value = value * 10 + (c - '0');
+    }
+    if (value > 31) return null;
+    return value;
+}
+
+/// The descriptor written after `>&`/`<&`: a small number, or `-` to close.
+fn isDupTarget(text: []const u8) bool {
+    if (text.len == 1 and text[0] == '-') return true;
+    return parseSmallFd(text) != null;
+}
+
+/// Splits `NAME=value` when NAME is a plain identifier. A quoted or otherwise
+/// non-identifier left-hand side is an ordinary word.
+fn parseAssignment(word: []const u8) ?ast.PrefixAssign {
+    const eq = std.mem.indexOfScalar(u8, word, '=') orelse return null;
+    if (eq == 0) return null;
+    const name = word[0..eq];
+    if (!isIdentifier(name)) return null;
+    return .{ .name = name, .value = word[eq + 1 ..] };
+}
+
 const Save = struct {
     lex: lexer.State,
     tok: lexer.Token,
@@ -145,14 +173,8 @@ pub const Parser = struct {
                 if (eql(kw, "fn")) return self.parseFn();
                 if (eql(kw, "return")) return self.parseReturn();
                 if (eql(kw, "alias")) return self.parseAlias();
-                if (eql(kw, "break")) {
-                    self.advance();
-                    return .{ .break_ = {} };
-                }
-                if (eql(kw, "continue")) {
-                    self.advance();
-                    return .{ .continue_ = {} };
-                }
+                if (eql(kw, "break")) return self.parseLoopControl(true);
+                if (eql(kw, "continue")) return self.parseLoopControl(false);
                 if (eql(kw, "env")) {
                     if (try self.tryParseEnv()) |stmt| return stmt;
                 }
@@ -163,6 +185,21 @@ pub const Parser = struct {
 
     fn parseCommandChain(self: *Parser) Error!ast.Pipeline {
         return self.parseChain();
+    }
+
+    /// `break [n]` / `continue [n]`. The optional count must be a positive
+    /// integer; anything else is a syntax error.
+    fn parseLoopControl(self: *Parser, is_break: bool) Error!ast.Stmt {
+        self.advance(); // `break` / `continue`
+        var count: u32 = 1;
+        if (self.tok.tag == .word) {
+            const value = std.fmt.parseInt(u32, self.tok.text, 10) catch
+                return self.fail(if (is_break) "break expects a positive number" else "continue expects a positive number");
+            if (value == 0) return self.fail(if (is_break) "break expects a positive number" else "continue expects a positive number");
+            count = value;
+            self.advance();
+        }
+        return if (is_break) .{ .break_ = count } else .{ .continue_ = count };
     }
 
     // --- language constructs -------------------------------------------------
@@ -395,6 +432,13 @@ pub const Parser = struct {
     }
 
     fn parsePipeline(self: *Parser) Error!ast.Pipeline {
+        self.setMode(.word);
+        // A leading standalone `!` negates the whole pipeline; `! !` cancels.
+        var negate = false;
+        while (isKeyword(self.tok, "!")) {
+            negate = !negate;
+            self.advance();
+        }
         var cmds: std.ArrayList(ast.Command) = .empty;
         try cmds.append(self.arena, try self.parseCommand());
         while (self.tok.tag == .pipe) {
@@ -407,26 +451,69 @@ pub const Parser = struct {
             background = true;
             self.advance();
         }
-        return .{ .commands = try cmds.toOwnedSlice(self.arena), .background = background };
+        return .{
+            .commands = try cmds.toOwnedSlice(self.arena),
+            .background = background,
+            .negate = negate,
+        };
+    }
+
+    /// The descriptor written directly before a redirect operator, when the
+    /// last command word is a small number. Removes that word from `words`.
+    fn takeRedirectFd(self: *Parser, last_word: ?lexer.Token, words: *std.ArrayList(ast.Word)) ?i32 {
+        const word = last_word orelse return null;
+        if (words.items.len == 0 or word.text.len == 0 or word.text.len > 2) return null;
+        if (word.start + word.text.len != self.tok.start) return null;
+        const fd = parseSmallFd(word.text) orelse return null;
+        words.items.len -= 1;
+        return fd;
     }
 
     fn parseCommand(self: *Parser) Error!ast.Command {
         self.setMode(.word);
         var words: std.ArrayList(ast.Word) = .empty;
         var redirects: std.ArrayList(ast.Redirect) = .empty;
+        var assigns: std.ArrayList(ast.PrefixAssign) = .empty;
         var last_word: ?lexer.Token = null;
         var subshell: ?[]ast.Stmt = null;
+        var group: ?[]ast.Stmt = null;
 
         while (true) {
             switch (self.tok.tag) {
                 .word => {
-                    if (subshell != null) return self.fail("unexpected word after a subshell");
+                    if (subshell != null or group != null) {
+                        // After a group or subshell the only word that may
+                        // appear is a redirect's explicit descriptor number,
+                        // as in `{ ...; } 2>file`.
+                        const text = self.tok.text;
+                        if (words.items.len == 0 and redirects.items.len == 0 and
+                            text.len > 0 and text.len <= 2 and parseSmallFd(text) != null)
+                        {
+                            last_word = self.tok;
+                            self.advance();
+                            continue;
+                        }
+                        if (subshell != null) return self.fail("unexpected word after a subshell");
+                        return self.fail("unexpected word after a command group");
+                    }
+                    // `NAME=value` words before the command word form the
+                    // command's temporary environment.
+                    if (words.items.len == 0 and redirects.items.len == 0) {
+                        if (parseAssignment(self.tok.text)) |assignment| {
+                            try assigns.append(self.arena, assignment);
+                            self.advance();
+                            last_word = null;
+                            continue;
+                        }
+                    }
                     last_word = self.tok;
                     try words.append(self.arena, self.tok.text);
                     self.advance();
                 },
                 .lparen => {
-                    if (subshell != null or words.items.len != 0 or redirects.items.len != 0) {
+                    if (subshell != null or group != null or words.items.len != 0 or
+                        redirects.items.len != 0 or assigns.items.len != 0)
+                    {
                         return self.fail("a subshell must start a command");
                     }
                     self.advance();
@@ -436,49 +523,76 @@ pub const Parser = struct {
                     self.advance();
                     subshell = try stmts.toOwnedSlice(self.arena);
                 },
-                .out, .out_append => {
-                    const op = self.tok.tag;
-                    var kind: ast.RedirectKind = if (op == .out) .out else .out_append;
-                    const adjacent_word = if (last_word) |word|
-                        word.start + word.text.len == self.tok.start
-                    else
-                        false;
-                    if (adjacent_word and words.items.len > 0 and
-                        (eql(words.items[words.items.len - 1], "2") or eql(words.items[words.items.len - 1], "1")))
+                .lbrace => {
+                    if (subshell != null or group != null or words.items.len != 0 or
+                        redirects.items.len != 0 or assigns.items.len != 0)
                     {
-                        const fd_word = words.items[words.items.len - 1];
-                        words.items.len -= 1;
-                        kind = if (eql(fd_word, "2"))
-                            (if (op == .out) .err_out else .err_append)
-                        else
-                            (if (op == .out) .out else .out_append);
+                        return self.fail("a command group must start a command");
                     }
+                    self.advance();
+                    self.setMode(.word);
+                    var stmts: std.ArrayList(ast.Stmt) = .empty;
+                    try self.parseStmtList(&stmts);
+                    if (self.tok.tag != .rbrace) return self.fail("expected '}' to close the command group");
+                    self.advance();
+                    group = try stmts.toOwnedSlice(self.arena);
+                    last_word = null;
+                },
+                .out, .out_append, .in => {
+                    const base: ast.RedirectKind = switch (self.tok.tag) {
+                        .out => .out,
+                        .out_append => .out_append,
+                        else => .in,
+                    };
+                    const explicit = self.takeRedirectFd(last_word, &words);
                     last_word = null;
                     self.advance();
                     if (self.tok.tag == .amp) {
                         self.advance();
-                        if (self.tok.tag != .word or self.tok.text.len != 1 or self.tok.text[0] < '0' or self.tok.text[0] > '2') {
+                        if (self.tok.tag != .word or !isDupTarget(self.tok.text)) {
                             return self.fail("expected a file descriptor after '&'");
                         }
-                        const dup_kind: ast.RedirectKind = if (kind == .err_out or kind == .err_append) .err_dup else .out_dup;
-                        try redirects.append(self.arena, .{ .kind = dup_kind, .target = self.tok.text });
+                        const target_fd = explicit orelse base.fd();
+                        const kind: ast.RedirectKind = switch (target_fd) {
+                            0 => .in_dup,
+                            2 => .err_dup,
+                            else => .out_dup,
+                        };
+                        try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text, .fd = explicit orelse kind.fd() });
                         self.advance();
                         continue;
                     }
-                    if (self.tok.tag != .word) return self.fail("expected a file name after the redirect");
-                    try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text });
-                    last_word = null;
+                    if (self.tok.tag != .word) {
+                        return self.fail(if (base == .in) "expected a file name after '<'" else "expected a file name after the redirect");
+                    }
+                    const kind: ast.RedirectKind = if (explicit) |n| switch (n) {
+                        2 => switch (base) {
+                            .out => .err_out,
+                            .out_append => .err_append,
+                            .in => .in,
+                            else => base,
+                        },
+                        else => base,
+                    } else base;
+                    try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text, .fd = explicit orelse -1 });
                     self.advance();
+                    last_word = null;
                 },
-                .in => {
-                    last_word = null;
+                .out_both, .out_both_append => {
+                    const append = self.tok.tag == .out_both_append;
                     self.advance();
-                    if (self.tok.tag != .word) return self.fail("expected a file name after '<'");
-                    try redirects.append(self.arena, .{ .kind = .in, .target = self.tok.text });
-                    last_word = null;
+                    if (self.tok.tag != .word) return self.fail("expected a file name after '&>'");
+                    try redirects.append(self.arena, .{
+                        .kind = if (append) .out_append else .out,
+                        .target = self.tok.text,
+                    });
+                    // `&>file` is exactly `>file 2>&1`.
+                    try redirects.append(self.arena, .{ .kind = .err_dup, .target = "1" });
                     self.advance();
+                    last_word = null;
                 },
-                .here_doc => {
+                .here_doc, .here_doc_strip => {
+                    const strip = self.tok.tag == .here_doc_strip;
                     self.advance();
                     if (self.tok.tag != .word) return self.fail("expected a delimiter after '<<'");
                     const delimiter = parseHereDocDelimiter(self.arena, self.tok.text) catch return self.fail("invalid here-document delimiter");
@@ -486,7 +600,15 @@ pub const Parser = struct {
                         .kind = .here_doc,
                         .target = delimiter.text,
                         .expand_body = delimiter.expand,
+                        .strip_tabs = strip,
                     });
+                    self.advance();
+                    last_word = null;
+                },
+                .here_string => {
+                    self.advance();
+                    if (self.tok.tag != .word) return self.fail("expected a word after '<<<'");
+                    try redirects.append(self.arena, .{ .kind = .here_string, .target = self.tok.text });
                     self.advance();
                     last_word = null;
                 },
@@ -494,13 +616,20 @@ pub const Parser = struct {
             }
         }
 
-        if (words.items.len == 0 and redirects.items.len == 0 and subshell == null) {
+        if ((subshell != null or group != null) and last_word != null) {
+            return self.fail("expected a redirect after the descriptor");
+        }
+        if (words.items.len == 0 and redirects.items.len == 0 and
+            subshell == null and group == null and assigns.items.len == 0)
+        {
             return self.fail("expected a command");
         }
         const command = ast.Command{
             .words = try words.toOwnedSlice(self.arena),
             .redirects = try redirects.toOwnedSlice(self.arena),
             .subshell = subshell,
+            .group = group,
+            .assigns = try assigns.toOwnedSlice(self.arena),
         };
         for (command.redirects) |*redirect| {
             if (redirect.kind == .here_doc) try self.pending_heredocs.append(self.arena, redirect);
@@ -509,6 +638,19 @@ pub const Parser = struct {
     }
 
     const HereDocDelimiter = struct { text: []const u8, expand: bool };
+
+    /// `<<-`: leading tabs are removed from every body line.
+    fn stripLeadingTabs(arena: std.mem.Allocator, body: []const u8) Error![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) try out.append(arena, '\n');
+            first = false;
+            try out.appendSlice(arena, std.mem.trimStart(u8, line, "\t"));
+        }
+        return out.toOwnedSlice(arena);
+    }
 
     fn parseHereDocDelimiter(arena: std.mem.Allocator, raw: []const u8) Error!HereDocDelimiter {
         var text: std.ArrayList(u8) = .empty;
@@ -564,8 +706,12 @@ pub const Parser = struct {
                 const line_end = std.mem.indexOfScalarPos(u8, self.lex.src, cursor, '\n') orelse self.lex.src.len;
                 var current = self.lex.src[line_start..line_end];
                 if (current.len > 0 and current[current.len - 1] == '\r') current = current[0 .. current.len - 1];
-                if (std.mem.eql(u8, current, redirect.target)) {
-                    redirect.body = self.lex.src[body_start..line_start];
+                const candidate = if (redirect.strip_tabs) std.mem.trimStart(u8, current, "\t") else current;
+                if (std.mem.eql(u8, candidate, redirect.target)) {
+                    redirect.body = if (redirect.strip_tabs)
+                        try stripLeadingTabs(self.arena, self.lex.src[body_start..line_start])
+                    else
+                        self.lex.src[body_start..line_start];
                     cursor = if (line_end < self.lex.src.len) line_end + 1 else line_end;
                     if (line_end < self.lex.src.len) line += 1;
                     found = true;
@@ -963,6 +1109,189 @@ test "parse break and continue" {
     try std.testing.expectEqual(@as(usize, 1), prog.stmts[0].while_.body.stmts.len);
     try std.testing.expect(prog.stmts[0].while_.body.stmts[0] == .break_);
     try std.testing.expect(prog.stmts[1].for_.body.stmts[0] == .continue_);
+}
+
+test "parse break and continue counts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\while true {
+        \\    break 2
+        \\}
+        \\for x in 1 {
+        \\    continue 3
+        \\}
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(u32, 2), prog.stmts[0].while_.body.stmts[0].break_);
+    try std.testing.expectEqual(@as(u32, 3), prog.stmts[1].for_.body.stmts[0].continue_);
+}
+
+test "break and continue reject a non-numeric count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "while true {\n    break nope\n}\n");
+    try std.testing.expectError(error.SyntaxError, p.parseProgram());
+
+    var p2 = Parser.init(arena_state.allocator(), "while true {\n    continue 0\n}\n");
+    try std.testing.expectError(error.SyntaxError, p2.parseProgram());
+}
+
+test "parse a brace command group" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\{
+        \\    echo hi
+        \\    cd /tmp
+        \\}
+        \\{ echo one; } > out.txt
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), prog.stmts.len);
+    const group = prog.stmts[0].pipeline.commands[0].group.?;
+    try std.testing.expectEqual(@as(usize, 2), group.len);
+    try std.testing.expectEqualStrings("echo", group[0].pipeline.commands[0].words[0]);
+    try std.testing.expectEqualStrings("hi", group[0].pipeline.commands[0].words[1]);
+
+    const redirected = prog.stmts[1].pipeline.commands[0];
+    try std.testing.expectEqual(@as(usize, 1), redirected.group.?.len);
+    try std.testing.expectEqual(ast.RedirectKind.out, redirected.redirects[0].kind);
+    try std.testing.expectEqualStrings("out.txt", redirected.redirects[0].target);
+}
+
+test "brace characters inside words are untouched" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "find . -exec ls {} \\;\necho ${HOME}-x\n");
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), prog.stmts.len);
+    try std.testing.expectEqualStrings("{}", prog.stmts[0].pipeline.commands[0].words[4]);
+    try std.testing.expectEqualStrings("${HOME}-x", prog.stmts[1].pipeline.commands[0].words[1]);
+}
+
+test "parse pipeline negation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "! true\n! ! false\n!a\n");
+    const prog = try p.parseProgram();
+    try std.testing.expect(prog.stmts[0].pipeline.negate);
+    try std.testing.expect(!prog.stmts[1].pipeline.negate);
+    // `!a` is a command word, not negation.
+    try std.testing.expect(!prog.stmts[2].pipeline.negate);
+    try std.testing.expectEqualStrings("!a", prog.stmts[2].pipeline.commands[0].words[0]);
+}
+
+test "parse command-prefix assignments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\FOO=bar BAZ="a b" cmd arg
+        \\COUNT=7
+        \\cmd COUNT=7
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 3), prog.stmts.len);
+
+    const first = prog.stmts[0].pipeline.commands[0];
+    try std.testing.expectEqual(@as(usize, 2), first.assigns.len);
+    try std.testing.expectEqualStrings("FOO", first.assigns[0].name);
+    try std.testing.expectEqualStrings("bar", first.assigns[0].value);
+    try std.testing.expectEqualStrings("BAZ", first.assigns[1].name);
+    try std.testing.expectEqualStrings("\"a b\"", first.assigns[1].value);
+    try std.testing.expectEqual(@as(usize, 2), first.words.len);
+    try std.testing.expectEqualStrings("cmd", first.words[0]);
+
+    // With no command word the assignment stands alone.
+    const second = prog.stmts[1].pipeline.commands[0];
+    try std.testing.expectEqual(@as(usize, 0), second.words.len);
+    try std.testing.expectEqualStrings("COUNT", second.assigns[0].name);
+
+    // After the command word an assignment is an ordinary argument.
+    const third = prog.stmts[2].pipeline.commands[0];
+    try std.testing.expectEqual(@as(usize, 0), third.assigns.len);
+    try std.testing.expectEqualStrings("COUNT=7", third.words[1]);
+}
+
+test "parse numbered and merged redirects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cmd 3>file 2>&3 <&0 4>&- &> all.txt &>> more.txt");
+    const prog = try p.parseProgram();
+    const redirects = prog.stmts[0].pipeline.commands[0].redirects;
+    try std.testing.expectEqual(@as(usize, 8), redirects.len);
+
+    try std.testing.expectEqual(ast.RedirectKind.out, redirects[0].kind);
+    try std.testing.expectEqual(@as(i32, 3), redirects[0].targetFd());
+    try std.testing.expectEqualStrings("file", redirects[0].target);
+
+    try std.testing.expectEqual(ast.RedirectKind.err_dup, redirects[1].kind);
+    try std.testing.expectEqual(@as(i32, 2), redirects[1].targetFd());
+    try std.testing.expectEqualStrings("3", redirects[1].target);
+
+    try std.testing.expectEqual(ast.RedirectKind.in_dup, redirects[2].kind);
+    try std.testing.expectEqual(@as(i32, 0), redirects[2].targetFd());
+
+    try std.testing.expectEqual(ast.RedirectKind.out_dup, redirects[3].kind);
+    try std.testing.expectEqual(@as(i32, 4), redirects[3].targetFd());
+    try std.testing.expectEqualStrings("-", redirects[3].target);
+
+    // `&>file` is `>file 2>&1`.
+    try std.testing.expectEqual(ast.RedirectKind.out, redirects[4].kind);
+    try std.testing.expectEqualStrings("all.txt", redirects[4].target);
+    try std.testing.expectEqual(ast.RedirectKind.err_dup, redirects[5].kind);
+    try std.testing.expectEqualStrings("1", redirects[5].target);
+
+    try std.testing.expectEqual(ast.RedirectKind.out_append, redirects[6].kind);
+    try std.testing.expectEqualStrings("more.txt", redirects[6].target);
+    try std.testing.expectEqual(ast.RedirectKind.err_dup, redirects[7].kind);
+}
+
+test "parse a numbered input redirect" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cmd 3<input.txt");
+    const prog = try p.parseProgram();
+    const redirect = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expectEqual(ast.RedirectKind.in, redirect.kind);
+    try std.testing.expectEqual(@as(i32, 3), redirect.targetFd());
+    try std.testing.expectEqual(@as(usize, 1), prog.stmts[0].pipeline.commands[0].words.len);
+}
+
+test "parse tab-stripping here-documents" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cat <<-EOF\n\tone\n\t\ttwo\n\tEOF\n");
+    const prog = try p.parseProgram();
+    const redirect = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expectEqual(ast.RedirectKind.here_doc, redirect.kind);
+    try std.testing.expect(redirect.strip_tabs);
+    try std.testing.expectEqualStrings("EOF", redirect.target);
+    try std.testing.expectEqualStrings("one\ntwo\n", redirect.body);
+}
+
+test "a space after << keeps a literal dash delimiter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cat << -EOF\nbody\n-EOF\n");
+    const prog = try p.parseProgram();
+    const redirect = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expect(!redirect.strip_tabs);
+    try std.testing.expectEqualStrings("-EOF", redirect.target);
+    try std.testing.expectEqualStrings("body\n", redirect.body);
+}
+
+test "parse here-strings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cat <<<\"hi there\"\ncat <<<$word\n");
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), prog.stmts.len);
+    const first = prog.stmts[0].pipeline.commands[0].redirects[0];
+    try std.testing.expectEqual(ast.RedirectKind.here_string, first.kind);
+    try std.testing.expectEqual(@as(i32, 0), first.targetFd());
+    try std.testing.expectEqualStrings("\"hi there\"", first.target);
+    try std.testing.expectEqualStrings("$word", prog.stmts[1].pipeline.commands[0].redirects[0].target);
 }
 
 test "syntax errors are reported" {

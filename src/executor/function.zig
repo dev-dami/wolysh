@@ -19,7 +19,7 @@ pub const Runtime = struct {
 
 pub fn run(
     sh: *Shell,
-    name: []const u8,
+    _: []const u8,
     source: []const u8,
     argv: []const []const u8,
     runtime: Runtime,
@@ -54,18 +54,19 @@ pub fn run(
         }
     }
 
+    // `$0` keeps naming the shell/script; only the positional parameters are
+    // the function's.
     const saved_positional = sh.positional;
-    const saved_name = sh.script_name;
     const saved_return = sh.return_pending;
     const saved_code = sh.return_code;
     sh.positional = if (argv.len > 1) argv[1..] else &.{};
-    sh.script_name = name;
     sh.return_pending = false;
+    sh.beginScope() catch return 1;
     sh.call_depth += 1;
     defer {
         sh.call_depth -= 1;
+        sh.endScope();
         sh.positional = saved_positional;
-        sh.script_name = saved_name;
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
     }

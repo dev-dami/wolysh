@@ -10,6 +10,7 @@ the line is a command.
 | `if`, `for`, `while` | Control flow |
 | `fn`, `return` | Define a function or return its status |
 | `alias`, `break`, `continue` | Aliases and loop control |
+| `{`, `!` | Brace group in the current shell, or a negated pipeline |
 | Anything else | Run a command or pipeline |
 
 ## Values and control flow
@@ -65,18 +66,38 @@ example, use `let length = len("abc")`, not `print len("abc")`.
 
 ```text
 $var  ${var}  ${#var}  ${var:-fallback}  ${var:+alt}
-$?  $$  $!  $0  $1  $2  $#
-$(command)  `command`  "quoted"  'literal'  ~  ~/path
-*  ?  [abc]  >  >>  <  2>  2>>  2>&1  <<WORD  |  &&  ||  &  ;
+$?  $$  $!  $0  $1  $2  $#  $@  $*  $-
+$(command)  `command`  $((expr))  "quoted"  'literal'  ~  ~/path
+*  ?  [abc]  >  >>  <  2>  2>>  2>&1  <&  >&  &>  <<WORD  <<-WORD  <<<word
+|  &&  ||  &  ;  !  { ...; }
 ```
 
-Field splitting and globbing apply to unquoted expansions. `"$value"` does not
-split, and a quoted `"*"` remains literal. Comments start with `#`.
+Field splitting and globbing apply to unquoted expansions, and `IFS` decides
+where fields split (default: space, tab, newline). `"$value"` does not split,
+and a quoted `"*"` remains literal. Comments start with `#`.
+
+Arithmetic expansion evaluates an integer expression and substitutes the
+result. `$10` follows the POSIX single-digit rule and means `$1` followed by a
+literal `0`; write `${10}` for the tenth positional parameter.
+
+```text
+let n = 3
+echo $((n * 2 + 1))     # 7
+echo {a,b}/config       # a/config b/config
+echo file{1..3}.log     # file1.log file2.log file3.log
+```
+
+Brace expansion covers comma lists and numeric ranges, and runs before
+globbing. Arithmetic expansion covers the common integer operators; it is not
+a complete POSIX arithmetic implementation.
 
 Redirections apply from left to right, so `command 2>&1 >out.txt` sends stderr
-to the original stdout and stdout to the file. An unquoted here-document
-delimiter enables variable and command substitution; quoting any part of the
-delimiter keeps the body literal:
+to the original stdout and stdout to the file. File descriptors above 2 are
+accepted (`3>log`), as are the duplication and shorthand forms `<&`, `>&`, and
+`&>`. An unquoted here-document delimiter enables variable and command
+substitution; quoting any part of the delimiter keeps the body literal, and a
+`<<-` delimiter strips leading tabs from the body. `<<<word` feeds one word
+plus a newline as standard input:
 
 ```text
 cat <<EOF
@@ -86,16 +107,30 @@ EOF
 cat <<'EOF'
 The text $USER stays literal.
 EOF
+
+cat <<-EOF
+	leading tabs are stripped
+	EOF
+
+tr a-z A-Z <<< "here string"
 ```
 
 Parenthesized command groups run in a child shell process. Variable, directory,
 and exit-state changes inside them do not affect the parent; groups can be
-pipeline stages:
+pipeline stages. Braced groups run in the current shell, so their changes
+persist; `!` negates a pipeline's status, and a `NAME=value` prefix applies to
+one command only:
 
 ```text
 (cd /tmp; pwd)
 (printf 'hello\n') | wc -l
+{ cd /tmp; pwd; }
+! grep -q pattern file
+LC_ALL=C sort names.txt
 ```
+
+`$0` stays the script name inside a function, and `source file arg...` gives
+the sourced file its own positional parameters.
 
 ## Interactive shell
 
@@ -120,10 +155,14 @@ their best correction inline; press Right to accept it.
 Foreground jobs receive the terminal and run in their own process groups.
 
 Interactive shells define `la` as `ls -A` and `lh` as `ls -lh` by default;
-configuration can override either alias. Builtins include `cd`, `pwd`, `echo`,
-`print`, `exit`, `export`, `unset`,
-`alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `history`, `read`, `test`,
-`source`, and `eval`. Other commands resolve through `PATH`.
+configuration can override either alias.
+
+Builtins include `cd`, `pwd`, `echo`, `print`, `printf`, `exit`, `export`,
+`unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `history`, `read`,
+`test`, `source`, `eval`, `shift`, `type`, `command`, `builtin`, `local`,
+`readonly`, `trap`, `umask`, `kill`, `exec`, `pushd`, `popd`, `dirs`, and `:`.
+`echo` accepts bundled flags such as `-ne` and interprets escapes; other
+commands resolve through `PATH`.
 
 ## Configuration
 
@@ -133,8 +172,19 @@ See [`examples/config`](../examples/config) for a working example.
 
 ## Known limitations
 
-- No `$((...))` arithmetic expansion, tab-stripping `<<-` here-documents, or
-  brace expansion.
+- No POSIX control flow: `if cmd; then ... fi`, `case`, and `until` are not
+  implemented; use `if expr { ... }`, `while`, and `for`.
+- No process substitution (`<( )`, `>( )`).
+- Parameter expansion stops at `$var`, `${var}`, `${#var}`, `${var:-fallback}`,
+  and `${var:+alt}`: `${name:=}`, `${name:?}`, and the pattern-removal operators
+  (`${var#pat}`, `${var%pat}`) are not implemented.
+- Globbing covers `*`, `?`, and `[abc]` classes only; extended globbing
+  (`+( )`, `@( )`, `!( )`) is not implemented.
+- Arithmetic expansion implements the common integer operators, not the full
+  POSIX arithmetic grammar.
+- A bare name in argument position that matches a variable expands to its
+  value (this is what makes `for file in ... { print file }` work). Quote a
+  literal name when it collides, e.g. `unset "PATH"`.
 - Aliases expand words only; use a function for pipelines or redirects.
 - The editor counts each Unicode code point as one column, so wide or combining
   characters may render imperfectly.

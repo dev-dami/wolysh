@@ -1,6 +1,10 @@
 const std = @import("std");
 const lexer = @import("../lexer.zig");
 
+/// A here-document opener: the raw delimiter text plus whether `<<-` asks for
+/// leading tabs to be stripped.
+const Delimiter = struct { raw: []const u8, strip: bool };
+
 pub fn isComplete(src: []const u8) bool {
     if (!quotesBalanced(src)) return false;
 
@@ -10,9 +14,10 @@ pub fn isComplete(src: []const u8) bool {
     var brackets: i32 = 0;
     var last: lexer.Tag = .eof;
     var last_text: []const u8 = "";
-    var heredoc_delimiters: [64][]const u8 = undefined;
+    var heredoc_delimiters: [64]Delimiter = undefined;
     var heredoc_count: usize = 0;
     var needs_heredoc_delimiter = false;
+    var heredoc_strip = false;
 
     while (true) {
         const tok = lx.next();
@@ -22,11 +27,12 @@ pub fn isComplete(src: []const u8) bool {
         }
         if (needs_heredoc_delimiter) {
             if (tok.tag != .word or heredoc_count == heredoc_delimiters.len) return false;
-            heredoc_delimiters[heredoc_count] = tok.text;
+            heredoc_delimiters[heredoc_count] = .{ .raw = tok.text, .strip = heredoc_strip };
             heredoc_count += 1;
             needs_heredoc_delimiter = false;
-        } else if (tok.tag == .here_doc) {
+        } else if (tok.tag == .here_doc or tok.tag == .here_doc_strip) {
             needs_heredoc_delimiter = true;
+            heredoc_strip = tok.tag == .here_doc_strip;
         }
         switch (tok.tag) {
             .lbrace => braces += 1,
@@ -65,7 +71,8 @@ fn wordExpectsMore(text: []const u8) bool {
 
 fn expectsMore(tag: lexer.Tag) bool {
     return switch (tag) {
-        .pipe, .pipepipe, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .out, .out_append => true,
+        .pipe, .pipepipe, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .here_doc_strip, .here_string => true,
+        .out, .out_append, .out_both, .out_both_append => true,
         .assign, .plus_assign, .minus_assign => true,
         .plus, .minus, .star, .slash, .percent => true,
         .eq, .ne, .lt, .le, .gt, .ge => true,
@@ -79,7 +86,7 @@ fn quotesBalanced(src: []const u8) bool {
     var in_single = false;
     var in_double = false;
     var line_start: usize = 0;
-    var heredoc_delimiters: [64][]const u8 = undefined;
+    var heredoc_delimiters: [64]Delimiter = undefined;
     var heredoc_count: usize = 0;
     while (i < src.len) {
         const c = src[i];
@@ -94,9 +101,14 @@ fn quotesBalanced(src: []const u8) bool {
             continue;
         }
         if (c == '<' and !in_single and !in_double and i + 1 < src.len and src[i + 1] == '<') {
+            // A here-string (`<<<word`) carries no body.
+            if (i + 2 < src.len and src[i + 2] == '<') {
+                i += 3;
+                continue;
+            }
             if (heredoc_count == heredoc_delimiters.len) return false;
             const marker = rawHereDocDelimiter(src, i + 2) orelse return false;
-            heredoc_delimiters[heredoc_count] = marker.raw;
+            heredoc_delimiters[heredoc_count] = .{ .raw = marker.raw, .strip = marker.strip };
             heredoc_count += 1;
             i = marker.end;
             continue;
@@ -122,10 +134,13 @@ fn quotesBalanced(src: []const u8) bool {
     return !in_single and !in_double and heredoc_count == 0;
 }
 
-const RawDelimiter = struct { raw: []const u8, end: usize };
+const RawDelimiter = struct { raw: []const u8, end: usize, strip: bool };
 
 fn rawHereDocDelimiter(src: []const u8, from: usize) ?RawDelimiter {
     var start = from;
+    // Only `<<-` written without a space strips tabs, exactly like the lexer.
+    const strip = start < src.len and src[start] == '-';
+    if (strip) start += 1;
     while (start < src.len and (src[start] == ' ' or src[start] == '\t')) start += 1;
     if (start == src.len or src[start] == '\n') return null;
     var i = start;
@@ -147,10 +162,11 @@ fn rawHereDocDelimiter(src: []const u8, from: usize) ?RawDelimiter {
         }
     }
     if (quote != 0 or i == start) return null;
-    return .{ .raw = src[start..i], .end = i };
+    return .{ .raw = src[start..i], .end = i, .strip = strip };
 }
 
-fn hereDocDelimiterMatches(raw: []const u8, line: []const u8) bool {
+fn hereDocDelimiterMatches(raw: []const u8, line: []const u8, strip: bool) bool {
+    const candidate = if (strip) std.mem.trimStart(u8, line, "\t") else line;
     var raw_index: usize = 0;
     var line_index: usize = 0;
     var quote: u8 = 0;
@@ -164,7 +180,7 @@ fn hereDocDelimiterMatches(raw: []const u8, line: []const u8) bool {
             }
             if (quote != '"' or next == '$' or next == '`' or next == '"' or next == '\\') {
                 raw_index += 1;
-                if (line_index >= line.len or raw[raw_index] != line[line_index]) return false;
+                if (line_index >= candidate.len or raw[raw_index] != candidate[line_index]) return false;
                 raw_index += 1;
                 line_index += 1;
                 continue;
@@ -174,7 +190,7 @@ fn hereDocDelimiterMatches(raw: []const u8, line: []const u8) bool {
             if (c == quote) {
                 quote = 0;
             } else {
-                if (line_index >= line.len or c != line[line_index]) return false;
+                if (line_index >= candidate.len or c != candidate[line_index]) return false;
                 line_index += 1;
             }
             raw_index += 1;
@@ -183,17 +199,17 @@ fn hereDocDelimiterMatches(raw: []const u8, line: []const u8) bool {
         if (c == '\'' or c == '"') {
             quote = c;
         } else {
-            if (line_index >= line.len or c != line[line_index]) return false;
+            if (line_index >= candidate.len or c != candidate[line_index]) return false;
             line_index += 1;
         }
         raw_index += 1;
     }
-    return quote == 0 and line_index == line.len;
+    return quote == 0 and line_index == candidate.len;
 }
 
 const SkippedHereDocs = struct { pos: usize, lines: usize };
 
-fn skipHereDocBodies(src: []const u8, start: usize, delimiters: []const []const u8) ?SkippedHereDocs {
+fn skipHereDocBodies(src: []const u8, start: usize, delimiters: []const Delimiter) ?SkippedHereDocs {
     var cursor = start;
     var lines: usize = 0;
     for (delimiters) |delimiter| {
@@ -203,7 +219,7 @@ fn skipHereDocBodies(src: []const u8, start: usize, delimiters: []const []const 
             const line_end = std.mem.indexOfScalarPos(u8, src, cursor, '\n') orelse src.len;
             var line = src[line_start..line_end];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            if (hereDocDelimiterMatches(delimiter, line)) {
+            if (hereDocDelimiterMatches(delimiter.raw, line, delimiter.strip)) {
                 cursor = if (line_end < src.len) line_end + 1 else line_end;
                 if (line_end < src.len) lines += 1;
                 found = true;
