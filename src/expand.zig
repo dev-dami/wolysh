@@ -16,6 +16,8 @@ pub const Error = error{
     UnterminatedSubstitution,
     SubstitutionFailed,
     UnsupportedArithmetic,
+    InvalidArithmetic,
+    DivisionByZero,
 } || std.mem.Allocator.Error;
 
 const Mode = enum {
@@ -35,6 +37,29 @@ fn isIdentStart(c: u8) bool {
 
 fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn allDigits(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// The field-splitting separators in force. `seps` borrows from the caller's
+/// buffer; `user_set` distinguishes an explicit `IFS` from the default set, so
+/// `\r` stays whitespace only in the default.
+const Ifs = struct {
+    seps: []const u8,
+    user_set: bool,
+};
+
+fn isIfsSep(c: u8, ifs: Ifs) bool {
+    return std.mem.indexOfScalar(u8, ifs.seps, c) != null;
+}
+
+fn isIfsWhite(c: u8, ifs: Ifs) bool {
+    if (!isIfsSep(c, ifs)) return false;
+    return c == ' ' or c == '\t' or c == '\n' or (!ifs.user_set and c == '\r');
 }
 
 /// Expands a command word into zero or more fields.
@@ -144,20 +169,57 @@ pub const Expander = struct {
         }
     }
 
-    /// Appends an unquoted value, splitting it into fields on whitespace.
+    /// Appends an unquoted value, splitting it into fields on `IFS`.
     fn appendSplitRaw(self: *Expander, bytes: []const u8) Error!void {
         if (self.mode == .literal) return self.appendRaw(bytes);
+        if (bytes.len == 0) return;
+        var seps: [64]u8 = undefined;
+        const ifs = self.ifsSpec(&seps);
         var i: usize = 0;
         while (i < bytes.len) {
-            if (isSpaceByte(bytes[i])) {
-                try self.flush();
-                while (i < bytes.len and isSpaceByte(bytes[i])) i += 1;
+            const c = bytes[i];
+            if (isIfsWhite(c, ifs)) {
+                while (i < bytes.len and isIfsWhite(bytes[i], ifs)) i += 1;
+                // Whitespace touching a non-whitespace delimiter is part of
+                // the same delimiter, which can be a field of its own.
+                if (i < bytes.len and isIfsSep(bytes[i], ifs)) {
+                    i += 1;
+                    while (i < bytes.len and isIfsWhite(bytes[i], ifs)) i += 1;
+                    try self.closeField();
+                } else if (self.active) {
+                    try self.flush();
+                }
+                continue;
+            }
+            if (isIfsSep(c, ifs)) {
+                try self.closeField();
+                i += 1;
+                while (i < bytes.len and isIfsWhite(bytes[i], ifs)) i += 1;
                 continue;
             }
             const start = i;
-            while (i < bytes.len and !isSpaceByte(bytes[i])) i += 1;
+            while (i < bytes.len and !isIfsSep(bytes[i], ifs)) i += 1;
             try self.appendRaw(bytes[start..i]);
         }
+    }
+
+    /// Ends the current field. A delimiter with nothing before it still yields
+    /// an (empty) field when the delimiter is not IFS whitespace.
+    fn closeField(self: *Expander) Error!void {
+        if (self.active) return self.flush();
+        const out = self.out orelse return;
+        try out.append(self.arena, "");
+    }
+
+    /// Reads `IFS` into `buf`, falling back to the default separator set.
+    fn ifsSpec(self: *Expander, buf: *[64]u8) Ifs {
+        const explicit: ?[]const u8 = if (self.sh.getVar("IFS")) |v| self.renderValue(v) else self.sh.getEnv("IFS");
+        if (explicit) |s| {
+            const n = @min(s.len, buf.len);
+            @memcpy(buf[0..n], s[0..n]);
+            return .{ .seps = buf[0..n], .user_set = true };
+        }
+        return .{ .seps = " \t\n\r", .user_set = false };
     }
 
     /// Emits the pending field, globbing it when it still has live
@@ -189,7 +251,22 @@ pub const Expander = struct {
 
     // --- scanning -----------------------------------------------------------
 
+    /// Brace expansion runs first, at the word level, over the raw text.
     fn scan(self: *Expander, word: []const u8) Error!void {
+        if (self.mode != .command_word) return self.scanText(word);
+        try self.scanBraceWord(word, 0);
+    }
+
+    fn scanBraceWord(self: *Expander, word: []const u8, depth: u32) Error!void {
+        if (depth < max_brace_depth) {
+            if (findBrace(word)) |group| {
+                if (try self.expandBrace(word, group, depth)) return;
+            }
+        }
+        try self.scanText(word);
+    }
+
+    fn scanText(self: *Expander, word: []const u8) Error!void {
         // A bare name that names a shell variable is a reference to it. The
         // value becomes a single field: a language-level reference should not
         // be split on whitespace or globbed.
@@ -247,7 +324,7 @@ pub const Expander = struct {
                 },
                 '$' => try self.scanDollar(word, &i, false),
                 '`' => {
-                    const end = std.mem.indexOfScalarPos(u8, word, i + 1, '`') orelse word.len;
+                    const end = findClosingBacktick(word, i + 1);
                     try self.substitute(word[i + 1 .. end], false);
                     i = if (end < word.len) end + 1 else word.len;
                 },
@@ -288,7 +365,7 @@ pub const Expander = struct {
                 continue;
             }
             if (c == '`') {
-                const end = std.mem.indexOfScalarPos(u8, content, i + 1, '`') orelse content.len;
+                const end = findClosingBacktick(content, i + 1);
                 try self.substitute(content[i + 1 .. end], true);
                 i = if (end < content.len) end + 1 else content.len;
                 continue;
@@ -321,7 +398,7 @@ pub const Expander = struct {
                 continue;
             }
             if (c == '`') {
-                const end = std.mem.indexOfScalarPos(u8, content, i + 1, '`') orelse content.len;
+                const end = findClosingBacktick(content, i + 1);
                 try self.substitute(content[i + 1 .. end], true);
                 i = if (end < content.len) end + 1 else content.len;
                 continue;
@@ -358,15 +435,16 @@ pub const Expander = struct {
                 i.* = close + 1;
             },
             '(' => {
-                if (start + 2 < s.len and s[start + 2] == '(') {
-                    i.* = s.len;
-                    return Error.UnsupportedArithmetic;
-                }
                 const close = findMatching(s, start + 1, '(', ')') orelse {
                     i.* = s.len;
                     return Error.UnterminatedSubstitution;
                 };
-                try self.substitute(s[start + 2 .. close], quoted);
+                if (start + 2 < s.len and s[start + 2] == '(') {
+                    var arith = Arith{ .sh = self.sh, .arena = self.arena, .src = s[start + 3 .. close - 1] };
+                    try self.emit(self.intText(try arith.evaluate()), quoted);
+                } else {
+                    try self.substitute(s[start + 2 .. close], quoted);
+                }
                 i.* = close + 1;
             },
             '?' => {
@@ -385,10 +463,20 @@ pub const Expander = struct {
                 try self.emit(self.intText(self.sh.positional.len), quoted);
                 i.* = start + 2;
             },
+            '@' => {
+                try self.emitPositionals(quoted);
+                i.* = start + 2;
+            },
+            '*' => {
+                try self.emitStar(quoted);
+                i.* = start + 2;
+            },
+            '-' => {
+                try self.emit(self.optionLetters(), quoted);
+                i.* = start + 2;
+            },
             '0'...'9' => {
-                var j = start + 1;
-                while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
-                const idx = std.fmt.parseInt(usize, s[start + 1 .. j], 10) catch 0;
+                const idx = s[start + 1] - '0';
                 const text = if (idx == 0)
                     self.sh.script_name
                 else if (idx <= self.sh.positional.len)
@@ -396,7 +484,7 @@ pub const Expander = struct {
                 else
                     "";
                 try self.emit(text, quoted);
-                i.* = j;
+                i.* = start + 2;
             },
             else => {
                 if (isIdentStart(next)) {
@@ -416,30 +504,178 @@ pub const Expander = struct {
         return std.fmt.bufPrint(&self.scratch, "{d}", .{n}) catch "0";
     }
 
+    /// `$@`: quoted, one field per positional parameter (so `"$@"` with no
+    /// parameters yields no field); unquoted, each parameter is split.
+    fn emitPositionals(self: *Expander, quoted: bool) Error!void {
+        const params = self.sh.positional;
+        for (params, 0..) |p, idx| {
+            if (idx != 0) try self.flush();
+            if (quoted) try self.appendQuoted(p) else try self.appendSplitRaw(p);
+        }
+        if (quoted and params.len == 0 and self.buf.items.len == 0) self.active = false;
+    }
+
+    /// `$*`: quoted, the parameters joined by the first character of `IFS` in
+    /// one field (empty when there are none); unquoted, the same joined text is
+    /// field-split.
+    fn emitStar(self: *Expander, quoted: bool) Error!void {
+        var seps: [64]u8 = undefined;
+        const ifs = self.ifsSpec(&seps);
+        const sep: []const u8 = if (!ifs.user_set) " " else if (ifs.seps.len > 0) ifs.seps[0..1] else "";
+        const params = self.sh.positional;
+        for (params, 0..) |p, idx| {
+            if (idx != 0) {
+                if (quoted) try self.appendQuoted(sep) else try self.appendSplitRaw(sep);
+            }
+            if (quoted) try self.appendQuoted(p) else try self.appendSplitRaw(p);
+        }
+    }
+
+    /// `$-`: the option letters the shell is running with.
+    fn optionLetters(self: *Expander) []const u8 {
+        var n: usize = 0;
+        if (self.sh.interactive) {
+            self.scratch[n] = 'i';
+            n += 1;
+        }
+        if (self.sh.login) {
+            self.scratch[n] = 'l';
+            n += 1;
+        }
+        if (self.sh.job_control) {
+            self.scratch[n] = 'm';
+            n += 1;
+        }
+        return self.scratch[0..n];
+    }
+
+    /// Expands one brace group into the words it stands for and scans each.
+    /// Returns false when the group is left literal instead (oversized range).
+    fn expandBrace(self: *Expander, word: []const u8, group: BraceGroup, depth: u32) Error!bool {
+        const prefix = word[0..group.open];
+        const suffix = word[group.close + 1 ..];
+        const content = word[group.open + 1 .. group.close];
+
+        if (parseRange(content)) |range| {
+            switch (range) {
+                .ints => |iv| {
+                    if (rangeLength(iv.lo, iv.hi) > max_brace_values) return false;
+                    const step: i64 = if (iv.lo <= iv.hi) 1 else -1;
+                    var n = iv.lo;
+                    while (true) {
+                        var buf: [24]u8 = undefined;
+                        const text = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return false;
+                        try self.emitBraceWord(prefix, text, suffix, depth);
+                        if (n == iv.hi) break;
+                        n += step;
+                    }
+                    return true;
+                },
+                .chars => |cv| {
+                    if (rangeLength(cv.lo, cv.hi) > max_brace_values) return false;
+                    const step: i16 = if (cv.lo <= cv.hi) 1 else -1;
+                    var c: i16 = cv.lo;
+                    while (true) {
+                        const one = [1]u8{@intCast(c)};
+                        try self.emitBraceWord(prefix, &one, suffix, depth);
+                        if (c == cv.hi) break;
+                        c += step;
+                    }
+                    return true;
+                },
+            }
+        }
+
+        if (!hasTopLevelComma(content)) return false;
+        var pieces: std.ArrayList([]const u8) = .empty;
+        try splitTopLevel(self.arena, content, &pieces);
+        for (pieces.items) |piece| {
+            try self.emitBraceWord(prefix, piece, suffix, depth);
+        }
+        return true;
+    }
+
+    /// Scans one generated word and closes it as its own field.
+    fn emitBraceWord(self: *Expander, prefix: []const u8, mid: []const u8, suffix: []const u8, depth: u32) Error!void {
+        self.active = true;
+        try self.scanBraceWord(try self.joinWord(prefix, mid, suffix), depth + 1);
+        try self.flush();
+    }
+
+    fn joinWord(self: *Expander, prefix: []const u8, mid: []const u8, suffix: []const u8) Error![]const u8 {
+        return std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{ prefix, mid, suffix });
+    }
+
     /// `${name}`, `${#name}`, `${name:-fallback}` and `${name:+alternate}`.
+    /// `name` may also be a positional parameter (`${1}`, `${10}`) or one of
+    /// the special parameters.
     fn expandBraced(self: *Expander, inner: []const u8, quoted: bool) Error!void {
         if (inner.len == 0) {
             try self.appendRaw("$");
             return;
         }
+
+        // `${@}` and `${*}` keep their field semantics.
+        if (std.mem.eql(u8, inner, "@")) return self.emitPositionals(quoted);
+        if (std.mem.eql(u8, inner, "*")) return self.emitStar(quoted);
+
         if (inner[0] == '#') {
-            const name_len = self.lookup(inner[1..]).len;
-            var buf: [24]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "{d}", .{name_len}) catch "0";
+            // `${#}` is the positional count; `${#name}` is the length of name.
+            const text = if (inner.len == 1 or inner[1] == '@' or inner[1] == '*')
+                self.intText(self.sh.positional.len)
+            else
+                self.intText(self.lookup(inner[1..]).len);
             try self.emit(text, quoted);
             return;
         }
         if (std.mem.indexOf(u8, inner, ":-")) |at| {
-            const val = self.lookup(inner[0..at]);
+            const val = self.paramText(inner[0..at]);
             try self.emit(if (val.len == 0) inner[at + 2 ..] else val, quoted);
             return;
         }
         if (std.mem.indexOf(u8, inner, ":+")) |at| {
-            const val = self.lookup(inner[0..at]);
+            const val = self.paramText(inner[0..at]);
             try self.emit(if (val.len != 0) inner[at + 2 ..] else "", quoted);
             return;
         }
-        try self.emit(self.lookup(inner), quoted);
+        try self.emit(self.paramText(inner), quoted);
+    }
+
+    /// Resolves one parameter name (the text inside `${...}` or after `$`) to a
+    /// single value: positional parameters, the special parameters, then shell
+    /// variables and the environment.
+    fn paramText(self: *Expander, name: []const u8) []const u8 {
+        if (name.len == 1) {
+            switch (name[0]) {
+                '?' => return self.intText(self.sh.last_status),
+                '$' => return self.intText(self.sh.pid),
+                '!' => return self.intText(self.sh.last_bg_pid),
+                '-' => return self.optionLetters(),
+                '@', '*' => {
+                    var out: std.ArrayList(u8) = .empty;
+                    const sep: []const u8 = if (name[0] == '@') " " else self.starSeparator();
+                    for (self.sh.positional, 0..) |p, idx| {
+                        if (idx != 0) out.appendSlice(self.arena, sep) catch return "";
+                        out.appendSlice(self.arena, p) catch return "";
+                    }
+                    return out.items;
+                },
+                else => {},
+            }
+        }
+        if (allDigits(name)) {
+            const idx = std.fmt.parseInt(usize, name, 10) catch return "";
+            if (idx == 0) return self.sh.script_name;
+            return if (idx <= self.sh.positional.len) self.sh.positional[idx - 1] else "";
+        }
+        return self.lookup(name);
+    }
+
+    fn starSeparator(self: *Expander) []const u8 {
+        var seps: [64]u8 = undefined;
+        const ifs = self.ifsSpec(&seps);
+        if (!ifs.user_set) return " ";
+        return if (ifs.seps.len > 0) ifs.seps[0..1] else "";
     }
 
     /// Resolves a name to text: shell variables first, then the environment.
@@ -529,6 +765,375 @@ fn findMatching(s: []const u8, open_index: usize, open: u8, close: u8) ?usize {
         }
     }
     return null;
+}
+
+/// The backtick closing a command substitution, skipping escaped backticks.
+fn findClosingBacktick(s: []const u8, from: usize) usize {
+    var i = from;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\' and i + 1 < s.len) {
+            i += 1;
+            continue;
+        }
+        if (s[i] == '`') return i;
+    }
+    return s.len;
+}
+
+fn skipSingle(s: []const u8, from: usize) usize {
+    const end = std.mem.indexOfScalarPos(u8, s, from, '\'') orelse return s.len;
+    return end + 1;
+}
+
+fn skipDouble(s: []const u8, from: usize) usize {
+    const end = findClosingDouble(s, from);
+    return if (end < s.len) end + 1 else s.len;
+}
+
+fn skipBacktick(s: []const u8, from: usize) usize {
+    const end = findClosingBacktick(s, from);
+    return if (end < s.len) end + 1 else s.len;
+}
+
+/// Steps past a `${...}` or `$(...)` group, or null at anything else.
+fn skipExpansion(s: []const u8, i: usize) ?usize {
+    if (i + 1 >= s.len or (s[i + 1] != '{' and s[i + 1] != '(')) return null;
+    const close: u8 = if (s[i + 1] == '{') '}' else ')';
+    const end = findMatching(s, i + 1, s[i + 1], close) orelse return s.len;
+    return if (end < s.len) end + 1 else s.len;
+}
+
+const max_brace_depth = 32;
+const max_brace_values = 4096;
+
+const BraceGroup = struct {
+    open: usize,
+    close: usize,
+};
+
+/// The first brace group in `word` that stands for more than one word: a
+/// top-level comma list or a `..` range. Quoted, escaped and `$`-substitution
+/// braces are skipped.
+fn findBrace(word: []const u8) ?BraceGroup {
+    var i: usize = 0;
+    while (i < word.len) {
+        const c = word[i];
+        if (c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c == '\'') {
+            i = skipSingle(word, i + 1);
+            continue;
+        }
+        if (c == '"') {
+            i = skipDouble(word, i + 1);
+            continue;
+        }
+        if (c == '`') {
+            i = skipBacktick(word, i + 1);
+            continue;
+        }
+        if (c == '$') {
+            i = skipExpansion(word, i) orelse i + 1;
+            continue;
+        }
+        if (c == '{') {
+            if (findMatching(word, i, '{', '}')) |close| {
+                const content = word[i + 1 .. close];
+                if (hasTopLevelComma(content) or parseRange(content) != null) {
+                    return .{ .open = i, .close = close };
+                }
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// True when a brace body carries a comma that separates alternatives.
+fn hasTopLevelComma(content: []const u8) bool {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < content.len) {
+        const c = content[i];
+        if (c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c == '\'') {
+            i = skipSingle(content, i + 1);
+            continue;
+        }
+        if (c == '"') {
+            i = skipDouble(content, i + 1);
+            continue;
+        }
+        if (c == '$') {
+            i = skipExpansion(content, i) orelse i + 1;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth > 0) depth -= 1;
+        } else if (c == ',' and depth == 0) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn splitTopLevel(arena: std.mem.Allocator, content: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < content.len) {
+        const c = content[i];
+        if (c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c == '\'') {
+            i = skipSingle(content, i + 1);
+            continue;
+        }
+        if (c == '"') {
+            i = skipDouble(content, i + 1);
+            continue;
+        }
+        if (c == '$') {
+            i = skipExpansion(content, i) orelse i + 1;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth > 0) depth -= 1;
+        } else if (c == ',' and depth == 0) {
+            try out.append(arena, content[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    try out.append(arena, content[start..]);
+}
+
+const Range = union(enum) {
+    ints: struct { lo: i64, hi: i64 },
+    chars: struct { lo: u8, hi: u8 },
+};
+
+fn rangeLength(lo: i64, hi: i64) u64 {
+    const a: u64 = @bitCast(lo);
+    const b: u64 = @bitCast(hi);
+    return if (lo <= hi) b -% a else a -% b;
+}
+
+/// A `{lo..hi}` range: numeric when both ends are integers, otherwise single
+/// characters.
+fn parseRange(content: []const u8) ?Range {
+    const at = topLevelRangeSplit(content) orelse return null;
+    const a = content[0..at];
+    const b = content[at + 2 ..];
+    if (a.len == 0 or b.len == 0) return null;
+    const lo: ?i64 = std.fmt.parseInt(i64, a, 0) catch null;
+    const hi: ?i64 = std.fmt.parseInt(i64, b, 0) catch null;
+    if (lo != null and hi != null) return .{ .ints = .{ .lo = lo.?, .hi = hi.? } };
+    if (a.len == 1 and b.len == 1) return .{ .chars = .{ .lo = a[0], .hi = b[0] } };
+    return null;
+}
+
+/// The offset of the single top-level `..`, or null if there is none or more
+/// than one.
+fn topLevelRangeSplit(content: []const u8) ?usize {
+    var depth: usize = 0;
+    var found: ?usize = null;
+    var i: usize = 0;
+    while (i < content.len) {
+        const c = content[i];
+        if (c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c == '\'') {
+            i = skipSingle(content, i + 1);
+            continue;
+        }
+        if (c == '"') {
+            i = skipDouble(content, i + 1);
+            continue;
+        }
+        if (c == '$') {
+            i = skipExpansion(content, i) orelse i + 1;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+        if (c == '.' and depth == 0 and i + 1 < content.len and content[i + 1] == '.') {
+            if (found != null) return null;
+            found = i;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    return found;
+}
+
+/// A self-contained integer evaluator for `$(( ))`. Kept here rather than in
+/// the expression executor so expansion has no dependency on it.
+const Arith = struct {
+    sh: *shell.Shell,
+    arena: std.mem.Allocator,
+    src: []const u8,
+    pos: usize = 0,
+
+    fn evaluate(self: *Arith) Error!i64 {
+        self.skipSpace();
+        if (self.pos == self.src.len) return 0;
+        const n = try self.sum();
+        self.skipSpace();
+        if (self.pos != self.src.len) return Error.InvalidArithmetic;
+        return n;
+    }
+
+    fn skipSpace(self: *Arith) void {
+        while (self.pos < self.src.len and isSpaceByte(self.src[self.pos])) self.pos += 1;
+    }
+
+    fn sum(self: *Arith) Error!i64 {
+        var lhs = try self.product();
+        while (true) {
+            self.skipSpace();
+            if (self.pos >= self.src.len) break;
+            const op = self.src[self.pos];
+            if (op != '+' and op != '-') break;
+            self.pos += 1;
+            const rhs = try self.product();
+            lhs = if (op == '+') lhs +% rhs else lhs -% rhs;
+        }
+        return lhs;
+    }
+
+    fn product(self: *Arith) Error!i64 {
+        var lhs = try self.factor();
+        while (true) {
+            self.skipSpace();
+            if (self.pos >= self.src.len) break;
+            const op = self.src[self.pos];
+            if (op != '*' and op != '/' and op != '%') break;
+            self.pos += 1;
+            const rhs = try self.factor();
+            switch (op) {
+                '*' => lhs = lhs *% rhs,
+                '/' => {
+                    if (rhs == 0) return Error.DivisionByZero;
+                    lhs = @divTrunc(lhs, rhs);
+                },
+                else => {
+                    if (rhs == 0) return Error.DivisionByZero;
+                    lhs = @rem(lhs, rhs);
+                },
+            }
+        }
+        return lhs;
+    }
+
+    fn factor(self: *Arith) Error!i64 {
+        self.skipSpace();
+        if (self.pos >= self.src.len) return Error.InvalidArithmetic;
+        const c = self.src[self.pos];
+        switch (c) {
+            '+' => {
+                self.pos += 1;
+                return self.factor();
+            },
+            '-' => {
+                self.pos += 1;
+                return -%try self.factor();
+            },
+            '(' => {
+                self.pos += 1;
+                const n = try self.sum();
+                self.skipSpace();
+                if (self.pos >= self.src.len or self.src[self.pos] != ')') return Error.InvalidArithmetic;
+                self.pos += 1;
+                return n;
+            },
+            '$' => {
+                if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '(' and self.src[self.pos + 2] == '(') {
+                    const open = self.pos + 1;
+                    const close = findMatching(self.src, open, '(', ')') orelse return Error.InvalidArithmetic;
+                    var sub = Arith{ .sh = self.sh, .arena = self.arena, .src = self.src[open + 2 .. close - 1] };
+                    self.pos = close + 1;
+                    return sub.evaluate();
+                }
+                self.pos += 1;
+                return self.variable();
+            },
+            else => {
+                if (std.ascii.isDigit(c)) return self.number();
+                if (isIdentStart(c)) return self.variable();
+                return Error.InvalidArithmetic;
+            },
+        }
+    }
+
+    fn variable(self: *Arith) Error!i64 {
+        if (self.pos < self.src.len and self.src[self.pos] == '{') {
+            const close = std.mem.indexOfScalarPos(u8, self.src, self.pos, '}') orelse return Error.InvalidArithmetic;
+            const var_name = self.src[self.pos + 1 .. close];
+            self.pos = close + 1;
+            return self.lookup(var_name);
+        }
+        if (self.pos >= self.src.len or !isIdentStart(self.src[self.pos])) return Error.InvalidArithmetic;
+        const start = self.pos;
+        self.pos += 1;
+        while (self.pos < self.src.len and isIdentChar(self.src[self.pos])) self.pos += 1;
+        return self.lookup(self.src[start..self.pos]);
+    }
+
+    fn number(self: *Arith) Error!i64 {
+        const start = self.pos;
+        if (self.src[start] == '0' and start + 1 < self.src.len and std.ascii.isAlphabetic(self.src[start + 1])) {
+            self.pos = start + 2;
+            while (self.pos < self.src.len and std.ascii.isAlphanumeric(self.src[self.pos])) self.pos += 1;
+        } else {
+            while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) self.pos += 1;
+        }
+        return std.fmt.parseInt(i64, self.src[start..self.pos], 0) catch Error.InvalidArithmetic;
+    }
+
+    fn lookup(self: *Arith, name: []const u8) i64 {
+        if (self.sh.getVar(name)) |v| {
+            switch (v) {
+                .int => |n| return n,
+                .boolean => |b| return if (b) 1 else 0,
+                .string => |s| return parseInteger(s),
+                else => return 0,
+            }
+        }
+        if (self.sh.getEnv(name)) |s| return parseInteger(s);
+        return 0;
+    }
+};
+
+fn parseInteger(text: []const u8) i64 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return 0;
+    return std.fmt.parseInt(i64, trimmed, 0) catch 0;
 }
 
 // --- tests ------------------------------------------------------------------
@@ -648,4 +1253,267 @@ test "empty quotes still produce a field" {
     try expandWord(&sh, arena, "\"\"", &fields);
     try testing.expectEqual(@as(usize, 1), fields.items.len);
     try testing.expectEqualStrings("", fields.items[0]);
+}
+
+fn identitySubst(_: *shell.Shell, src: []const u8, arena: std.mem.Allocator) anyerror![]const u8 {
+    return arena.dupe(u8, src);
+}
+
+test "$@ and $* expand the positional parameters" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    sh.positional = &.{ "a b", "c" };
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    try expandWord(&sh, arena, "$@", &fields);
+    try testing.expectEqual(@as(usize, 3), fields.items.len);
+    try testing.expectEqualStrings("a", fields.items[0]);
+    try testing.expectEqualStrings("b", fields.items[1]);
+    try testing.expectEqualStrings("c", fields.items[2]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "x$@y", &fields);
+    try testing.expectEqual(@as(usize, 3), fields.items.len);
+    try testing.expectEqualStrings("xa", fields.items[0]);
+    try testing.expectEqualStrings("b", fields.items[1]);
+    try testing.expectEqualStrings("cy", fields.items[2]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "\"$@\"", &fields);
+    try testing.expectEqual(@as(usize, 2), fields.items.len);
+    try testing.expectEqualStrings("a b", fields.items[0]);
+    try testing.expectEqualStrings("c", fields.items[1]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "\"$*\"", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("a b c", fields.items[0]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "$*", &fields);
+    try testing.expectEqual(@as(usize, 3), fields.items.len);
+
+    fields.clearRetainingCapacity();
+    sh.positional = &.{};
+    try expandWord(&sh, arena, "\"$@\"", &fields);
+    try testing.expectEqual(@as(usize, 0), fields.items.len);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "\"$*\"", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("", fields.items[0]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "$#", &fields);
+    try testing.expectEqualStrings("0", fields.items[0]);
+}
+
+test "$- reports option letters, never its literal text" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    try testing.expectEqualStrings("", try expandLiteral(&sh, arena, "$-"));
+
+    sh.interactive = true;
+    try testing.expectEqualStrings("i", try expandLiteral(&sh, arena, "$-"));
+
+    sh.login = true;
+    try testing.expectEqualStrings("il", try expandLiteral(&sh, arena, "$-"));
+}
+
+test "$10 is one digit followed by a literal zero" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    sh.script_name = "wsh";
+    sh.positional = &.{ "one", "two" };
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    try expandWord(&sh, arena, "$10", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("one0", fields.items[0]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "$2", &fields);
+    try testing.expectEqualStrings("two", fields.items[0]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "$0", &fields);
+    try testing.expectEqualStrings("wsh", fields.items[0]);
+}
+
+test "an escaped backtick does not close a substitution" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    sh.subst_runner = identitySubst;
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    try expandWord(&sh, arena, "`hi`", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("hi", fields.items[0]);
+
+    try testing.expectEqualStrings("a\\`b", try expandLiteral(&sh, arena, "`a\\`b`"));
+}
+
+test "IFS drives field splitting" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    try sh.setVar("x", .{ .string = "a:b::c" });
+    try sh.setVar("IFS", .{ .string = ":" });
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    try expandWord(&sh, arena, "$x", &fields);
+    try testing.expectEqual(@as(usize, 4), fields.items.len);
+    try testing.expectEqualStrings("a", fields.items[0]);
+    try testing.expectEqualStrings("b", fields.items[1]);
+    try testing.expectEqualStrings("", fields.items[2]);
+    try testing.expectEqualStrings("c", fields.items[3]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "\"$x\"", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("a:b::c", fields.items[0]);
+
+    // IFS whitespace collapses and is swallowed around a real delimiter.
+    try sh.setVar("y", .{ .string = "a : b" });
+    try sh.setVar("IFS", .{ .string = " :" });
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "$y", &fields);
+    try testing.expectEqual(@as(usize, 2), fields.items.len);
+    try testing.expectEqualStrings("a", fields.items[0]);
+    try testing.expectEqualStrings("b", fields.items[1]);
+
+    // `"$*"` joins with the first character of IFS.
+    try sh.setVar("IFS", .{ .string = ":" });
+    sh.positional = &.{ "a", "b" };
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "\"$*\"", &fields);
+    try testing.expectEqualStrings("a:b", fields.items[0]);
+
+    // Without IFS the default separators apply.
+    _ = sh.unsetVar("IFS");
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "$x", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("a:b::c", fields.items[0]);
+}
+
+test "arithmetic expansion" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    try sh.setVar("n", .{ .int = 10 });
+    try sh.setVar("s", .{ .string = "2" });
+
+    try testing.expectEqualStrings("5", try expandLiteral(&sh, arena, "$((1 + 2 * 2))"));
+    try testing.expectEqualStrings("1", try expandLiteral(&sh, arena, "$((10 % 3))"));
+    try testing.expectEqualStrings("2", try expandLiteral(&sh, arena, "$((7 / 3))"));
+    try testing.expectEqualStrings("-1", try expandLiteral(&sh, arena, "$((-1))"));
+    try testing.expectEqualStrings("3", try expandLiteral(&sh, arena, "$(((1 + 2)))"));
+    try testing.expectEqualStrings("10", try expandLiteral(&sh, arena, "$((n))"));
+    try testing.expectEqualStrings("12", try expandLiteral(&sh, arena, "$(( ${n} + s ))"));
+    try testing.expectEqualStrings("16", try expandLiteral(&sh, arena, "$((2 * $((n - 2))))"));
+    try testing.expectEqualStrings("255", try expandLiteral(&sh, arena, "$((0xff))"));
+    try testing.expectEqualStrings("0", try expandLiteral(&sh, arena, "$(( ))"));
+    try testing.expectEqualStrings("42", try expandLiteral(&sh, arena, "$((missing + 42))"));
+
+    try testing.expectError(error.DivisionByZero, expandLiteral(&sh, arena, "$((1 / 0))"));
+}
+
+test "brace expansion lists, ranges and nesting" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    try expandWord(&sh, arena, "a{b,c}d", &fields);
+    try testing.expectEqual(@as(usize, 2), fields.items.len);
+    try testing.expectEqualStrings("abd", fields.items[0]);
+    try testing.expectEqualStrings("acd", fields.items[1]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "a{b,c}d{e,f}", &fields);
+    try testing.expectEqual(@as(usize, 4), fields.items.len);
+    try testing.expectEqualStrings("abde", fields.items[0]);
+    try testing.expectEqualStrings("abdf", fields.items[1]);
+    try testing.expectEqualStrings("acde", fields.items[2]);
+    try testing.expectEqualStrings("acdf", fields.items[3]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "{1..3}", &fields);
+    try testing.expectEqual(@as(usize, 3), fields.items.len);
+    try testing.expectEqualStrings("1", fields.items[0]);
+    try testing.expectEqualStrings("2", fields.items[1]);
+    try testing.expectEqualStrings("3", fields.items[2]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "{5..1}", &fields);
+    try testing.expectEqual(@as(usize, 5), fields.items.len);
+    try testing.expectEqualStrings("5", fields.items[0]);
+    try testing.expectEqualStrings("1", fields.items[4]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "{a..c}", &fields);
+    try testing.expectEqual(@as(usize, 3), fields.items.len);
+    try testing.expectEqualStrings("a", fields.items[0]);
+    try testing.expectEqualStrings("b", fields.items[1]);
+    try testing.expectEqualStrings("c", fields.items[2]);
+
+    // A group with neither a comma nor a range stays literal.
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "{x}", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("{x}", fields.items[0]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "{}", &fields);
+    try testing.expectEqualStrings("{}", fields.items[0]);
+
+    // An oversized range is left literal instead of generating forever.
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "{-9223372036854775808..9223372036854775807}", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("{-9223372036854775808..9223372036854775807}", fields.items[0]);
+
+    // Quoted braces stay literal and `${...}` is not a brace group.
+    try sh.setVar("v", .{ .string = "value" });
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "\"{1..3}\"", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("{1..3}", fields.items[0]);
+
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "${v}", &fields);
+    try testing.expectEqual(@as(usize, 1), fields.items.len);
+    try testing.expectEqualStrings("value", fields.items[0]);
+
+    // A later expansion still attaches to each generated word.
+    fields.clearRetainingCapacity();
+    try expandWord(&sh, arena, "x{1..2}$v", &fields);
+    try testing.expectEqual(@as(usize, 2), fields.items.len);
+    try testing.expectEqualStrings("x1value", fields.items[0]);
+    try testing.expectEqualStrings("x2value", fields.items[1]);
 }

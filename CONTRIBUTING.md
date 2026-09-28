@@ -9,11 +9,16 @@ pseudo-terminal.
 From the repository root, run:
 
 ```sh
+zig build fmt
 zig build test
 zig build -Doptimize=ReleaseFast
 python3 tests/pty_test.py
 python3 tests/shell_compat_test.py
 ```
+
+`zig build fmt` runs `zig fmt --check src build.zig build.zig.zon`; run
+`zig fmt src build.zig build.zig.zon` to apply it. `zig build check` runs the
+format check together with the unit tests. CI runs all five commands.
 
 The test suites expect the ReleaseFast binary at `zig-out/bin/wsh` by default.
 To run the PTY tests against another binary, set `WSH=/absolute/path/to/wsh`.

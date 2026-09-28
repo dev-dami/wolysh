@@ -17,21 +17,24 @@ pub const RedirectKind = enum {
     out_append,
     in,
     here_doc,
+    /// `<<<word`: the expanded word becomes standard input.
+    here_string,
     err_out,
     err_append,
     out_dup,
     err_dup,
+    in_dup,
 
     pub fn fd(self: RedirectKind) i32 {
         return switch (self) {
-            .in, .here_doc => 0,
+            .in, .here_doc, .here_string, .in_dup => 0,
             .err_out, .err_append, .err_dup => 2,
             else => 1,
         };
     }
 
     pub fn isInput(self: RedirectKind) bool {
-        return self == .in or self == .here_doc;
+        return self == .in or self == .here_doc or self == .here_string;
     }
 
     pub fn append(self: RedirectKind) bool {
@@ -39,7 +42,7 @@ pub const RedirectKind = enum {
     }
 
     pub fn duplicates(self: RedirectKind) bool {
-        return self == .out_dup or self == .err_dup;
+        return self == .out_dup or self == .err_dup or self == .in_dup;
     }
 };
 
@@ -48,12 +51,31 @@ pub const Redirect = struct {
     target: Word,
     body: []const u8 = "",
     expand_body: bool = true,
+    /// Explicit `N` written before the operator; negative when absent, in which
+    /// case the kind's own descriptor is used.
+    fd: i32 = -1,
+    /// `<<-`: strip leading tabs from the body and the delimiter line.
+    strip_tabs: bool = false,
+
+    pub fn targetFd(self: Redirect) i32 {
+        return if (self.fd >= 0) self.fd else self.kind.fd();
+    }
+};
+
+/// A `NAME=value` word in command-prefix position.
+pub const PrefixAssign = struct {
+    name: []const u8,
+    value: Word,
 };
 
 pub const Command = struct {
     words: []Word,
     redirects: []Redirect,
     subshell: ?[]Stmt = null,
+    /// `{ ...; }`: like a subshell but executed in the current shell.
+    group: ?[]Stmt = null,
+    /// Temporary environment assignments written before the command word.
+    assigns: []PrefixAssign = &.{},
 };
 
 pub const ChainOp = enum { and_, or_ };
@@ -70,6 +92,8 @@ pub const Pipeline = struct {
     commands: []Command,
     background: bool = false,
     links: []ChainLink = &.{},
+    /// A leading `!` inverts the status of the pipeline it precedes.
+    negate: bool = false,
 };
 
 pub const BinOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
@@ -148,8 +172,9 @@ pub const Stmt = union(enum) {
     while_: While,
     fn_decl: FnDecl,
     return_: ?*Expr,
-    break_,
-    continue_,
+    /// `break N`: how many enclosing loops to leave (at least 1).
+    break_: u32,
+    continue_: u32,
     alias: struct { name: []const u8, value: Word },
 };
 

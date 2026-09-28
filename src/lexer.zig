@@ -43,6 +43,13 @@ pub const Tag = enum {
     out_append,
     in,
     here_doc,
+    /// `<<-`: body lines and the delimiter have leading tabs stripped.
+    here_doc_strip,
+    /// `<<<`: the target word is expanded and fed as standard input.
+    here_string,
+    /// `&>` / `&>>`: stdout and stderr to the same file.
+    out_both,
+    out_both_append,
     lbrace,
     rbrace,
 
@@ -217,6 +224,14 @@ pub const Lexer = struct {
                     self.pos += 1;
                     return self.tok(.ampamp, start, depth_before);
                 }
+                if (self.mode == .word and self.pos < self.src.len and self.src[self.pos] == '>') {
+                    self.pos += 1;
+                    if (self.pos < self.src.len and self.src[self.pos] == '>') {
+                        self.pos += 1;
+                        return self.tok(.out_both_append, start, depth_before);
+                    }
+                    return self.tok(.out_both, start, depth_before);
+                }
                 return self.tok(.amp, start, depth_before);
             },
             ';' => {
@@ -236,6 +251,14 @@ pub const Lexer = struct {
                 self.pos += 1;
                 if (self.mode == .word and self.pos < self.src.len and self.src[self.pos] == '<') {
                     self.pos += 1;
+                    if (self.pos < self.src.len and self.src[self.pos] == '<') {
+                        self.pos += 1;
+                        return self.tok(.here_string, start, depth_before);
+                    }
+                    if (self.pos < self.src.len and self.src[self.pos] == '-') {
+                        self.pos += 1;
+                        return self.tok(.here_doc_strip, start, depth_before);
+                    }
                     return self.tok(.here_doc, start, depth_before);
                 }
                 if (self.pos < self.src.len and self.src[self.pos] == '=' and self.mode == .expr) {
@@ -599,6 +622,29 @@ test "braces are structural only when standalone" {
     _ = lx2.next();
     _ = lx2.next();
     try std.testing.expectEqualStrings("{}", lx2.next().text);
+}
+
+test "merged, here-string and tab-stripping redirect tokens" {
+    var lx = Lexer.init("a &> f &>> g <<-EOF <<<s");
+    try std.testing.expectEqualStrings("a", lx.next().text);
+    try std.testing.expectEqual(Tag.out_both, lx.next().tag);
+    try std.testing.expectEqualStrings("f", lx.next().text);
+    try std.testing.expectEqual(Tag.out_both_append, lx.next().tag);
+    try std.testing.expectEqualStrings("g", lx.next().text);
+    try std.testing.expectEqual(Tag.here_doc_strip, lx.next().tag);
+    try std.testing.expectEqualStrings("EOF", lx.next().text);
+    try std.testing.expectEqual(Tag.here_string, lx.next().tag);
+    try std.testing.expectEqualStrings("s", lx.next().text);
+    try std.testing.expectEqual(Tag.eof, lx.next().tag);
+}
+
+test "a spaced ampersand still backgrounds" {
+    var lx = Lexer.init("sleep 1 & > out.txt");
+    try std.testing.expectEqualStrings("sleep", lx.next().text);
+    try std.testing.expectEqualStrings("1", lx.next().text);
+    try std.testing.expectEqual(Tag.amp, lx.next().tag);
+    try std.testing.expectEqual(Tag.out, lx.next().tag);
+    try std.testing.expectEqualStrings("out.txt", lx.next().text);
 }
 
 test "comments" {

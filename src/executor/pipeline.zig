@@ -9,6 +9,7 @@ const command = @import("command.zig");
 const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
 const subshell = @import("subshell.zig");
+const assign = @import("assign.zig");
 
 const Shell = shellmod.Shell;
 
@@ -49,14 +50,24 @@ fn childExecute(ctx_ptr: *anyopaque) noreturn {
 
 pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
     var status = runPipeline(sh, chain.commands, chain.background, runtime);
+    if (chain.negate) status = invert(status);
     for (chain.links) |link| {
         const should_run = switch (link.op) {
             .and_ => status == 0,
             .or_ => status != 0,
         };
-        if (should_run) status = runPipeline(sh, link.pipeline.commands, link.pipeline.background, runtime);
+        if (should_run) {
+            status = runPipeline(sh, link.pipeline.commands, link.pipeline.background, runtime);
+            if (link.pipeline.negate) status = invert(status);
+        }
     }
     return status;
+}
+
+/// `! pipeline`: success and failure trade places, so a signal-killed pipeline
+/// (a non-zero status) becomes a success.
+fn invert(status: u8) u8 {
+    return if (status == 0) 1 else 0;
 }
 
 fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runtime: Runtime) u8 {
@@ -69,8 +80,21 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
     if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime);
 
     var stages: std.ArrayList(proc.Stage) = .empty;
+    // Prefix assignments stay in the environment until the whole pipeline has
+    // been launched, so every child inherits them.
+    var scopes: std.ArrayList(assign.State) = .empty;
+    defer {
+        var index = scopes.items.len;
+        while (index > 0) {
+            index -= 1;
+            scopes.items[index].restore();
+        }
+    }
     for (commands) |cmd| {
-        if (cmd.subshell) |statements| {
+        const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
+        scopes.append(arena, scope) catch return 1;
+
+        if (cmd.subshell orelse cmd.group) |statements| {
             const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
             const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, runtime.run_statements) catch |err| {
                 return runtime.expression_error(sh, err);
@@ -140,7 +164,27 @@ fn runSingle(
     expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
 
     const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
-    if (argv.items.len == 0 and cmd.subshell == null) return 0;
+    if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null) {
+        // `NAME=value` on its own outlives the command line.
+        assign.persist(sh, arena, cmd.assigns) catch |err| return runtime.expression_error(sh, err);
+        return 0;
+    }
+
+    const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
+    defer scope.restore();
+
+    if (cmd.group) |statements| {
+        const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
+        sh.default_in = prepared.fds.in;
+        sh.default_out = prepared.fds.out;
+        sh.default_err = prepared.fds.err;
+        defer {
+            sh.default_in = saved.in;
+            sh.default_out = saved.out;
+            sh.default_err = saved.err;
+        }
+        return runtime.run_statements(sh, statements);
+    }
 
     if (cmd.subshell) |statements| {
         const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, runtime.run_statements) catch |err| {
@@ -280,15 +324,24 @@ fn pipelineText(arena: std.mem.Allocator, commands: []const ast.Command) ![]cons
             try out.appendSlice(arena, word);
         }
         if (cmd.subshell != null) try out.appendSlice(arena, "(subshell)");
+        if (cmd.group != null) try out.appendSlice(arena, "{group}");
+        for (cmd.assigns) |assignment| {
+            try out.appendSlice(arena, assignment.name);
+            try out.append(arena, '=');
+            try out.appendSlice(arena, assignment.value);
+            try out.append(arena, ' ');
+        }
         for (cmd.redirects) |item| {
             const operator = switch (item.kind) {
                 .in => " < ",
                 .here_doc => " << ",
+                .here_string => " <<< ",
                 .out_append => " >> ",
                 .err_out => " 2> ",
                 .err_append => " 2>> ",
                 .out_dup => " >&",
                 .err_dup => " 2>&",
+                .in_dup => " <&",
                 else => " > ",
             };
             try out.appendSlice(arena, operator);

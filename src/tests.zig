@@ -16,5 +16,7 @@ test {
     _ = @import("expand.zig");
     _ = @import("builtins.zig");
     _ = @import("exec.zig");
+    _ = @import("main.zig");
     _ = @import("interactive/editor.zig");
+    _ = @import("interactive/prompt.zig");
 }

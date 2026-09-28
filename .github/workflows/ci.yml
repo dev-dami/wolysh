@@ -21,6 +21,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Check formatting
+        run: zig build fmt
+
       - name: Run unit tests
         run: zig build test
 

@@ -59,6 +59,7 @@ pub fn writeContinuation(out: *std.Io.Writer, sh: *Shell, depth: usize) !void {
 test "prompt includes the marker" {
     var sh = try Shell.initBare(std.testing.allocator);
     defer sh.deinit();
+    std.testing.allocator.free(sh.cwd);
     sh.cwd = try std.testing.allocator.dupe(u8, "/tmp");
 
     var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);

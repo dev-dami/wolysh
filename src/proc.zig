@@ -68,6 +68,88 @@ fn setHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
     _ = linux.sigaction(sig, &act, null);
 }
 
+/// Installs a disposition for one signal. Used by `trap`; `null` restores the
+/// default action.
+pub fn installHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
+    if (sig == .KILL or sig == .STOP) return;
+    setHandler(sig, handler);
+}
+
+/// Signals that can never be caught or ignored.
+pub fn isUncatchable(sig: linux.SIG) bool {
+    return sig == .KILL or sig == .STOP;
+}
+
+/// Resolves `INT`, `SIGINT`, `int` or `2` to a signal number.
+pub fn signalFromName(text: []const u8) ?linux.SIG {
+    var buf: [16]u8 = undefined;
+    var name = text;
+    if (std.mem.startsWith(u8, name, "SIG") or std.mem.startsWith(u8, name, "sig")) name = name[3..];
+    if (name.len == 0 or name.len > buf.len) return null;
+    for (name, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
+    name = buf[0..name.len];
+
+    if (std.fmt.parseInt(u32, name, 10)) |n| {
+        if (n == 0 or n > 64) return null;
+        return @enumFromInt(n);
+    } else |_| {}
+
+    const known = [_]struct { []const u8, linux.SIG }{
+        .{ "HUP", .HUP },       .{ "INT", .INT },   .{ "QUIT", .QUIT },
+        .{ "ILL", .ILL },       .{ "TRAP", .TRAP }, .{ "ABRT", .ABRT },
+        .{ "BUS", .BUS },       .{ "FPE", .FPE },   .{ "KILL", .KILL },
+        .{ "USR1", .USR1 },     .{ "SEGV", .SEGV }, .{ "USR2", .USR2 },
+        .{ "PIPE", .PIPE },     .{ "ALRM", .ALRM }, .{ "TERM", .TERM },
+        .{ "CHLD", .CHLD },     .{ "CONT", .CONT }, .{ "STOP", .STOP },
+        .{ "TSTP", .TSTP },     .{ "TTIN", .TTIN }, .{ "TTOU", .TTOU },
+        .{ "URG", .URG },       .{ "XCPU", .XCPU }, .{ "XFSZ", .XFSZ },
+        .{ "VTALRM", .VTALRM }, .{ "PROF", .PROF }, .{ "WINCH", .WINCH },
+        .{ "IO", .IO },         .{ "SYS", .SYS },
+    };
+    for (known) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return null;
+}
+
+/// Canonical short name of a signal number, without the `SIG` prefix.
+pub fn signalName(sig: u32) []const u8 {
+    if (sig == 0 or sig > 64) return "0";
+    const named: linux.SIG = @enumFromInt(sig);
+    return switch (named) {
+        .HUP => "HUP",
+        .INT => "INT",
+        .QUIT => "QUIT",
+        .ILL => "ILL",
+        .TRAP => "TRAP",
+        .ABRT => "ABRT",
+        .BUS => "BUS",
+        .FPE => "FPE",
+        .KILL => "KILL",
+        .USR1 => "USR1",
+        .SEGV => "SEGV",
+        .USR2 => "USR2",
+        .PIPE => "PIPE",
+        .ALRM => "ALRM",
+        .TERM => "TERM",
+        .CHLD => "CHLD",
+        .CONT => "CONT",
+        .STOP => "STOP",
+        .TSTP => "TSTP",
+        .TTIN => "TTIN",
+        .TTOU => "TTOU",
+        .URG => "URG",
+        .XCPU => "XCPU",
+        .XFSZ => "XFSZ",
+        .VTALRM => "VTALRM",
+        .PROF => "PROF",
+        .WINCH => "WINCH",
+        .IO => "IO",
+        .SYS => "SYS",
+        else => "SIG",
+    };
+}
+
 /// Signals the shell itself ignores while it waits for children.
 pub fn shellSignals() void {
     setHandler(.INT, linux.SIG.IGN);
@@ -272,6 +354,14 @@ pub fn signalGroup(pgid: i32, sig: linux.SIG) void {
     _ = linux.kill(-pgid, sig);
 }
 
+/// Signal 0 (`kill -0`): reports whether the process exists and is ours to
+/// signal. Sent as a raw syscall because `linux.kill` takes a `SIG` enum, which
+/// has no zero member.
+pub fn probeProcess(pid: i32) bool {
+    const rc = linux.syscall2(.kill, @bitCast(@as(isize, pid)), 0);
+    return linux.errno(rc) == .SUCCESS;
+}
+
 test "create a pipe and read from a child" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -301,6 +391,19 @@ test "create a pipe and read from a child" {
 
     const st = waitPid(launched.pids[0], 0).?;
     try std.testing.expectEqual(@as(u8, 0), st.exitCode());
+}
+
+test "signal names round-trip" {
+    try std.testing.expectEqual(linux.SIG.INT, signalFromName("INT").?);
+    try std.testing.expectEqual(linux.SIG.TERM, signalFromName("SIGTERM").?);
+    try std.testing.expectEqual(linux.SIG.TERM, signalFromName("term").?);
+    try std.testing.expectEqual(linux.SIG.USR1, signalFromName("10").?);
+    try std.testing.expect(signalFromName("NOPE") == null);
+    try std.testing.expect(signalFromName("0") == null);
+    try std.testing.expectEqualStrings("INT", signalName(2));
+    try std.testing.expectEqualStrings("TERM", signalName(15));
+    try std.testing.expect(isUncatchable(linux.SIG.KILL));
+    try std.testing.expect(!isUncatchable(linux.SIG.INT));
 }
 
 test "resolve finds real binaries and rejects missing ones" {

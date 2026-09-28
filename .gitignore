@@ -6,3 +6,5 @@ wsh-small
 *.o
 .commandcode/
 .DS_Store
+.zig-cache-*/
+zig-cache-*
