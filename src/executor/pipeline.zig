@@ -26,6 +26,7 @@ const ChildPayload = struct {
     sh: *Shell,
     argv: []const []const u8,
     command_runtime: command.Runtime,
+    scope: assign.State,
 };
 
 const MissingCommandPayload = struct { message: []const u8 };
@@ -45,6 +46,7 @@ fn childExecute(ctx_ptr: *anyopaque) noreturn {
     sh.job_control = false;
     sh.tty_fd = -1;
     sh.should_exit = false;
+    payload.scope.apply() catch linux.exit(1);
     linux.exit(command.dispatch(sh, payload.argv, payload.command_runtime));
 }
 
@@ -80,23 +82,13 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
     if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime);
 
     var stages: std.ArrayList(proc.Stage) = .empty;
-    // Prefix assignments stay in the environment until the whole pipeline has
-    // been launched, so every child inherits them.
-    var scopes: std.ArrayList(assign.State) = .empty;
-    defer {
-        var index = scopes.items.len;
-        while (index > 0) {
-            index -= 1;
-            scopes.items[index].restore();
-        }
-    }
     for (commands) |cmd| {
         const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
-        scopes.append(arena, scope) catch return 1;
+        defer scope.restore();
 
         if (cmd.subshell orelse cmd.group) |statements| {
             const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
-            const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, runtime.run_statements) catch |err| {
+            const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
                 return runtime.expression_error(sh, err);
             };
             stages.append(arena, stage) catch return 1;
@@ -113,7 +105,7 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
 
         const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
         const call_argv = argv.toOwnedSlice(arena) catch return 1;
-        const stage = makeStage(sh, arena, call_argv, prepared.redirects, runtime) catch |err| {
+        const stage = makeStage(sh, arena, call_argv, prepared.redirects, scope, runtime) catch |err| {
             return runtime.expression_error(sh, err);
         };
         stages.append(arena, stage) catch return 1;
@@ -131,11 +123,12 @@ fn makeStage(
     arena: std.mem.Allocator,
     argv: []const []const u8,
     redirects: []const proc.Redirection,
+    scope: assign.State,
     runtime: Runtime,
 ) Error!proc.Stage {
     if (command.isInternal(sh, argv[0])) {
         const payload = try arena.create(ChildPayload);
-        payload.* = .{ .sh = sh, .argv = argv, .command_runtime = runtime.command };
+        payload.* = .{ .sh = sh, .argv = argv, .command_runtime = runtime.command, .scope = scope };
         return .{
             .child_fn = childExecute,
             .child_ctx = payload,
@@ -173,7 +166,8 @@ fn runSingle(
     const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
     defer scope.restore();
 
-    if (cmd.group) |statements| {
+    if (cmd.group != null and !background) {
+        const statements = cmd.group.?;
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
         sh.default_in = prepared.fds.in;
         sh.default_out = prepared.fds.out;
@@ -186,8 +180,8 @@ fn runSingle(
         return runtime.run_statements(sh, statements);
     }
 
-    if (cmd.subshell) |statements| {
-        const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, runtime.run_statements) catch |err| {
+    if (cmd.subshell orelse cmd.group) |statements| {
+        const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
             return runtime.expression_error(sh, err);
         };
         const text = pipelineText(arena, &.{cmd}) catch "subshell";
@@ -212,7 +206,7 @@ fn runSingle(
         return command.dispatch(sh, call_argv, runtime.command);
     }
 
-    const stage = makeStage(sh, arena, call_argv, prepared.redirects, runtime) catch |err| {
+    const stage = makeStage(sh, arena, call_argv, prepared.redirects, scope, runtime) catch |err| {
         return runtime.expression_error(sh, err);
     };
     if (background) return startBackground(sh, arena, &.{stage}, text, runtime.expression_error);

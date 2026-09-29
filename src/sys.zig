@@ -159,7 +159,11 @@ pub fn dup2(old: fd_t, new: fd_t) void {
 }
 
 pub fn duplicate(fd: fd_t) ?fd_t {
-    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 3);
+    return duplicateAbove(fd, 3);
+}
+
+pub fn duplicateAbove(fd: fd_t, minimum: usize) ?fd_t {
+    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, minimum);
     if (linux.errno(rc) != .SUCCESS) return null;
     return @intCast(rc);
 }

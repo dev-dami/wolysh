@@ -15,16 +15,24 @@ const Saved = struct {
     /// The environment value the assignment shadowed, or null when there was
     /// none.
     value: ?[]const u8,
+    assigned: []const u8,
 };
 
 pub const State = struct {
     sh: *Shell,
     saved: []const Saved,
 
+    pub fn apply(self: State) !void {
+        for (self.saved) |entry| try self.sh.setEnv(entry.name, entry.assigned);
+    }
+
     /// Puts the shadowed environment back. Call after the command has been
     /// launched, so children still inherit the temporary values.
     pub fn restore(self: State) void {
-        for (self.saved) |entry| {
+        var index = self.saved.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.saved[index];
             if (entry.value) |value| {
                 self.sh.setEnv(entry.name, value) catch {};
             } else {
@@ -54,8 +62,9 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
     for (cmd.assigns) |assignment| {
         if (sh.isReadonly(assignment.name)) return error.ReadonlyVariable;
         const previous = if (sh.getEnv(assignment.name)) |old| try arena.dupe(u8, old) else null;
-        try saved.append(arena, .{ .name = assignment.name, .value = previous });
-        try sh.setEnv(assignment.name, try expand_mod.expandLiteral(sh, arena, assignment.value));
+        const assigned = try expand_mod.expandLiteral(sh, arena, assignment.value);
+        try saved.append(arena, .{ .name = assignment.name, .value = previous, .assigned = assigned });
+        try sh.setEnv(assignment.name, assigned);
     }
     return .{ .sh = sh, .saved = saved.items };
 }

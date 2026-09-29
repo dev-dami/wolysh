@@ -73,10 +73,9 @@ pub fn apply(
         }
 
         var source = opened_fd.?;
-        if (source == target_fd) {
-            // The child reaches the target with `dup2`, which is also what
-            // clears CLOEXEC, so move the file out of the target's slot.
-            const moved = sys.duplicate(source) orelse {
+        if (source < max_fd) {
+            // Keep temporary files outside every supported logical descriptor.
+            const moved = sys.duplicateAbove(source, max_fd) orelse {
                 sys.closeFd(source);
                 return error.ExecutionFailed;
             };

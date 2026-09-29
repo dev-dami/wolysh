@@ -23,6 +23,98 @@ def run_shell(command):
 
 
 class ShellCompatibilityTests(unittest.TestCase):
+    def test_numbered_redirects_do_not_collide_with_temporary_descriptors(self):
+        with tempfile.TemporaryDirectory(prefix="wsh-compat-") as temp_dir:
+            paths = [pathlib.Path(temp_dir) / f"fd{fd}" for fd in range(3, 7)]
+            redirects = " ".join(
+                f"{fd}>{shlex.quote(str(path))}"
+                for fd, path in enumerate(paths, 3)
+            )
+            result = run_shell(
+                "/bin/sh -c 'echo three >&3; echo four >&4; "
+                "echo five >&5; echo six >&6' " + redirects
+            )
+            self.assert_success(result)
+            self.assertEqual(
+                [path.read_bytes() for path in paths],
+                [b"three\n", b"four\n", b"five\n", b"six\n"],
+            )
+
+    def test_recursive_function_parameters_restore_enclosing_bindings(self):
+        result = run_shell(
+            'let n = "outer"; fn f(n) { if n > 0 { f 0; echo $n } }; '
+            'f 1; echo $n'
+        )
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"1\nouter\n")
+
+    def test_function_defaults_and_missing_parameters_are_local(self):
+        result = run_shell(
+            'let n = "outer"; let m = "kept"; '
+            'fn f(n = "default", m) { echo "$n:$m" }; '
+            'f; echo "$n:$m"'
+        )
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"default:\nouter:kept\n")
+
+    def test_pipeline_prefix_assignments_are_isolated_for_external_commands(self):
+        result = run_shell(
+            'env WSH_STAGE_VALUE = "original"; '
+            "WSH_STAGE_VALUE=left /bin/sh -c 'echo $WSH_STAGE_VALUE' | "
+            "/bin/sh -c 'cat; echo $WSH_STAGE_VALUE'; echo $WSH_STAGE_VALUE"
+        )
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"left\noriginal\noriginal\n")
+
+    def test_pipeline_prefix_assignments_are_isolated_for_builtins_and_groups(self):
+        stages = (
+            "eval 'cat; echo $WSH_STAGE_VALUE'",
+            "{ cat; echo $WSH_STAGE_VALUE; }",
+        )
+        for stage in stages:
+            with self.subTest(stage=stage):
+                result = run_shell(
+                    'env WSH_STAGE_VALUE = "original"; '
+                    "WSH_STAGE_VALUE=left eval 'echo $WSH_STAGE_VALUE' | "
+                    f"{stage}; echo $WSH_STAGE_VALUE"
+                )
+                self.assert_success(result)
+                self.assertEqual(result.stdout, b"left\noriginal\noriginal\n")
+
+    def test_each_builtin_pipeline_stage_keeps_its_own_prefix_assignments(self):
+        result = run_shell(
+            'env WSH_STAGE_VALUE = "original"; '
+            "WSH_STAGE_VALUE=left eval 'echo $WSH_STAGE_VALUE' | "
+            "WSH_STAGE_VALUE=right eval 'cat; echo $WSH_STAGE_VALUE'; "
+            "echo $WSH_STAGE_VALUE"
+        )
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"left\nright\noriginal\n")
+
+    def test_repeated_prefix_assignments_restore_original_value(self):
+        result = run_shell(
+            'env WSH_STAGE_VALUE = "original"; '
+            "WSH_STAGE_VALUE=first WSH_STAGE_VALUE=last "
+            "eval 'echo $WSH_STAGE_VALUE'; echo $WSH_STAGE_VALUE"
+        )
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"last\noriginal\n")
+
+    def test_background_brace_group_is_registered_and_isolates_state(self):
+        with tempfile.TemporaryDirectory(prefix="wsh-compat-") as temp_dir:
+            marker = shlex.quote(str(pathlib.Path(temp_dir) / "parent-ran"))
+            result = run_shell(
+                'let value = "parent"; '
+                '{ let value = "child"; '
+                "/bin/sh -c 'for i in $(seq 1 100); do "
+                f"if test -f {marker}; then exit 0; fi; sleep 0.01; "
+                "done; exit 1' && echo ready; } & "
+                f"echo after; /usr/bin/touch {marker}; wait; echo $value"
+            )
+            self.assert_success(result)
+            self.assertEqual(result.stdout, b"after\nready\nparent\n")
+            self.assertRegex(result.stderr, rb"\[1\] [0-9]+\n")
+
     def assert_success(self, result):
         self.assertEqual(
             result.returncode,

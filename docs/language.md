@@ -118,7 +118,8 @@ tr a-z A-Z <<< "here string"
 Parenthesized command groups run in a child shell process. Variable, directory,
 and exit-state changes inside them do not affect the parent; groups can be
 pipeline stages. Braced groups run in the current shell, so their changes
-persist; `!` negates a pipeline's status, and a `NAME=value` prefix applies to
+persist. Background braced groups (`{ ...; } &`) run in a child process and
+register as jobs. `!` negates a pipeline's status, and a `NAME=value` prefix applies to
 one command only:
 
 ```text
@@ -129,7 +130,9 @@ one command only:
 LC_ALL=C sort names.txt
 ```
 
-`$0` stays the script name inside a function, and `source file arg...` gives
+Named function parameters are local to each call and restore enclosing bindings
+on return, including during recursion. `$0` stays the script name inside a
+function, and `source file arg...` gives
 the sourced file its own positional parameters.
 
 ## Interactive shell

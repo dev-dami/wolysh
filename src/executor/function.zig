@@ -42,18 +42,6 @@ pub fn run(
         else => return 0,
     };
 
-    for (declaration.params, 0..) |param, index| {
-        const arg_index = index + 1;
-        if (arg_index < argv.len) {
-            sh.setVar(param.name, .{ .string = argv[arg_index] }) catch return 1;
-        } else if (param.default) |default| {
-            const result = runtime.evaluate(sh, arena, default) catch |err| return runtime.expression_error(sh, err);
-            sh.setVar(param.name, result) catch return 1;
-        } else {
-            sh.setVar(param.name, .{ .string = "" }) catch return 1;
-        }
-    }
-
     // `$0` keeps naming the shell/script; only the positional parameters are
     // the function's.
     const saved_positional = sh.positional;
@@ -69,6 +57,18 @@ pub fn run(
         sh.positional = saved_positional;
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
+    }
+
+    for (declaration.params, 0..) |param, index| {
+        const arg_index = index + 1;
+        if (arg_index < argv.len) {
+            sh.setLocal(param.name, .{ .string = argv[arg_index] }) catch return 1;
+        } else if (param.default) |default| {
+            const result = runtime.evaluate(sh, arena, default) catch |err| return runtime.expression_error(sh, err);
+            sh.setLocal(param.name, result) catch return 1;
+        } else {
+            sh.setLocal(param.name, .{ .string = "" }) catch return 1;
+        }
     }
 
     const status = runtime.run_statements(sh, declaration.body.stmts);

@@ -7,6 +7,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.3.4]
+
+### Fixed
+
+- Multiple numbered redirects no longer collide with temporary file descriptors
+  and send output to the wrong file.
+- Function parameters are local to each call and restore enclosing bindings,
+  including during recursion.
+- Command-prefix assignments stay within their pipeline stage, including
+  builtins and command groups; repeated assignments restore the original value.
+- Background brace groups run in a child process and register as jobs.
+
 ## [0.3.0]
 
 Compatibility and correctness work across expansion, grammar, execution, and
@@ -73,5 +85,6 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/dev-dami/wolysh/compare/v0.3.3...v0.3.4
 [0.3.0]: https://github.com/dev-dami/wolysh/releases/tag/v0.3.0
