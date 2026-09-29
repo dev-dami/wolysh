@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Single source of truth for the version string; keep in step with
 /// `build.zig.zon`.
-const version = "0.3.4";
+const version = "0.3.5";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

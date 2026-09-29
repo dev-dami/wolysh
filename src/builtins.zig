@@ -680,6 +680,10 @@ fn sleepBriefly() void {
 }
 
 fn finishJob(ctx: Ctx, job: *jobs.Job) u8 {
+    if (job.state == .done) {
+        job.notified = true;
+        return job.status;
+    }
     const outcome = ctx.sh.waitForeground(job);
     job.state = .done;
     job.notified = true;
@@ -716,7 +720,6 @@ fn builtinWait(ctx: Ctx) u8 {
 
     if (index >= ctx.argv.len) {
         for (ctx.sh.jobs.jobs.items) |*job| {
-            if (job.state == .done) continue;
             _ = finishJob(ctx, job);
         }
         ctx.sh.jobs.sweep(ctx.sh.gpa);
@@ -740,11 +743,11 @@ fn builtinWait(ctx: Ctx) u8 {
                 continue;
             }
             if (ctx.sh.jobs.findById(@intCast(number))) |job| {
-                status = if (job.state == .done) job.status else finishJob(ctx, job);
+                status = finishJob(ctx, job);
                 continue;
             }
             if (jobForPid(ctx, number)) |job| {
-                status = if (job.state == .done) job.status else finishJob(ctx, job);
+                status = finishJob(ctx, job);
                 continue;
             }
             if (proc.waitPid(number, 0)) |st| {
@@ -761,7 +764,7 @@ fn builtinWait(ctx: Ctx) u8 {
             status = 127;
             continue;
         };
-        status = if (job.state == .done) job.status else finishJob(ctx, job);
+        status = finishJob(ctx, job);
     }
     ctx.sh.jobs.sweep(ctx.sh.gpa);
     return status;
@@ -1728,25 +1731,33 @@ test "wait with no jobs succeeds and rejects unknown specs" {
 }
 
 test "wait blocks on a named job and reports its status" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
+    for ([_]bool{ false, true }) |pre_reap| {
+        var sh = try Shell.initBare(std.testing.allocator);
+        defer sh.deinit();
 
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-    const exec = try arena.create(proc.Exec);
-    exec.* = .{
-        .path = "/bin/sh",
-        .argv = try proc.buildArgv(arena, &.{ "sh", "-c", "exit 7" }),
-        .envp = try proc.buildArgv(arena, &.{"PATH=/usr/bin:/bin"}),
-    };
-    const launched = try proc.launch(arena, &.{.{ .exec = exec }}, .{ .new_group = false });
-    _ = try sh.jobs.add(testing.allocator, launched.pgid, launched.pids, "sh -c exit 7", false);
+        const exec = try arena.create(proc.Exec);
+        exec.* = .{
+            .path = "/bin/sh",
+            .argv = try proc.buildArgv(arena, &.{ "sh", "-c", "exit 7" }),
+            .envp = try proc.buildArgv(arena, &.{"PATH=/usr/bin:/bin"}),
+        };
+        const launched = try proc.launch(arena, &.{.{ .exec = exec }}, .{ .new_group = false });
+        _ = try sh.jobs.add(testing.allocator, launched.pgid, launched.pids, "sh -c exit 7", false);
 
-    const argv = [_][]const u8{ "wait", "%1" };
-    try testing.expectEqual(@as(u8, 7), builtinWait(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-    try testing.expectEqual(@as(usize, 0), sh.jobs.count());
+        if (pre_reap) {
+            while (sh.jobs.findById(1).?.state != .done) {
+                sh.reapJobs();
+                sleepBriefly();
+            }
+        }
+        const argv = [_][]const u8{ "wait", "%1" };
+        try testing.expectEqual(@as(u8, 7), builtinWait(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
+        try testing.expectEqual(@as(usize, 0), sh.jobs.count());
+    }
 }
 
 test "read splits on IFS, honours -r and prompts" {

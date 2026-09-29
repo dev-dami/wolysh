@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.3.5]
+
+### Fixed
+
+- `wait` consumes jobs that finished before it was called, preserving their
+  exit status and removing them from the job table.
+
 ## [0.3.4]
 
 ### Fixed
@@ -85,6 +92,7 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/dev-dami/wolysh/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/dev-dami/wolysh/compare/v0.3.3...v0.3.4
 [0.3.0]: https://github.com/dev-dami/wolysh/releases/tag/v0.3.0
