@@ -30,10 +30,10 @@ jobs:
         run: zig build fmt
 
       - name: Run unit tests
-        run: zig build test
+        run: zig build test -Dtarget=x86_64-linux -Dcpu=baseline
 
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=baseline
 
       - name: Require the tag to match the binary version
         env:

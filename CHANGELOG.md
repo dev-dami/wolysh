@@ -7,6 +7,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-04
+
+### Fixed
+
+- Linux x86_64 release archives now target the baseline CPU instead of the
+  GitHub runner's native CPU. This prevents `SIGILL` on CPUs without the
+  runner's instruction extensions.
+- CI and release tests use the same baseline x86_64 target as the archive.
+
 ## [0.4.0] - 2026-10-04
 
 ### Added
@@ -119,7 +128,8 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/dev-dami/wolysh/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dev-dami/wolysh/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/dev-dami/wolysh/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/dev-dami/wolysh/compare/v0.3.3...v0.3.4
