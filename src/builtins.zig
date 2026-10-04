@@ -13,6 +13,7 @@ const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
+const parallel = @import("parallel.zig");
 
 const Shell = shellmod.Shell;
 
@@ -23,6 +24,7 @@ pub const Ctx = struct {
     stdin: i32 = 0,
     stdout: i32 = 1,
     stderr: i32 = 2,
+    run_source: ?*const fn (*Shell, []const u8) u8 = null,
 
     fn arg(self: Ctx, index: usize) ?[]const u8 {
         if (index >= self.argv.len) return null;
@@ -667,16 +669,12 @@ fn isDigits(text: []const u8) bool {
 /// The job that owns `pid`, if any.
 fn jobForPid(ctx: Ctx, pid: i32) ?*jobs.Job {
     for (ctx.sh.jobs.jobs.items) |*job| {
+        if (job.last_pid == pid) return job;
         for (job.pids) |candidate| {
             if (candidate == pid) return job;
         }
     }
     return null;
-}
-
-fn sleepBriefly() void {
-    const request = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-    _ = linux.nanosleep(&request, null);
 }
 
 fn finishJob(ctx: Ctx, job: *jobs.Job) u8 {
@@ -685,8 +683,9 @@ fn finishJob(ctx: Ctx, job: *jobs.Job) u8 {
         return job.status;
     }
     const outcome = ctx.sh.waitForeground(job);
-    job.state = .done;
-    job.notified = true;
+    job.state = if (outcome.stopped) .stopped else .done;
+    job.status = outcome.status;
+    job.notified = !outcome.stopped;
     return outcome.status;
 }
 
@@ -703,18 +702,33 @@ fn builtinWait(ctx: Ctx) u8 {
     }
 
     if (next) {
-        // `wait -n` returns the status of whichever job finishes first.
-        if (ctx.sh.jobs.jobs.items.len == 0) return 127;
+        var selected: std.ArrayList(u32) = .empty;
+        const arena = ctx.sh.scratch();
+        for (ctx.argv[index..]) |spec| {
+            const job = if (isDigits(spec)) blk: {
+                const number = std.fmt.parseInt(i32, spec, 10) catch break :blk null;
+                if (number <= 0) break :blk null;
+                break :blk jobForPid(ctx, number) orelse ctx.sh.jobs.findById(@intCast(number));
+            } else resolveJob(ctx, spec);
+            if (job == null) {
+                ctx.errFmt("wsh: wait: {s}: no such job\n", .{spec});
+                return 127;
+            }
+            selected.append(arena, job.?.id) catch return 1;
+        }
         while (true) {
             ctx.sh.reapJobs();
+            var running = false;
             for (ctx.sh.jobs.jobs.items) |*job| {
+                if (selected.items.len != 0 and std.mem.indexOfScalar(u32, selected.items, job.id) == null) continue;
+                if (job.state == .running) running = true;
                 if (job.state != .done) continue;
                 const status = job.status;
-                job.notified = true;
-                ctx.sh.jobs.sweep(ctx.sh.gpa);
+                const job_index = ctx.sh.jobs.indexOf(job).?;
+                ctx.sh.jobs.removeAt(ctx.sh.gpa, job_index);
                 return status;
             }
-            sleepBriefly();
+            if (!running or !ctx.sh.waitJobEvent()) return 127;
         }
     }
 
@@ -1091,6 +1105,7 @@ fn builtinCommand(ctx: Ctx) u8 {
             .stdin = ctx.stdin,
             .stdout = ctx.stdout,
             .stderr = ctx.stderr,
+            .run_source = ctx.run_source,
         };
         return b.run(inner);
     }
@@ -1112,8 +1127,17 @@ fn builtinBuiltin(ctx: Ctx) u8 {
         .stdin = ctx.stdin,
         .stdout = ctx.stdout,
         .stderr = ctx.stderr,
+        .run_source = ctx.run_source,
     };
     return b.run(inner);
+}
+
+fn builtinParallel(ctx: Ctx) u8 {
+    const run_source = ctx.run_source orelse {
+        ctx.err("wsh: parallel: executor unavailable\n");
+        return 1;
+    };
+    return parallel.run(ctx.sh, ctx.argv, run_source);
 }
 
 /// Forks and execs `argv` through `PATH`, waiting for it like a foreground
@@ -1559,6 +1583,7 @@ const table = [_]Builtin{
     .{ .name = "unalias", .summary = "remove an alias", .run = builtinUnalias },
     .{ .name = "jobs", .summary = "list background jobs", .run = builtinJobs },
     .{ .name = "wait", .summary = "wait for background jobs", .run = builtinWait },
+    .{ .name = "parallel", .summary = "run commands with bounded concurrency", .run = builtinParallel },
     .{ .name = "fg", .summary = "bring a job to the foreground", .run = builtinFg },
     .{ .name = "bg", .summary = "resume a job in the background", .run = builtinBg },
     .{ .name = "kill", .summary = "send a signal to a process or job", .run = builtinKill },
@@ -1750,8 +1775,7 @@ test "wait blocks on a named job and reports its status" {
 
         if (pre_reap) {
             while (sh.jobs.findById(1).?.state != .done) {
-                sh.reapJobs();
-                sleepBriefly();
+                try testing.expect(sh.waitJobEvent());
             }
         }
         const argv = [_][]const u8{ "wait", "%1" };

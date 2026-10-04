@@ -2,7 +2,7 @@
 
 # wolysh (`wsh`)
 
-**A fast, readable Linux shell built to grow into a fish/Bash alternative.**
+**A fast, readable Linux shell for developers and agent workflows.**
 
 wolysh combines everyday Linux commands with a readable scripting language.
 Commands stay commands; arithmetic, conditions, loops, and functions get their
@@ -32,6 +32,9 @@ The release archive includes the shell, examples, license, and checksum.
 - Cache recent misses for fast inline corrections on the next attempt.
 - Use quick `la` and `lh` shortcuts for common `ls` options.
 - Manage foreground/background jobs with `Ctrl-Z`, `bg`, and `fg`.
+- Run independent tasks with native `parallel -j N`, fail-fast queueing,
+  and JSONL task reports.
+- Check generated scripts with `wsh --check` before executing them.
 
 ```text
 let workers = 4 * 2
@@ -49,6 +52,28 @@ Measurements are from one development machine, not a standardized benchmark.
 The loop result covers this 20,000-iteration workload; results vary by machine
 and workload.
 
+The [repeatable benchmark suite](benchmarks/README.md) compares the current
+worktree, the previous release, and Bash with interleaved samples. It covers
+startup, arithmetic, external commands, pipelines, event-driven waits, and
+bounded parallel tasks.
+
+## Agent and developer workflows
+
+Build once with `zig build -Doptimize=ReleaseFast`, then invoke the native
+binary directly. Non-interactive commands skip prompt, history, and config
+loading:
+
+```sh
+./zig-out/bin/wsh --check script.wsh
+./zig-out/bin/wsh --no-config -c "parallel -j 2 --fail-fast --report checks.jsonl 'zig build check' 'zig build -Doptimize=ReleaseFast'"
+```
+
+`parallel` runs Wolysh command strings in isolated child processes, inherits
+functions and variables, and refills a slot as soon as a task finishes. Reports
+record task indexes, exit statuses, and elapsed times separately from command
+output. See the [agent workflow guide](docs/agent-workflows.md) for the contract
+and examples.
+
 <details>
 <summary>Build from source</summary>
 
@@ -60,6 +85,15 @@ zig build -Doptimize=ReleaseFast
 ```
 
 To install the source build, run `sudo install -m 0755 zig-out/bin/wsh /usr/local/bin/wsh`.
+
+For a user-local installation without sudo:
+
+```sh
+zig build -Doptimize=ReleaseFast --prefix "$HOME/.local"
+"$HOME/.local/bin/wsh" --version
+```
+
+Add `$HOME/.local/bin` to your existing shell's `PATH` if it is not already there.
 
 </details>
 

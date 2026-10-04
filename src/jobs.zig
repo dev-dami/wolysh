@@ -23,6 +23,8 @@ pub const Job = struct {
     pgid: i32,
     /// Every process in the pipeline, in pipeline order.
     pids: []i32,
+    /// Retained after reaping so `wait $!` can consume a completed job.
+    last_pid: i32,
     state: State,
     /// Exit status of the last process in the pipeline.
     status: u8 = 0,
@@ -69,6 +71,7 @@ pub const Table = struct {
             .id = self.next_id,
             .pgid = pgid,
             .pids = owned_pids,
+            .last_pid = if (pids.len != 0) pids[pids.len - 1] else 0,
             .state = .running,
             .command = owned_command,
             .foreground = foreground,

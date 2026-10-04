@@ -36,13 +36,16 @@ class Session:
             os._exit(127)
         self.buf = b""
 
-    def read_until(self, needle, timeout=TIMEOUT):
-        return self.read_until_count(needle, 1, timeout)
+    def read_until(self, needle, timeout=TIMEOUT, regex=False):
+        return self.read_until_count(needle, 1, timeout, regex)
 
-    def read_until_count(self, needle, count, timeout=TIMEOUT):
+    def read_until_count(self, needle, count, timeout=TIMEOUT, regex=False):
+        def matched():
+            return len(re.findall(needle, self.buf)) >= count if regex else self.buf.count(needle) >= count
+
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.buf.count(needle) >= count:
+            if matched():
                 return True
             r, _, _ = select.select([self.fd], [], [], 0.2)
             if r:
@@ -53,7 +56,7 @@ class Session:
                 if not chunk:
                     return False
                 self.buf += chunk
-        return self.buf.count(needle) >= count
+        return matched()
 
     def send(self, data):
         os.write(self.fd, data if isinstance(data, bytes) else data.encode())
@@ -131,6 +134,8 @@ def main():
     # 1b. the cursor must land at the *visible* prompt width. The prompt is ~50
     # bytes once colour codes are included but only ~18 columns wide; measuring
     # bytes parked the cursor far right and drifted the prompt off the output.
+    # The prompt marker can arrive before the editor writes cursor placement.
+    s.read_until(rb'\x1b\[\d+C', regex=True)
     cols = re.findall(rb'\x1b\[(\d+)C', s.buf)
     visible = strip_ansi(s.buf).replace(b"\r", b"").split(b"\n")[-1]
     visible = visible.decode("utf-8", "replace")
@@ -343,6 +348,22 @@ def main():
     s.clear()
     s.send(b"\x03")  # Ctrl-C kills the foreground job
     check("fg returns the job to the foreground", s.read_until(b"\xe2\x9d\xaf", timeout=4))
+
+    s.clear()
+    s.send("parallel -j 2 '/bin/sleep 30' '/bin/sleep 30'\r")
+    s.drain(0.4)
+    s.clear()
+    s.send(b"\x1a")
+    check("Ctrl-Z stops the parallel job", s.read_until(b"\xe2\x9d\xaf", timeout=4))
+    s.clear()
+    s.send("jobs\r")
+    check("jobs lists the stopped parallel scheduler", s.read_until(b"Stopped  parallel"))
+    s.clear()
+    s.send("fg\r")
+    s.drain(0.4)
+    s.clear()
+    s.send(b"\x03")
+    check("Ctrl-C cancels parallel workers and restores the prompt", s.read_until(b"\xe2\x9d\xaf", timeout=4))
 
     # 11. rendering geometry: a wrapped line must keep the cursor inside the
     # terminal, and the prompt must land on the line right after the output.

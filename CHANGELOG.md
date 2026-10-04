@@ -7,6 +7,33 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-04
+
+### Added
+
+- Native `parallel` builtin with bounded concurrency (`-j` / `--jobs`),
+  CPU-count defaults, fail-fast queueing, and optional JSONL task reports.
+- `wsh -n` / `--check` validates command strings, scripts, and standard input
+  without executing commands or substitutions.
+- Reproducible shell benchmarks covering startup, arithmetic, external
+  commands, pipelines, waits, and bounded parallel workloads against Bash.
+- Agent workflow documentation and user-local ReleaseFast installation.
+
+### Changed
+
+- `wait -n` blocks on kernel child events instead of polling every millisecond,
+  and honors explicit job or PID operands.
+- Process launches avoid temporary duplicates of standard descriptors when
+  the mappings cannot overwrite one another.
+- Child environment entries are formatted directly into null-terminated
+  buffers, removing an allocation and copy per entry.
+
+### Fixed
+
+- Waiting for a partially reaped pipeline retains the last stage's exit status.
+- `wait $!` can consume a background job whose last process was already reaped.
+- Waiting for a stopped job preserves it for later resumption.
+
 ## [0.3.5]
 
 ### Fixed
@@ -92,7 +119,8 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dev-dami/wolysh/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/dev-dami/wolysh/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/dev-dami/wolysh/compare/v0.3.3...v0.3.4
 [0.3.0]: https://github.com/dev-dami/wolysh/releases/tag/v0.3.0

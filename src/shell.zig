@@ -509,11 +509,11 @@ pub const Shell = struct {
         var i: usize = 0;
         var it = self.env.iterator();
         while (it.next()) |entry| {
-            const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{
+            const pair = try std.fmt.allocPrintSentinel(arena, "{s}={s}", .{
                 entry.key_ptr.*,
                 entry.value_ptr.*,
-            });
-            arr[i] = (try arena.dupeZ(u8, pair)).ptr;
+            }, 0);
+            arr[i] = pair.ptr;
             i += 1;
         }
         arr[i] = null;
@@ -683,8 +683,8 @@ pub const Shell = struct {
     pub fn waitForeground(self: *Shell, job: *jobs.Job) WaitOutcome {
         self.giveTerminal(job.pgid);
 
-        var last_status: u8 = 0;
-        var last_signal: ?u32 = null;
+        var last_status: u8 = job.status;
+        var last_signal: ?u32 = job.signal;
         var stopped_signal: ?u32 = null;
 
         while (true) {
@@ -795,6 +795,39 @@ pub const Shell = struct {
                 job.state = .stopped;
             }
         }
+    }
+
+    /// Block in the kernel until a child changes state, preserving statuses
+    /// for jobs other than the one a caller is waiting for.
+    pub fn waitJobEvent(self: *Shell) bool {
+        const event = proc.waitAny(linux.W.UNTRACED | linux.W.CONTINUED) orelse return false;
+        for (self.jobs.jobs.items) |*job| {
+            for (job.pids, 0..) |*pid, index| {
+                if (pid.* != event.pid) continue;
+                const status = event.status;
+                switch (status.kind) {
+                    .exited, .signaled => {
+                        if (index + 1 == job.pids.len) {
+                            job.status = status.exitCode();
+                            job.signal = if (status.kind == .signaled) status.sig else null;
+                        }
+                        pid.* = 0;
+                        var alive = false;
+                        for (job.pids) |candidate| {
+                            if (candidate != 0) alive = true;
+                        }
+                        if (!alive) job.state = .done;
+                    },
+                    .stopped => {
+                        job.state = .stopped;
+                        job.signal = status.sig;
+                    },
+                    .continued => job.state = .running,
+                }
+                return true;
+            }
+        }
+        return true;
     }
 
     /// Prints a line for every job that finished since the last call.

@@ -26,11 +26,22 @@ jobs:
       - name: Require a project license
         run: test -s LICENSE
 
+      - name: Check formatting
+        run: zig build fmt
+
       - name: Run unit tests
         run: zig build test
 
       - name: Build release binary
         run: zig build -Doptimize=ReleaseFast
+
+      - name: Require the tag to match the binary version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          expected_version="${RELEASE_TAG#v}"
+          actual_version="$(zig-out/bin/wsh --version)"
+          test "${actual_version}" = "wolysh ${expected_version}"
 
       - name: Run interactive tests
         run: python3 tests/pty_test.py
@@ -45,12 +56,17 @@ jobs:
           set -euo pipefail
           archive_name="wolysh-${RELEASE_TAG}-linux-x86_64"
           stage="dist/${archive_name}"
-          mkdir -p "${stage}/examples" "${stage}/assets" "${stage}/docs"
+          mkdir -p "${stage}/examples" "${stage}/assets" "${stage}/docs/releases" "${stage}/benchmarks"
           install -m 0755 zig-out/bin/wsh "${stage}/wsh"
-          install -m 0644 README.md LICENSE "${stage}/"
+          install -m 0644 README.md CHANGELOG.md CONTRIBUTING.md LICENSE "${stage}/"
           install -m 0644 examples/config examples/demo.wsh "${stage}/examples/"
           install -m 0644 assets/terminal-session.png assets/terminal-script-example.png assets/benchmarks.svg assets/sheep-logo.png "${stage}/assets/"
-          install -m 0644 docs/language.md "${stage}/docs/"
+          install -m 0644 docs/language.md docs/agent-workflows.md "${stage}/docs/"
+          notes_file="docs/releases/${RELEASE_TAG}.md"
+          if test -f "${notes_file}"; then
+            install -m 0644 "${notes_file}" "${stage}/docs/releases/"
+          fi
+          install -m 0644 benchmarks/README.md benchmarks/shell_bench.py benchmarks/results-linux-x86_64.json "${stage}/benchmarks/"
           tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
           (cd dist && sha256sum "${archive_name}.tar.gz" > "${archive_name}.tar.gz.sha256")
 
@@ -59,8 +75,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          notes_file="docs/releases/${RELEASE_TAG}.md"
+          if test -f "${notes_file}"; then
+            set -- --notes-file "${notes_file}"
+          else
+            set -- --generate-notes
+          fi
           gh release create "${RELEASE_TAG}" \
             "dist/wolysh-${RELEASE_TAG}-linux-x86_64.tar.gz" \
             "dist/wolysh-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256" \
-            --generate-notes \
-            --verify-tag
+            --title "wolysh ${RELEASE_TAG}" \
+            --latest \
+            --verify-tag \
+            "$@"

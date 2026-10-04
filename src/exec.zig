@@ -51,6 +51,15 @@ pub fn runSource(sh: *Shell, src: []const u8) u8 {
     return status;
 }
 
+pub fn checkSource(sh: *Shell, src: []const u8) u8 {
+    var p = parser_mod.Parser.init(sh.scratch(), src);
+    _ = p.parseProgram() catch {
+        reportSyntaxError(sh, &p);
+        return 2;
+    };
+    return 0;
+}
+
 fn reportSyntaxError(sh: *Shell, p: *const parser_mod.Parser) void {
     var buf: [512]u8 = undefined;
     const msg = p.message(&buf);
