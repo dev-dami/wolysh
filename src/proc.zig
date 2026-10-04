@@ -237,20 +237,43 @@ pub fn waitPid(pid: i32, flags: u32) ?Status {
     }
 }
 
+pub const ChildEvent = struct { pid: i32, status: Status };
+
+pub fn waitAny(flags: u32) ?ChildEvent {
+    var wstatus: u32 = 0;
+    while (true) {
+        const rc = linux.waitpid(-1, &wstatus, flags);
+        const err = linux.errno(rc);
+        if (err == .INTR) continue;
+        if (err != .SUCCESS or rc == 0) return null;
+        return .{ .pid = @intCast(rc), .status = decode(wstatus) };
+    }
+}
+
 fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, pgid: i32) noreturn {
     // Both parent and child call setpgid so neither has to win the race.
     if (pgid != 0) _ = linux.setpgid(0, pgid);
     resetSignals();
 
-    const saved_in = sys.duplicate(fd_in) orelse linux.exit(126);
-    const saved_out = sys.duplicate(fd_out) orelse linux.exit(126);
-    const saved_err = sys.duplicate(stage.stdio.err) orelse linux.exit(126);
-    sys.dup2(saved_in, 0);
-    sys.dup2(saved_out, 1);
-    sys.dup2(saved_err, 2);
-    sys.closeFd(saved_in);
-    sys.closeFd(saved_out);
-    sys.closeFd(saved_err);
+    const sources = [3]i32{ fd_in, fd_out, stage.stdio.err };
+    var cross_standard = false;
+    for (sources, 0..) |source, target| {
+        if (source >= 0 and source < 3 and source != @as(i32, @intCast(target))) cross_standard = true;
+    }
+    if (cross_standard) {
+        // Preserve standard descriptors before a remapping can overwrite them.
+        var saved: [3]i32 = undefined;
+        for (sources, 0..) |source, index| saved[index] = sys.duplicate(source) orelse linux.exit(126);
+        for (saved, 0..) |source, target| {
+            if (linux.errno(linux.dup3(source, @intCast(target), 0)) != .SUCCESS) linux.exit(126);
+            sys.closeFd(source);
+        }
+    } else {
+        for (sources, 0..) |source, target| {
+            if (source == @as(i32, @intCast(target))) continue;
+            if (linux.errno(linux.dup3(source, @intCast(target), 0)) != .SUCCESS) linux.exit(126);
+        }
+    }
 
     for (pipes) |fds| {
         _ = linux.close(fds[0]);

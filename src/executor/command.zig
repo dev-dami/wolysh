@@ -51,6 +51,7 @@ pub fn dispatch(sh: *Shell, argv: []const []const u8, runtime: Runtime) u8 {
             .stdin = sh.default_in,
             .stdout = sh.default_out,
             .stderr = sh.default_err,
+            .run_source = runtime.run_source,
         };
         return builtin.run(ctx);
     }

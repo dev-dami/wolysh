@@ -22,6 +22,7 @@ const help_text =
     \\
     \\options:
     \\  -c <command>   run a command string and exit
+    \\  -n, --check    check syntax without executing commands
     \\  -i             force interactive mode
     \\  -l, --login    mark this as a login shell
     \\      --no-config  skip the configuration file
@@ -77,7 +78,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // `-c`: everything after the command string is positional.
         sh.positional = parsed.rest;
         sh.script_name = "wsh";
-        const status = exec.runSource(&sh, command);
+        const status = if (options.check) exec.checkSource(&sh, command) else exec.runSource(&sh, command);
         return status;
     }
 
@@ -91,7 +92,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         };
         defer gpa.free(data);
-        return exec.runSource(&sh, data);
+        return if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data);
     }
 
     // No command and no script: interactive when stdin is a terminal,
@@ -99,11 +100,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const is_tty = sys.isTty(0) and sys.isTty(1);
     sh.interactive = options.interactive or is_tty;
 
-    if (!sh.interactive) {
+    if (options.check or !sh.interactive) {
         const data = readAllStdin(gpa) orelse return 1;
         defer gpa.free(data);
         sh.script_name = "wsh";
-        return exec.runSource(&sh, data);
+        return if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data);
     }
 
     return runRepl(&sh, gpa, options.no_config);
@@ -115,6 +116,7 @@ const Options = struct {
     interactive: bool = false,
     login: bool = false,
     no_config: bool = false,
+    check: bool = false,
 };
 
 const ParsedArgs = struct {
@@ -148,6 +150,10 @@ fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
         }
         if (eql(arg, "-i")) {
             options.interactive = true;
+            continue;
+        }
+        if (eql(arg, "-n") or eql(arg, "--check")) {
+            options.check = true;
             continue;
         }
         if (eql(arg, "-l") or eql(arg, "--login")) {

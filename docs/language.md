@@ -156,16 +156,40 @@ their best correction inline; press Right to accept it.
 
 `jobs`, `fg`, `bg`, and `wait` support `%1`, `%+`, and command prefixes.
 Foreground jobs receive the terminal and run in their own process groups.
+`wait -n` blocks until a job completes; optional operands limit which jobs it
+can return. `wait -n` returns 127 when no eligible running or completed job
+remains. Already completed jobs retain their exit status until consumed.
 
 Interactive shells define `la` as `ls -A` and `lh` as `ls -lh` by default;
 configuration can override either alias.
 
 Builtins include `cd`, `pwd`, `echo`, `print`, `printf`, `exit`, `export`,
-`unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `history`, `read`,
+`unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `parallel`, `history`, `read`,
 `test`, `source`, `eval`, `shift`, `type`, `command`, `builtin`, `local`,
 `readonly`, `trap`, `umask`, `kill`, `exec`, `pushd`, `popd`, `dirs`, and `:`.
 `echo` accepts bundled flags such as `-ne` and interprets escapes; other
 commands resolve through `PATH`.
+
+## Parallel tasks and syntax checks
+
+```text
+parallel -j 2 'cargo check' 'cargo test'
+parallel --jobs 4 --fail-fast --report checks.jsonl 'task one' 'task two'
+```
+
+Commands use Wolysh syntax and inherit the current environment, variables,
+functions, and aliases. Each task has an isolated shell state; stdout, stderr,
+and stdin are shared unless redirected. The default limit is the available
+CPU count. `--fail-fast` stops queued tasks after observing a failure and waits
+for tasks already started. `--report` writes completion and skipped-task records
+as JSONL, separate from task output.
+
+`wsh -n` / `--check` accepts the same script, `-c`, and standard-input modes as
+normal execution, parses the source, and returns 0 for valid syntax or 2 for a
+syntax error. It does not execute commands or substitutions. It cannot validate
+commands stored in strings for later `eval`, function calls, or `parallel`.
+
+See [agent workflows](agent-workflows.md) for report fields and exit semantics.
 
 ## Configuration
 
