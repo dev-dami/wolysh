@@ -10,8 +10,8 @@ From the repository root, run:
 
 ```sh
 zig build fmt
-zig build test
-zig build -Doptimize=ReleaseFast
+zig build test -Dtarget=x86_64-linux -Dcpu=baseline
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=baseline
 python3 tests/pty_test.py
 python3 tests/shell_compat_test.py
 ```
@@ -57,3 +57,6 @@ changelog entries into a dated version section, and write
 `docs/releases/vX.Y.Z.md`. The workflow verifies that the binary's version
 matches the tag and uses that file as the release notes when present. It ships
 the notes, language and agent guides, and repeatable benchmarks in the archive.
+Release and CI builds explicitly use `-Dtarget=x86_64-linux -Dcpu=baseline`
+so a downloaded archive does not require the runner's CPU extensions. A local
+source build can use the native CPU for that machine.
