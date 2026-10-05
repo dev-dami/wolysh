@@ -86,6 +86,11 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
 }
 
 fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value {
+    // The lexer passes `${...}` through as its inner text: `let n = ${#a[@]}`.
+    if (!isPlainName(name)) {
+        const braced = try std.mem.concat(arena, u8, &.{ "${", name, "}" });
+        return Value{ .string = try expand_mod.expandLiteral(sh, arena, braced) };
+    }
     if (std.mem.eql(u8, name, "status")) return Value{ .int = sh.last_status };
     if (std.mem.eql(u8, name, "pid")) return Value{ .int = sh.pid };
     if (std.mem.eql(u8, name, "cwd")) return Value{ .string = try arena.dupe(u8, sh.cwd) };
@@ -108,6 +113,14 @@ fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value
     if (sh.getVar(name)) |result| return result;
     if (sh.getEnv(name)) |environment| return Value{ .string = try arena.dupe(u8, environment) };
     return .none;
+}
+
+fn isPlainName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+    return true;
 }
 
 pub fn isFunction(name: []const u8) bool {

@@ -247,6 +247,7 @@ class WshBehaviourTests(unittest.TestCase):
                    "a c []\n")
         self.check("declare -A m=([k]=v); let v = m[\"k\"]; let g = [[1, 2], [3, 4]]; let c = g[1][0]; "
                    "let s = \"héllo\"[1]; echo $v $c $s", "v 3 é\n")
+        self.check('a=(x y z); let n = ${#a[@]} + 1; if ${u:-d} == "d" { echo $n }', "4\n")
         result = run_shell("let bad = 5[0]")
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"cannot index", result.stderr)
