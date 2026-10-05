@@ -14,6 +14,7 @@ const session = @import("interactive/session.zig");
 const history = @import("history.zig");
 const login = @import("login.zig");
 const stdin_script = @import("stdin_script.zig");
+const histexpand = @import("interactive/histexpand.zig");
 
 const Shell = shellmod.Shell;
 
@@ -437,10 +438,11 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         if (editor_state.interrupted) continue;
         if (source.len == 0) continue;
 
-        recordHistory(sh, source, &history_error_reported);
+        const line = histexpand.apply(sh, source) orelse continue;
+        recordHistory(sh, line, &history_error_reported);
         prompt.command_number += 1;
-        session.beforeCommand(sh, source);
-        var status = exec.runSource(sh, source);
+        session.beforeCommand(sh, line);
+        var status = exec.runSource(sh, line);
         if (sh.interrupted) {
             status = 130;
             sh.last_status = status;

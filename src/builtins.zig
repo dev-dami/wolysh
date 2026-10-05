@@ -17,6 +17,7 @@ const parallel = @import("parallel.zig");
 const cd = @import("builtins/cd.zig");
 const history_builtin = @import("builtins/history.zig");
 const import_env = @import("builtins/import_env.zig");
+const complete_builtin = @import("builtins/complete.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1668,6 +1669,8 @@ const table = [_]Builtin{
     .{ .name = "true", .summary = "return success", .run = builtinTrue },
     .{ .name = "false", .summary = "return failure", .run = builtinFalse },
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },
+    .{ .name = "complete", .summary = "define how arguments of a command complete", .run = complete_builtin.runComplete },
+    .{ .name = "compgen", .summary = "print completion candidates", .run = complete_builtin.runCompgen },
 };
 
 // --- tests -----------------------------------------------------------------
