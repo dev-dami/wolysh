@@ -263,7 +263,7 @@ fn failed(ctx: Ctx, arg: []const u8, err: anyerror) u8 {
             // Already reported; a failed expansion ends a script, as in bash.
             if (!ctx.sh.interactive) {
                 ctx.sh.should_exit = true;
-                ctx.sh.exit_code = if (err == error.UnboundVariable) 127 else 1;
+                ctx.sh.exit_code = 1;
             }
         },
         error.ReadonlyVariable => ctx.errFmt("wsh: {s}: {s}: readonly variable\n", .{ cmd, parseSpec(arg).name }),

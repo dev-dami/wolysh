@@ -35,20 +35,25 @@ def run_shell(command, *args):
     )
 
 
-def run_bash(command, *args):
-    # bash takes `$0` before the positional parameters; wsh does not.
-    return subprocess.run(
-        [BASH, "-c", command, "bash", *args],
-        cwd=ROOT,
-        env=ENV,
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
+def run_script(shell, script, *args):
+    # Scripts rather than `-c`: `bash -c` exits 127 after an expansion error
+    # where a bash script exits 1, and scripts are what wsh has to replace.
+    with tempfile.NamedTemporaryFile("w", suffix=".sh") as handle:
+        handle.write(script + "\n")
+        handle.flush()
+        command = [BASH] if shell == "bash" else [str(SHELL), "--no-config"]
+        return subprocess.run(
+            [*command, handle.name, *args],
+            cwd=ROOT,
+            env=ENV,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
 
 
 def normalize(stderr):
-    return re.sub(rb"(?m)^bash: (line \d+: )?", b"wsh: ", stderr)
+    return re.sub(rb"(?m)^[^\n]*?: line \d+: ", b"wsh: ", stderr)
 
 
 # Each case runs under both shells; status, stdout and stderr must agree.
@@ -109,6 +114,7 @@ ERROR_CASES = [
     "echo ${x;y} ran",
     "echo ${u:?}; echo after",
     "echo ${u?}; echo after",
+    '(echo ${u:?boom}); echo "after $?"; (echo ${x;y}); echo "after $?"',
     "e=; echo ${e:?is empty $HOME}; echo after",
     "x=hello; echo ${x:1:-10}; echo after",
     "echo ${1:=x}; echo after",
@@ -188,8 +194,8 @@ class BashComparisonTests(unittest.TestCase):
     def compare(self, cases, *args):
         for script in cases:
             with self.subTest(script=script):
-                expected = run_bash(script, *args)
-                actual = run_shell(script, *args)
+                expected = run_script("bash", script, *args)
+                actual = run_script("wsh", script, *args)
                 self.assertEqual(
                     (actual.returncode, actual.stdout, normalize(actual.stderr)),
                     (expected.returncode, expected.stdout, normalize(expected.stderr)),
