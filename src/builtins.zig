@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const import_env = @import("builtins/import_env.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1575,6 +1576,7 @@ const table = [_]Builtin{
     .{ .name = "printf", .summary = "format and print arguments", .run = builtinPrintf },
     .{ .name = "exit", .summary = "exit the shell", .run = builtinExit },
     .{ .name = "export", .summary = "set an environment variable", .run = builtinExport },
+    .{ .name = "import-env", .summary = "import the environment a bash script exports", .run = import_env.run },
     .{ .name = "unset", .summary = "remove a variable", .run = builtinUnset },
     .{ .name = "set", .summary = "list or set shell variables", .run = builtinSet },
     .{ .name = "local", .summary = "declare a function-local variable", .run = builtinLocal },
