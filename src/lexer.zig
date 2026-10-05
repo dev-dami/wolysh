@@ -163,7 +163,9 @@ const CaseParens = struct {
         const c = src[pos];
         if (self.in_patterns and (c == '(' or c == ')')) {
             if (c == '(') {
-                if (pos > start and std.mem.indexOfScalar(u8, "?*+@!", src[pos - 1]) != null) self.pattern_parens += 1;
+                // An extglob group or a nested `$(`/`$((`; otherwise the
+                // optional `(` before a pattern.
+                if (pos > start and std.mem.indexOfScalar(u8, "?*+@!$(", src[pos - 1]) != null) self.pattern_parens += 1;
             } else if (self.pattern_parens > 0) {
                 self.pattern_parens -= 1;
             } else {
@@ -864,6 +866,9 @@ test "a case statement inside $(...) does not close it early" {
 
     var plain = Lexer.init("$(echo case in a) b");
     try std.testing.expectEqualStrings("$(echo case in a)", plain.next().text);
+
+    var nested = Lexer.init("$(case $(echo b) in $(echo b)) echo B;; $((1+1))) echo 2;; esac) c");
+    try std.testing.expectEqualStrings("$(case $(echo b) in $(echo b)) echo B;; $((1+1))) echo 2;; esac)", nested.next().text);
 }
 
 test "special parameters in expression mode" {
