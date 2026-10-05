@@ -15,6 +15,11 @@ const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
 const printf_builtin = @import("builtins/printf.zig");
+const read_builtin = @import("builtins/read.zig");
+const describe_builtin = @import("builtins/describe.zig");
+const jobctl_builtin = @import("builtins/jobctl.zig");
+const getopts_builtin = @import("builtins/getopts.zig");
+const help_builtin = @import("builtins/help.zig");
 
 const Shell = shellmod.Shell;
 
@@ -487,36 +492,10 @@ fn builtinExit(ctx: Ctx) u8 {
 fn resolveJob(ctx: Ctx, spec: ?[]const u8) ?*jobs.Job {
     const text = spec orelse return ctx.sh.jobs.mostRecent();
     if (text.len == 0) return ctx.sh.jobs.mostRecent();
-    if (std.mem.eql(u8, text, "%+") or std.mem.eql(u8, text, "%%")) {
-        return ctx.sh.jobs.mostRecent();
-    }
-    const bare = if (text[0] == '%') text[1..] else text;
-    if (std.fmt.parseInt(u32, bare, 10)) |id| {
-        return ctx.sh.jobs.findById(id);
-    } else |_| {}
-    return ctx.sh.jobs.findByCommandPrefix(bare);
-}
-
-fn printJob(ctx: Ctx, job: *const jobs.Job, is_current: bool) void {
-    const marker: u8 = if (job.state == .done) ' ' else if (is_current) '+' else '-';
-    ctx.outFmt("[{d}] {c} {s}  {s}\n", .{ job.id, marker, job.state.label(), job.command });
-}
-
-fn builtinJobs(ctx: Ctx) u8 {
-    ctx.sh.reapJobs();
-
-    // The most recently started live job is the "current" one, like bash.
-    var current: ?*jobs.Job = null;
-    for (ctx.sh.jobs.jobs.items) |*job| {
-        if (job.state != .done) current = job;
-    }
-
-    for (ctx.sh.jobs.jobs.items) |*job| {
-        printJob(ctx, job, job == current);
-        job.notified = true;
-    }
-    ctx.sh.jobs.sweep(ctx.sh.gpa);
-    return 0;
+    return switch (ctx.sh.jobs.lookup(text)) {
+        .found => |job| job,
+        .none, .ambiguous => null,
+    };
 }
 
 fn builtinFg(ctx: Ctx) u8 {
@@ -916,102 +895,6 @@ fn builtinWhich(ctx: Ctx) u8 {
     return status;
 }
 
-/// Classifies `name` the way `type` (verbose) or `command -v` (terse) does.
-fn describe(ctx: Ctx, name: []const u8, verbose: bool) u8 {
-    if (ctx.sh.getFunc(name) != null) {
-        if (verbose) {
-            ctx.outFmt("{s} is a shell function\n", .{name});
-        } else {
-            ctx.outFmt("{s}\n", .{name});
-        }
-        return 0;
-    }
-    if (ctx.sh.getAlias(name)) |text| {
-        if (verbose) {
-            ctx.outFmt("{s} is aliased to `{s}'\n", .{ name, text });
-        } else {
-            ctx.outFmt("{s}\n", .{name});
-        }
-        return 0;
-    }
-    if (lookup(name) != null) {
-        if (verbose) {
-            ctx.outFmt("{s} is a shell builtin\n", .{name});
-        } else {
-            ctx.outFmt("{s}\n", .{name});
-        }
-        return 0;
-    }
-
-    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const resolved = proc.resolve(arena, name, ctx.sh.pathEnv()) catch null;
-    if (resolved) |path| {
-        if (verbose) {
-            ctx.outFmt("{s} is {s}\n", .{ name, path });
-        } else {
-            ctx.outFmt("{s}\n", .{path});
-        }
-        return 0;
-    }
-
-    if (verbose) ctx.errFmt("wsh: type: {s}: not found\n", .{name});
-    return 1;
-}
-
-fn builtinType(ctx: Ctx) u8 {
-    if (ctx.argv.len < 2) {
-        ctx.err("wsh: type: expected a name\n");
-        return 1;
-    }
-    var status: u8 = 0;
-    for (ctx.argv[1..]) |name| {
-        if (describe(ctx, name, true) != 0) status = 1;
-    }
-    return status;
-}
-
-fn builtinCommand(ctx: Ctx) u8 {
-    var index: usize = 1;
-    var terse = false;
-    while (index < ctx.argv.len) : (index += 1) {
-        const arg = ctx.argv[index];
-        if (std.mem.eql(u8, arg, "-v")) {
-            terse = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--")) {
-            index += 1;
-            break;
-        }
-        break;
-    }
-    if (index >= ctx.argv.len) return 0;
-
-    if (terse) {
-        var status: u8 = 0;
-        for (ctx.argv[index..]) |name| {
-            if (describe(ctx, name, false) != 0) status = 1;
-        }
-        return status;
-    }
-
-    const call = ctx.argv[index..];
-    if (lookup(call[0])) |b| {
-        const inner = Ctx{
-            .sh = ctx.sh,
-            .argv = call,
-            .stdin = ctx.stdin,
-            .stdout = ctx.stdout,
-            .stderr = ctx.stderr,
-            .run_source = ctx.run_source,
-        };
-        return b.run(inner);
-    }
-    return runExternal(ctx, call);
-}
-
 fn builtinBuiltin(ctx: Ctx) u8 {
     if (ctx.argv.len < 2) {
         ctx.err("wsh: builtin: expected a builtin name\n");
@@ -1040,14 +923,14 @@ fn builtinParallel(ctx: Ctx) u8 {
     return parallel.run(ctx.sh, ctx.argv, run_source);
 }
 
-/// Forks and execs `argv` through `PATH`, waiting for it like a foreground
-/// job. `command NAME` and the function-less path use this.
-fn runExternal(ctx: Ctx, argv: []const []const u8) u8 {
+/// Forks and execs `argv` through `path_env`, waiting for it like a
+/// foreground job. `command NAME` and the function-less path use this.
+pub fn runExternal(ctx: Ctx, argv: []const []const u8, path_env: []const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const resolved = (proc.resolve(arena, argv[0], ctx.sh.pathEnv()) catch null) orelse {
+    const resolved = (proc.resolve(arena, argv[0], path_env) catch null) orelse {
         ctx.errFmt("wsh: {s}: command not found\n", .{argv[0]});
         return 127;
     };
@@ -1148,131 +1031,6 @@ fn markExecFailure(ctx: Ctx) u8 {
         ctx.sh.exit_code = 127;
     }
     return 127;
-}
-
-// --- read -------------------------------------------------------------------
-
-/// Copies the current `IFS` into `buf`: the value must survive the assignments
-/// `read` performs, which would otherwise reallocate it underneath us.
-fn readIfs(sh: *Shell, buf: []u8) []const u8 {
-    const v = sh.getVar("IFS") orelse return " \t\n";
-    if (std.meta.activeTag(v) != .string) return " \t\n";
-    if (v.string.len > buf.len) return " \t\n";
-    @memcpy(buf[0..v.string.len], v.string);
-    return buf[0..v.string.len];
-}
-
-fn isIfsWhitespace(c: u8, ifs: []const u8) bool {
-    if (c != ' ' and c != '\t' and c != '\n') return false;
-    return std.mem.indexOfScalar(u8, ifs, c) != null;
-}
-
-fn isIfsChar(c: u8, ifs: []const u8) bool {
-    return std.mem.indexOfScalar(u8, ifs, c) != null;
-}
-
-/// Pulls one field out of `line`, the way the shell splits unquoted words:
-/// runs of IFS whitespace delimit, a non-whitespace IFS character delimits on
-/// its own and can leave an empty field. The final field keeps the rest of the
-/// line with its trailing IFS whitespace removed.
-fn nextField(line: []const u8, pos: *usize, ifs: []const u8, last: bool) ?[]const u8 {
-    while (pos.* < line.len and isIfsWhitespace(line[pos.*], ifs)) pos.* += 1;
-    if (pos.* >= line.len) return null;
-
-    const start = pos.*;
-    if (last) {
-        var end = line.len;
-        while (end > start and isIfsWhitespace(line[end - 1], ifs)) end -= 1;
-        pos.* = line.len;
-        return line[start..end];
-    }
-
-    var field: []const u8 = "";
-    if (!isIfsChar(line[pos.*], ifs)) {
-        while (pos.* < line.len and !isIfsChar(line[pos.*], ifs)) pos.* += 1;
-        field = line[start..pos.*];
-    }
-
-    // Consume the delimiter: IFS whitespace, then one non-whitespace IFS
-    // character with any whitespace that follows it.
-    while (pos.* < line.len and isIfsWhitespace(line[pos.*], ifs)) pos.* += 1;
-    if (pos.* < line.len and isIfsChar(line[pos.*], ifs) and !isIfsWhitespace(line[pos.*], ifs)) {
-        pos.* += 1;
-        while (pos.* < line.len and isIfsWhitespace(line[pos.*], ifs)) pos.* += 1;
-    }
-    return field;
-}
-
-fn builtinRead(ctx: Ctx) u8 {
-    var raw = false;
-    var prompt: ?[]const u8 = null;
-    var index: usize = 1;
-    while (index < ctx.argv.len) : (index += 1) {
-        const arg = ctx.argv[index];
-        if (std.mem.eql(u8, arg, "--")) {
-            index += 1;
-            break;
-        }
-        if (arg.len < 2 or arg[0] != '-') break;
-        if (std.mem.eql(u8, arg, "-r")) {
-            raw = true;
-        } else if (std.mem.eql(u8, arg, "-p")) {
-            index += 1;
-            if (index >= ctx.argv.len) {
-                ctx.err("wsh: read: -p needs a prompt\n");
-                return 2;
-            }
-            prompt = ctx.argv[index];
-        } else {
-            ctx.errFmt("wsh: read: {s}: invalid option\n", .{arg});
-            return 2;
-        }
-    }
-
-    if (index >= ctx.argv.len) {
-        ctx.err("wsh: read: expected a variable name\n");
-        return 2;
-    }
-    const names = ctx.argv[index..];
-    for (names) |name| {
-        if (!validName(name)) {
-            ctx.errFmt("wsh: read: '{s}' is not a valid name\n", .{name});
-            return 2;
-        }
-        if (ctx.sh.isReadonly(name)) {
-            ctx.errFmt("wsh: read: {s}: readonly variable\n", .{name});
-            return 1;
-        }
-    }
-
-    if (prompt) |text| ctx.err(text);
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(ctx.sh.gpa);
-
-    while (true) {
-        const c = sys.readByte(ctx.stdin) orelse break;
-        if (!raw and c == '\\') {
-            const escaped = sys.readByte(ctx.stdin) orelse break;
-            // Without -r, a trailing backslash continues onto the next line.
-            if (escaped == '\n') continue;
-            buf.append(ctx.sh.gpa, escaped) catch return 1;
-            continue;
-        }
-        if (c == '\n') break;
-        buf.append(ctx.sh.gpa, c) catch return 1;
-    }
-
-    const line = std.mem.trimEnd(u8, buf.items, "\r");
-    var ifs_buf: [64]u8 = undefined;
-    const ifs = readIfs(ctx.sh, &ifs_buf);
-    var pos: usize = 0;
-    for (names, 0..) |name, i| {
-        const last = i + 1 == names.len;
-        const field = nextField(line, &pos, ifs, last) orelse "";
-        ctx.sh.assignVar(name, .{ .string = field }) catch return 1;
-    }
-    return 0;
 }
 
 // --- test ------------------------------------------------------------------
@@ -1481,7 +1239,7 @@ const table = [_]Builtin{
     .{ .name = "readonly", .summary = "mark variables readonly", .run = builtinReadonly },
     .{ .name = "alias", .summary = "define or list aliases", .run = builtinAlias },
     .{ .name = "unalias", .summary = "remove an alias", .run = builtinUnalias },
-    .{ .name = "jobs", .summary = "list background jobs", .run = builtinJobs },
+    .{ .name = "jobs", .summary = "list background jobs", .run = jobctl_builtin.jobsBuiltin },
     .{ .name = "wait", .summary = "wait for background jobs", .run = builtinWait },
     .{ .name = "parallel", .summary = "run commands with bounded concurrency", .run = builtinParallel },
     .{ .name = "fg", .summary = "bring a job to the foreground", .run = builtinFg },
@@ -1490,10 +1248,10 @@ const table = [_]Builtin{
     .{ .name = "trap", .summary = "set or clear signal handlers", .run = builtinTrap },
     .{ .name = "history", .summary = "show command history", .run = builtinHistory },
     .{ .name = "which", .summary = "locate a command", .run = builtinWhich },
-    .{ .name = "type", .summary = "describe how a name would be resolved", .run = builtinType },
-    .{ .name = "command", .summary = "run a command bypassing functions", .run = builtinCommand },
+    .{ .name = "type", .summary = "describe how a name would be resolved", .run = describe_builtin.typeBuiltin },
+    .{ .name = "command", .summary = "run a command bypassing functions", .run = describe_builtin.commandBuiltin },
     .{ .name = "builtin", .summary = "run a shell builtin directly", .run = builtinBuiltin },
-    .{ .name = "read", .summary = "read a line into variables", .run = builtinRead },
+    .{ .name = "read", .summary = "read a line into variables", .run = read_builtin.read },
     .{ .name = "shift", .summary = "shift positional parameters", .run = builtinShift },
     .{ .name = "umask", .summary = "get or set the file-creation mask", .run = builtinUmask },
     .{ .name = "exec", .summary = "replace the shell with a command", .run = builtinExec },
@@ -1502,6 +1260,12 @@ const table = [_]Builtin{
     .{ .name = "true", .summary = "return success", .run = builtinTrue },
     .{ .name = "false", .summary = "return failure", .run = builtinFalse },
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },
+    .{ .name = "mapfile", .summary = "read lines into an array", .run = read_builtin.mapfile },
+    .{ .name = "readarray", .summary = "read lines into an array", .run = read_builtin.mapfile },
+    .{ .name = "hash", .summary = "check where commands resolve in PATH", .run = describe_builtin.hashBuiltin },
+    .{ .name = "disown", .summary = "remove jobs from the job table", .run = jobctl_builtin.disownBuiltin },
+    .{ .name = "getopts", .summary = "parse positional options", .run = getopts_builtin.run },
+    .{ .name = "help", .summary = "describe builtins and the language", .run = help_builtin.run },
 };
 
 // --- tests -----------------------------------------------------------------
@@ -1533,15 +1297,6 @@ const Capture = struct {
         return out.toOwnedSlice(allocator);
     }
 };
-
-/// Fills a pipe with `input` and returns its read end.
-fn inputPipe(input: []const u8) !i32 {
-    var fds: [2]i32 = undefined;
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
-    if (input.len != 0) _ = linux.write(fds[1], input.ptr, input.len);
-    _ = linux.close(fds[1]);
-    return fds[0];
-}
 
 var trap_hits: usize = 0;
 
@@ -1657,86 +1412,6 @@ test "wait blocks on a named job and reports its status" {
     }
 }
 
-test "read splits on IFS, honours -r and prompts" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    {
-        const fd = try inputPipe("one two three\n");
-        const argv = [_][]const u8{ "read", "a", "b" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("one", sh.getVar("a").?.string);
-        try testing.expectEqualStrings("two three", sh.getVar("b").?.string);
-    }
-    {
-        // A single name still receives the trimmed line.
-        const fd = try inputPipe("  hello  \n");
-        const argv = [_][]const u8{ "read", "line" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("hello", sh.getVar("line").?.string);
-    }
-    {
-        // Three names, but only two fields: the extra name is emptied.
-        const fd = try inputPipe("x y\n");
-        const argv = [_][]const u8{ "read", "p", "q", "r" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("x", sh.getVar("p").?.string);
-        try testing.expectEqualStrings("y", sh.getVar("q").?.string);
-        try testing.expectEqualStrings("", sh.getVar("r").?.string);
-    }
-    {
-        // Without -r a backslash escapes; with -r it is literal.
-        const fd = try inputPipe("a\\b\n");
-        const argv = [_][]const u8{ "read", "cooked" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("ab", sh.getVar("cooked").?.string);
-    }
-    {
-        const fd = try inputPipe("a\\b\n");
-        const argv = [_][]const u8{ "read", "-r", "raw" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("a\\b", sh.getVar("raw").?.string);
-    }
-    {
-        // A trailing backslash continues onto the next line.
-        const fd = try inputPipe("one \\\ntwo\n");
-        const argv = [_][]const u8{ "read", "joined" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("one two", sh.getVar("joined").?.string);
-    }
-    {
-        // A non-whitespace IFS character delimits on its own, so `a::b`
-        // yields an empty middle field.
-        try sh.setVar("IFS", .{ .string = ":" });
-        const fd = try inputPipe("a::b\n");
-        const argv = [_][]const u8{ "read", "x", "y", "z" };
-        try testing.expectEqual(@as(u8, 0), builtinRead(Ctx{ .sh = &sh, .argv = &argv, .stdin = fd }));
-        _ = linux.close(fd);
-        try testing.expectEqualStrings("a", sh.getVar("x").?.string);
-        try testing.expectEqualStrings("", sh.getVar("y").?.string);
-        try testing.expectEqualStrings("b", sh.getVar("z").?.string);
-        _ = sh.unsetVar("IFS");
-    }
-    {
-        const cap = try Capture.open();
-        const fd = try inputPipe("value\n");
-        const argv = [_][]const u8{ "read", "-p", "prompt> ", "answer" };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv, .stdin = fd, .stderr = cap.write_fd };
-        try testing.expectEqual(@as(u8, 0), builtinRead(ctx));
-        _ = linux.close(fd);
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        try testing.expectEqualStrings("prompt> ", out);
-        try testing.expectEqualStrings("value", sh.getVar("answer").?.string);
-    }
-}
-
 test "test builtin" {
     var sh = try Shell.initBare(std.testing.allocator);
     defer sh.deinit();
@@ -1806,55 +1481,10 @@ test "test groups, negates and brackets" {
     try testing.expectEqual(@as(u8, 2), builtinTest(Ctx{ .sh = &sh, .argv = &unclosed, .stderr = -1 }));
 }
 
-test "type and command -v classify names" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-    try sh.setAlias("ll", "echo listed");
-    try sh.defineFunc("greet", "fn greet() {\n}\n");
-
-    {
-        const cap = try Capture.open();
-        const argv = [_][]const u8{ "type", "echo", "ll", "greet", "sh" };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd, .stderr = -1 };
-        try testing.expectEqual(@as(u8, 0), builtinType(ctx));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        try testing.expect(std.mem.indexOf(u8, out, "echo is a shell builtin\n") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "ll is aliased to `echo listed'\n") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "greet is a shell function\n") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "sh is /") != null);
-    }
-    {
-        const argv = [_][]const u8{ "type", "definitely-not-real-xyz" };
-        try testing.expectEqual(@as(u8, 1), builtinType(Ctx{ .sh = &sh, .argv = &argv, .stdout = -1, .stderr = -1 }));
-    }
-    {
-        const cap = try Capture.open();
-        const argv = [_][]const u8{ "command", "-v", "echo" };
-        try testing.expectEqual(@as(u8, 0), builtinCommand(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd, .stderr = -1 }));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        try testing.expectEqualStrings("echo\n", out);
-    }
-    {
-        // A missing name prints nothing and reports failure.
-        const argv = [_][]const u8{ "command", "-v", "definitely-not-real-xyz" };
-        try testing.expectEqual(@as(u8, 1), builtinCommand(Ctx{ .sh = &sh, .argv = &argv, .stdout = -1, .stderr = -1 }));
-    }
-}
-
-test "command and builtin run builtins, exec routes through PATH" {
+test "builtin runs a shell builtin directly" {
     var sh = try Shell.initBare(std.testing.allocator);
     defer sh.deinit();
 
-    {
-        const cap = try Capture.open();
-        const argv = [_][]const u8{ "command", "echo", "hi" };
-        try testing.expectEqual(@as(u8, 0), builtinCommand(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        try testing.expectEqualStrings("hi\n", out);
-    }
     {
         const cap = try Capture.open();
         const argv = [_][]const u8{ "builtin", "echo", "hi" };
@@ -1866,11 +1496,6 @@ test "command and builtin run builtins, exec routes through PATH" {
     {
         const argv = [_][]const u8{ "builtin", "definitely-not-real-xyz" };
         try testing.expectEqual(@as(u8, 1), builtinBuiltin(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-    }
-    {
-        // `command` on an external goes through PATH and its status is kept.
-        const argv = [_][]const u8{ "command", "sh", "-c", "exit 5" };
-        try testing.expectEqual(@as(u8, 5), builtinCommand(Ctx{ .sh = &sh, .argv = &argv }));
     }
 }
 

@@ -5,6 +5,7 @@ const std = @import("std");
 const ast = @import("../ast.zig");
 const expand_mod = @import("../expand.zig");
 const shellmod = @import("../shell.zig");
+const value_mod = @import("../value.zig");
 
 const Shell = shellmod.Shell;
 
@@ -16,6 +17,9 @@ const Saved = struct {
     /// none.
     value: ?[]const u8,
     assigned: []const u8,
+    /// A shell variable of the same name, shadowed for the command so
+    /// builtins such as `IFS=: read` see the assignment.
+    variable: ?value_mod.Value,
 };
 
 pub const State = struct {
@@ -23,7 +27,10 @@ pub const State = struct {
     saved: []const Saved,
 
     pub fn apply(self: State) !void {
-        for (self.saved) |entry| try self.sh.setEnv(entry.name, entry.assigned);
+        for (self.saved) |entry| {
+            try self.sh.setEnv(entry.name, entry.assigned);
+            if (entry.variable != null) try self.sh.setVar(entry.name, .{ .string = entry.assigned });
+        }
     }
 
     /// Puts the shadowed environment back. Call after the command has been
@@ -38,6 +45,7 @@ pub const State = struct {
             } else {
                 _ = self.sh.unsetEnv(entry.name);
             }
+            if (entry.variable) |previous| self.sh.setVar(entry.name, previous) catch {};
         }
     }
 };
@@ -57,14 +65,17 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
             } else {
                 _ = sh.unsetEnv(entry.name);
             }
+            if (entry.variable) |previous| sh.setVar(entry.name, previous) catch {};
         }
     }
     for (cmd.assigns) |assignment| {
         if (sh.isReadonly(assignment.name)) return error.ReadonlyVariable;
         const previous = if (sh.getEnv(assignment.name)) |old| try arena.dupe(u8, old) else null;
         const assigned = try expand_mod.expandLiteral(sh, arena, assignment.value);
-        try saved.append(arena, .{ .name = assignment.name, .value = previous, .assigned = assigned });
+        const variable = if (sh.getVar(assignment.name)) |v| try shellmod.cloneValue(arena, v) else null;
+        try saved.append(arena, .{ .name = assignment.name, .value = previous, .assigned = assigned, .variable = variable });
         try sh.setEnv(assignment.name, assigned);
+        if (variable != null) try sh.setVar(assignment.name, .{ .string = assigned });
     }
     return .{ .sh = sh, .saved = saved.items };
 }
