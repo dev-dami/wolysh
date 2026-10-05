@@ -201,8 +201,8 @@ pub const Compound = struct {
         while_: While,
         case_: Case,
         select_: For,
-        /// `return`, `break` or `continue` where a command is expected, as in
-        /// `[ -f x ] || return 1`.
+        /// `return`, `break`, `continue` or a function definition where a
+        /// command is expected, as in `[ -f x ] || return 1`.
         statement: Stmt,
     };
 };

@@ -297,9 +297,19 @@ pub const Parser = struct {
                 }
             }
         }
-        if (isKeyword(self.tok, "function")) return self.parseFunctionKeyword();
-        if (self.tok.tag == .word) {
-            if (try self.tryParsePosixFunction()) |stmt| return stmt;
+        const start = self.tok.start;
+        const definition = if (isKeyword(self.tok, "function"))
+            try self.parseFunctionKeyword()
+        else if (self.tok.tag == .word)
+            try self.tryParsePosixFunction()
+        else
+            null;
+        if (definition) |stmt| {
+            // `_complete() { ...; } && complete -F _complete cmd`
+            if (self.tok.tag != .ampamp and self.tok.tag != .pipepipe) return stmt;
+            const commands = try self.arena.alloc(ast.Command, 1);
+            commands[0] = .{ .words = &.{}, .redirects = &.{}, .compound = try self.newCompound(.{ .statement = stmt }, start) };
+            return .{ .pipeline = try self.parseLinks(.{ .commands = commands, .line = stmt.fn_decl.line }) };
         }
         return .{ .pipeline = try self.parseCommandChain() };
     }
@@ -873,7 +883,12 @@ pub const Parser = struct {
     // --- pipelines ----------------------------------------------------------
 
     fn parseChain(self: *Parser) Error!ast.Pipeline {
-        var first = try self.parsePipeline();
+        return self.parseLinks(try self.parsePipeline());
+    }
+
+    /// The `&&`/`||` continuation of `head`.
+    fn parseLinks(self: *Parser, head: ast.Pipeline) Error!ast.Pipeline {
+        var first = head;
         var links: std.ArrayList(ast.ChainLink) = .empty;
         while (self.tok.tag == .ampamp or self.tok.tag == .pipepipe) {
             const op: ast.ChainOp = if (self.tok.tag == .ampamp) .and_ else .or_;
@@ -1944,6 +1959,11 @@ test "POSIX function definitions" {
 
     var bad = Parser.init(arena_state.allocator(), "f() echo hi");
     try std.testing.expectError(error.SyntaxError, bad.parseProgram());
+
+    var listed = Parser.init(arena_state.allocator(), "_comp() { :; } && complete -F _comp cmd");
+    const chain = (try listed.parseProgram()).stmts[0].pipeline;
+    try std.testing.expect(compoundOf(.{ .pipeline = chain }).statement == .fn_decl);
+    try std.testing.expectEqual(@as(usize, 1), chain.links.len);
 }
 
 test "statements record their lines, from a chosen first line" {
