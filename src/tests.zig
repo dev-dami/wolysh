@@ -18,6 +18,8 @@ test {
     _ = @import("builtins.zig");
     _ = @import("exec.zig");
     _ = @import("main.zig");
+    _ = @import("login.zig");
+    _ = @import("stdin_script.zig");
     _ = @import("interactive/editor.zig");
     _ = @import("interactive/prompt.zig");
 }

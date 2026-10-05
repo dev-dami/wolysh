@@ -10,6 +10,8 @@ const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
 const prompt = @import("interactive/prompt.zig");
+const login = @import("login.zig");
+const stdin_script = @import("stdin_script.zig");
 
 const Shell = shellmod.Shell;
 
@@ -19,15 +21,25 @@ const help_text =
     \\wsh — wolysh, a modern Unix shell
     \\
     \\usage: wsh [options] [script [arguments...]]
+    \\       wsh [options] -c command [name [arguments...]]
+    \\       wsh [options] -s [arguments...]
     \\
     \\options:
-    \\  -c <command>   run a command string and exit
-    \\  -n, --check    check syntax without executing commands
-    \\  -i             force interactive mode
-    \\  -l, --login    mark this as a login shell
-    \\      --no-config  skip the configuration file
-    \\  -h, --help     show this help
-    \\  -v, --version  show the version
+    \\  -c               run the first argument as a command; the next one is $0
+    \\  -s               read commands from standard input; arguments are positional
+    \\  -i               force interactive mode
+    \\  -l, --login      run as a login shell
+    \\  -n, --check      check syntax without executing commands
+    \\  -e -u -x -f -C -a  set errexit, nounset, xtrace, noglob, noclobber, allexport
+    \\  -o NAME, +o NAME   set or clear a shell option (errexit, pipefail, ...)
+    \\      --norc, --no-config  skip the configuration file
+    \\      --rcfile FILE  read FILE instead of the configuration file
+    \\      --noprofile    skip login initialisation
+    \\  -h, --help       show this help
+    \\  -v, --version    show the version
+    \\
+    \\Short options combine (`-lc`, `-ec`), `+` clears a flag, and `--` or `-`
+    \\ends the options.
     \\
     \\language:
     \\  let name = "value"            bind a variable
@@ -72,19 +84,44 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer sh.deinit();
     exec.install(&sh);
 
-    sh.login = options.login;
+    const argv0: []const u8 = if (argv.len > 0) argv[0] else "wsh";
+    // `login` and `sshd` start a login shell with a `-` in front of its name.
+    sh.login = options.login or (argv0.len > 0 and argv0[0] == '-');
+    sh.options = options.shell;
+    sh.script_name = argv0;
+    sh.positional = parsed.rest;
+    bumpShellLevel(&sh) catch {
+        sys.writeStr(2, "wsh: cannot initialise the shell\n");
+        return 1;
+    };
+
+    // bash's rule: interactive when commands come from a terminal and errors
+    // go to one, or when `-i` asks for it. Standard output may be a pipe.
+    const reads_input = options.command == null and options.script == null;
+    sh.interactive = options.interactive or (reads_input and sys.isTty(0) and sys.isTty(2));
+
+    if (!options.check) {
+        if (sh.login) {
+            if (sh.interactive) proc.shellSignals();
+            login.initialise(&sh, options.no_profile);
+            if (sh.should_exit) return sh.exit_code;
+        }
+        if (options.rcfile) |path| {
+            if (!useRcFile(&sh, gpa, path)) return 1;
+        }
+    }
 
     if (options.command) |command| {
-        // `-c`: everything after the command string is positional.
-        sh.positional = parsed.rest;
-        sh.script_name = "wsh";
-        const status = if (options.check) exec.checkSource(&sh, command) else exec.runSource(&sh, command);
-        return status;
+        if (options.name) |name| sh.script_name = name;
+        if (options.check) return exec.checkSource(&sh, command);
+        if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
+        return exec.runSource(&sh, command);
     }
 
     if (options.script) |script| {
-        sh.positional = parsed.rest;
         sh.script_name = script;
+        // A script file is parsed as a whole: a syntax error anywhere means
+        // none of it runs.
         const data = readWholeFile(gpa, script) orelse {
             var buf: [512]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot read script\n", .{script}) catch return 1;
@@ -92,20 +129,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         };
         defer gpa.free(data);
-        return if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data);
+        if (options.check) return exec.checkSource(&sh, data);
+        if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
+        return exec.runSource(&sh, data);
     }
 
-    // No command and no script: interactive when stdin is a terminal,
-    // otherwise read a script from standard input.
-    const is_tty = sys.isTty(0) and sys.isTty(1);
-    sh.interactive = options.interactive or is_tty;
-
-    if (options.check or !sh.interactive) {
+    if (options.check) {
         const data = readAllStdin(gpa) orelse return 1;
         defer gpa.free(data);
-        sh.script_name = "wsh";
-        return if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data);
+        return exec.checkSource(&sh, data);
     }
+    if (!sh.interactive) return stdin_script.run(&sh);
 
     return runRepl(&sh, gpa, options.no_config);
 }
@@ -113,10 +147,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 const Options = struct {
     command: ?[]const u8 = null,
     script: ?[]const u8 = null,
+    /// `$0` given after a `-c` command.
+    name: ?[]const u8 = null,
+    command_mode: bool = false,
+    read_stdin: bool = false,
     interactive: bool = false,
     login: bool = false,
     no_config: bool = false,
+    no_profile: bool = false,
+    rcfile: ?[]const u8 = null,
     check: bool = false,
+    shell: shellmod.Options = .{},
 };
 
 const ParsedArgs = struct {
@@ -130,6 +171,9 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// Options are read up to the first operand, `--` or `-`, as bash does. With
+/// `-c` the first operand is the command and the next one `$0`; with `-s` all
+/// operands are positional; otherwise the first operand is a script file.
 fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
     var rest: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
@@ -137,57 +181,140 @@ fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
 
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (eql(arg, "--")) {
+        if (eql(arg, "--") or eql(arg, "-")) {
             i += 1;
             break;
         }
-        if (eql(arg, "-c")) {
-            i += 1;
-            if (i >= argv.len) return null;
-            options.command = argv[i];
-            i += 1;
-            break;
-        }
-        if (eql(arg, "-i")) {
-            options.interactive = true;
+        if (std.mem.startsWith(u8, arg, "--")) {
+            if (eql(arg, "--check")) {
+                options.check = true;
+            } else if (eql(arg, "--login")) {
+                options.login = true;
+            } else if (eql(arg, "--no-config") or eql(arg, "--norc")) {
+                options.no_config = true;
+            } else if (eql(arg, "--noprofile")) {
+                options.no_profile = true;
+            } else if (eql(arg, "--rcfile")) {
+                i += 1;
+                if (i >= argv.len) return missingArgument(arg);
+                options.rcfile = argv[i];
+            } else if (eql(arg, "--help")) {
+                result.show_help = true;
+                result.stop = true;
+                return result;
+            } else if (eql(arg, "--version")) {
+                result.show_version = true;
+                result.stop = true;
+                return result;
+            } else {
+                return unknownOption(arg);
+            }
             continue;
         }
-        if (eql(arg, "-n") or eql(arg, "--check")) {
-            options.check = true;
-            continue;
-        }
-        if (eql(arg, "-l") or eql(arg, "--login")) {
-            options.login = true;
-            continue;
-        }
-        if (eql(arg, "--no-config")) {
-            options.no_config = true;
-            continue;
-        }
-        if (eql(arg, "-h") or eql(arg, "--help")) {
+        // `-h` and `-v` only stand alone; `-v` is the version, not bash's verbose.
+        if (eql(arg, "-h")) {
             result.show_help = true;
             result.stop = true;
             return result;
         }
-        if (eql(arg, "-v") or eql(arg, "--version")) {
+        if (eql(arg, "-v")) {
             result.show_version = true;
             result.stop = true;
             return result;
         }
-        if (arg.len > 1 and arg[0] == '-') {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "wsh: unknown option: {s}\n", .{arg}) catch return null;
-            sys.writeStr(2, msg);
-            return null;
+        if (arg.len < 2 or (arg[0] != '-' and arg[0] != '+')) break;
+
+        const on = arg[0] == '-';
+        for (arg[1..]) |letter| {
+            if (letter == 'o') {
+                i += 1;
+                if (i >= argv.len) return missingArgument(if (on) "-o" else "+o");
+                if (!setNamedOption(&options.shell, argv[i], on)) {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "wsh: {s}: invalid option name\n", .{argv[i]}) catch return null;
+                    sys.writeStr(2, msg);
+                    return null;
+                }
+            } else if (!setFlag(options, letter, on)) {
+                return unknownOption(arg);
+            }
         }
-        options.script = arg;
-        i += 1;
-        break;
     }
 
-    while (i < argv.len) : (i += 1) rest.append(gpaOf(argv), argv[i]) catch return null;
+    const operands = argv[i..];
+    var params = operands;
+    if (options.command_mode) {
+        if (operands.len == 0) return missingArgument("-c");
+        options.command = operands[0];
+        params = operands[1..];
+        if (params.len > 0) {
+            options.name = params[0];
+            params = params[1..];
+        }
+    } else if (!options.read_stdin and operands.len > 0) {
+        options.script = operands[0];
+        params = operands[1..];
+    }
+
+    for (params) |param| rest.append(gpaOf(argv), param) catch return null;
     result.rest = rest.toOwnedSlice(gpaOf(argv)) catch return null;
     return result;
+}
+
+/// One letter of a short-option group; `on` is false for the `+` form.
+fn setFlag(options: *Options, letter: u8, on: bool) bool {
+    const shell = &options.shell;
+    switch (letter) {
+        'e' => shell.errexit = on,
+        'u' => shell.nounset = on,
+        'x' => shell.xtrace = on,
+        'f' => shell.noglob = on,
+        'C' => shell.noclobber = on,
+        'a' => shell.allexport = on,
+        else => {
+            // The invocation-only options have no `+` form.
+            if (!on) return false;
+            switch (letter) {
+                'c' => options.command_mode = true,
+                's' => options.read_stdin = true,
+                'i' => options.interactive = true,
+                'l' => options.login = true,
+                'n' => options.check = true,
+                else => return false,
+            }
+        },
+    }
+    return true;
+}
+
+/// `-o NAME` names; each matches a `shellmod.Options` field.
+const named_options = [_][]const u8{
+    "errexit",   "nounset",   "xtrace",     "pipefail",  "noglob",
+    "noclobber", "allexport", "histexpand", "ignoreeof", "vi",
+};
+
+fn setNamedOption(shell: *shellmod.Options, name: []const u8, on: bool) bool {
+    inline for (named_options) |field| {
+        if (eql(name, field)) {
+            @field(shell, field) = on;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn unknownOption(arg: []const u8) ?ParsedArgs {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "wsh: unknown option: {s}\n", .{arg}) catch return null;
+    sys.writeStr(2, msg);
+    return null;
+}
+
+fn missingArgument(option: []const u8) ?ParsedArgs {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "wsh: {s}: option requires an argument\n", .{option}) catch return null;
+    sys.writeStr(2, msg);
+    return null;
 }
 
 /// `parseArgs` needs an allocator only for the positional list; the process
@@ -196,6 +323,41 @@ fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
 fn gpaOf(argv: []const [:0]const u8) std.mem.Allocator {
     _ = argv;
     return std.heap.smp_allocator;
+}
+
+/// Increments and exports `SHLVL`; a missing or malformed value counts as 0.
+fn bumpShellLevel(sh: *Shell) !void {
+    const current = std.mem.trim(u8, sh.getEnv("SHLVL") orelse "", " \t");
+    var level = (std.fmt.parseInt(i64, current, 10) catch 0) +| 1;
+    if (level < 0) level = 0;
+    if (level >= 1000) {
+        var warn: [96]u8 = undefined;
+        sys.writeStr(2, std.fmt.bufPrint(&warn, "wsh: warning: shell level ({d}) too high, resetting to 1\n", .{level}) catch "");
+        level = 1;
+    }
+    var buf: [24]u8 = undefined;
+    try sh.setEnv("SHLVL", try std.fmt.bufPrint(&buf, "{d}", .{level}));
+}
+
+/// `--rcfile FILE` replaces the configuration file of an interactive shell.
+fn useRcFile(sh: *Shell, gpa: std.mem.Allocator, path: []const u8) bool {
+    if (!sh.interactive) return true;
+    const z = gpa.dupeZ(u8, path) catch return false;
+    defer gpa.free(z);
+    if (!sys.canAccess(z, 4)) {
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot read the configuration file\n", .{path}) catch "wsh: cannot read the configuration file\n";
+        sys.writeStr(2, msg);
+    }
+    sh.config_path = gpa.dupe(u8, path) catch return false;
+    return true;
+}
+
+/// `-i` with a command or a script: read the configuration as an interactive
+/// shell would, then run.
+fn loadInteractiveConfig(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) void {
+    setupPaths(sh, gpa) catch {};
+    if (!no_config) loadConfig(sh);
 }
 
 fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
@@ -291,7 +453,8 @@ fn setupPaths(sh: *Shell, gpa: std.mem.Allocator) !void {
 
     const config_dir = sh.getEnv("XDG_CONFIG_HOME") orelse
         try std.fmt.allocPrint(gpa, "{s}/.config", .{home});
-    sh.config_path = try std.fmt.allocPrint(gpa, "{s}/wsh/config", .{config_dir});
+    // `--rcfile` has already chosen the file.
+    if (sh.config_path.len == 0) sh.config_path = try std.fmt.allocPrint(gpa, "{s}/wsh/config", .{config_dir});
 
     const data_dir = sh.getEnv("XDG_DATA_HOME") orelse
         try std.fmt.allocPrint(gpa, "{s}/.local/share", .{home});
@@ -332,4 +495,31 @@ test "argument parsing" {
     const parsed2 = parseArgs(&argv2, &options2).?;
     try std.testing.expectEqualStrings("script.wsh", options2.script.?);
     try std.testing.expectEqual(@as(usize, 2), parsed2.rest.len);
+}
+
+test "bundled options, -c operands and named options" {
+    const argv = [_][:0]const u8{ "wsh", "-lec", "+e", "-o", "pipefail", "echo", "name", "one" };
+    var options = Options{};
+    const parsed = parseArgs(&argv, &options).?;
+    try std.testing.expect(options.login);
+    try std.testing.expect(!options.shell.errexit);
+    try std.testing.expect(options.shell.pipefail);
+    try std.testing.expectEqualStrings("echo", options.command.?);
+    try std.testing.expectEqualStrings("name", options.name.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.rest.len);
+    try std.testing.expectEqualStrings("one", parsed.rest[0]);
+
+    const stdin_argv = [_][:0]const u8{ "wsh", "-s", "--noprofile", "--rcfile", "rc", "a", "b" };
+    var stdin_options = Options{};
+    const stdin_parsed = parseArgs(&stdin_argv, &stdin_options).?;
+    try std.testing.expect(stdin_options.read_stdin and stdin_options.no_profile);
+    try std.testing.expectEqualStrings("rc", stdin_options.rcfile.?);
+    try std.testing.expect(stdin_options.script == null);
+    try std.testing.expectEqual(@as(usize, 2), stdin_parsed.rest.len);
+
+    const dash_argv = [_][:0]const u8{ "wsh", "-x", "-", "-script" };
+    var dash_options = Options{};
+    _ = parseArgs(&dash_argv, &dash_options).?;
+    try std.testing.expect(dash_options.shell.xtrace);
+    try std.testing.expectEqualStrings("-script", dash_options.script.?);
 }
