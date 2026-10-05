@@ -653,7 +653,9 @@ pub const Parser = struct {
             const t = lx.next();
             if (t.tag == .eof or t.start >= to) break;
             switch (t.tag) {
-                .bang, .ampamp, .pipepipe => {},
+                .ampamp, .pipepipe => {},
+                // `!name` is one word to a command, so only `! name` negates.
+                .bang => if (t.start + 1 < to and !std.ascii.isWhitespace(self.lex.src[t.start + 1])) return false,
                 .ident => {
                     if (self.lex.src[t.start] == '$' or oneOf(t.text, &expression_words)) return false;
                     names += 1;
@@ -1909,6 +1911,7 @@ test "native conditions are expressions first, then commands" {
         \\if grep -q x file { echo found }
         \\if ! ready { echo waiting }
         \\while $? == 0 && $# > 1 { break }
+        \\if !ready { echo waiting }
     );
     const prog = try p.parseProgram();
 
@@ -1926,6 +1929,10 @@ test "native conditions are expressions first, then commands" {
 
     const special = compoundOf(prog.stmts[3]).while_.cond;
     try std.testing.expect(special.expr != null and special.list == null);
+
+    // `!ready` would be a single command word, so it stays an expression.
+    const glued = compoundOf(prog.stmts[4]).if_.cond;
+    try std.testing.expect(glued.expr != null and glued.list == null);
 }
 
 test "POSIX function definitions" {
