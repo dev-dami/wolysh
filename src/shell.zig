@@ -49,6 +49,8 @@ pub const Options = struct {
     nocasematch: bool = false, // shopt -s nocasematch
     globstar: bool = true, // shopt -s globstar
     extglob: bool = true, // shopt -s extglob
+    histexpand: bool = true, // set -H
+    ignoreeof: bool = false, // set -o ignoreeof
 };
 
 /// Bit `N` is set when signal `N + 1` arrives. Written only from a signal
@@ -136,6 +138,13 @@ pub const Shell = struct {
     options: Options = .{},
     /// Source line of the statement being executed, for `$LINENO`.
     current_line: u32 = 0,
+    /// Non-zero while running a condition: an `if`/`while`/`until` test, a
+    /// non-final part of an `&&`/`||` list, or a `!` pipeline. `set -e` and the
+    /// ERR trap do not fire there.
+    condition_depth: u32 = 0,
+    /// Set when Ctrl-C interrupts the running command line. Statement lists and
+    /// loops stop while it is set; the REPL clears it before the next prompt.
+    interrupted: bool = false,
     hostname: []const u8 = "",
     history_path: []const u8 = "",
     config_path: []const u8 = "",

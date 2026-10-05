@@ -37,6 +37,8 @@ pub const Job = struct {
     notified: bool = false,
     /// True while this job owns the terminal.
     owns_terminal: bool = false,
+    /// Set by `disown -h`: the shell does not forward SIGHUP to this job.
+    no_hup: bool = false,
 };
 
 pub const Table = struct {
