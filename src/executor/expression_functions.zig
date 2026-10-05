@@ -54,7 +54,8 @@ pub fn evaluate(
     }
     if (std.mem.eql(u8, callee, "abs")) {
         const number = (try eval(eval_context, sh, arena, argAt(args, 0))).asInt() orelse 0;
-        return Value{ .int = if (number < 0) -number else number };
+        // Wraps like bash: the minimum integer has no positive counterpart.
+        return Value{ .int = if (number < 0) 0 -% number else number };
     }
     if (std.mem.eql(u8, callee, "min") or std.mem.eql(u8, callee, "max")) {
         const want_min = std.mem.eql(u8, callee, "min");
