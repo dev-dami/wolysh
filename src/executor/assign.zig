@@ -71,13 +71,16 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
     return .{ .sh = sh, .saved = saved.items };
 }
 
-/// `NAME=value` with no command word: the assignment outlives the line.
+/// `NAME=value` with no command word: the assignment outlives the line. It
+/// sets the shell variable, and reaches the environment only when NAME is
+/// already exported or `set -a` is on.
 pub fn persist(sh: *Shell, arena: std.mem.Allocator, assigns: []const ast.PrefixAssign) Error!void {
     for (assigns) |assignment| {
         const text = try expand_mod.expandLiteral(sh, arena, assignment.value);
         strict.traceAssignment(sh, assignment.name, text);
+        const exported = sh.options.allexport or sh.getEnv(assignment.name) != null;
         try sh.assignVar(assignment.name, .{ .string = text });
-        try sh.assignEnv(assignment.name, text);
+        if (exported) try sh.assignEnv(assignment.name, text);
     }
 }
 
@@ -115,4 +118,14 @@ test "persistent assignments become a shell variable" {
 
     try persist(&sh, arena, &.{.{ .name = "ONLY", .value = "yes" }});
     try std.testing.expectEqualStrings("yes", sh.getVar("ONLY").?.string);
+    try std.testing.expect(sh.getEnv("ONLY") == null);
+
+    // An exported name keeps its environment entry in step.
+    try sh.setEnv("SHARED", "old");
+    try persist(&sh, arena, &.{.{ .name = "SHARED", .value = "new" }});
+    try std.testing.expectEqualStrings("new", sh.getEnv("SHARED").?);
+
+    sh.options.allexport = true;
+    try persist(&sh, arena, &.{.{ .name = "AUTO", .value = "1" }});
+    try std.testing.expectEqualStrings("1", sh.getEnv("AUTO").?);
 }

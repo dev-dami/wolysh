@@ -10,6 +10,7 @@ const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
 const subshell = @import("subshell.zig");
 const assign = @import("assign.zig");
+const session = @import("../interactive/session.zig");
 const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
@@ -55,6 +56,9 @@ fn childExecute(ctx_ptr: *anyopaque) noreturn {
 pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
     var status = runLink(sh, chain, chain.links.len != 0, runtime);
     for (chain.links, 0..) |link, index| {
+        if (sh.interrupted) break;
+        // `cd dir && make`: chpwd runs before `make`, as it would in zsh.
+        session.checkDirectory(sh);
         const should_run = switch (link.op) {
             .and_ => status == 0,
             .or_ => status != 0,
@@ -82,13 +86,22 @@ fn invert(status: u8) u8 {
     return if (status == 0) 1 else 0;
 }
 
+/// What `runStages` learned besides the status.
+const Outcome = struct {
+    /// Each stage's status for a multi-command pipeline.
+    statuses: []const u8 = &.{},
+    /// The command ran as a `{ ...; }` group in this shell (an alias with
+    /// operators does too).
+    grouped: bool = false,
+};
+
 fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runtime: Runtime) u8 {
-    var statuses: []const u8 = &.{};
-    const status = runStages(sh, commands, background, runtime, &statuses);
-    // A `{ ...; }` group's own status is not a command failure: the commands
-    // inside it were checked as they ran.
-    if (background or (commands.len == 1 and commands[0].group != null)) return status;
-    strict.setPipeStatus(sh, if (statuses.len != 0) statuses else &.{status});
+    var outcome: Outcome = .{};
+    const status = runStages(sh, commands, background, runtime, &outcome);
+    // A group's own status is not a command failure: the commands inside it
+    // were checked as they ran.
+    if (background or outcome.grouped) return status;
+    strict.setPipeStatus(sh, if (outcome.statuses.len != 0) outcome.statuses else &.{status});
     strict.commandDone(sh, status);
     return status;
 }
@@ -98,7 +111,7 @@ fn runStages(
     commands: []const ast.Command,
     background: bool,
     runtime: Runtime,
-    statuses_out: *[]const u8,
+    outcome: *Outcome,
 ) u8 {
     const arena = sh.scratch();
     if (commands.len == 0) return 0;
@@ -106,11 +119,25 @@ fn runStages(
     var opened: std.ArrayList(i32) = .empty;
     defer for (opened.items) |fd| sys.closeFd(fd);
 
-    if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime);
+    if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime, outcome);
 
+    // Alias names stay suppressed until every stage has forked, so a body that
+    // mentions its own alias does not expand it again in the child.
+    var alias_names: std.ArrayList([]const u8) = .empty;
     var stages: std.ArrayList(proc.Stage) = .empty;
-    for (commands) |cmd| {
+    for (commands) |original| {
+        var cmd = original;
+        var resolved: command.Resolved = .{ .words = cmd.words };
+        if (cmd.subshell == null and cmd.group == null) {
+            resolved = command.resolveAliases(sh, arena, cmd.words) catch return 1;
+            if (resolved.body != null) {
+                cmd.group = (command.aliasStatements(sh, arena, resolved) catch |err| return runtime.expression_error(sh, err)) orelse return 2;
+                cmd.words = &.{};
+                alias_names.appendSlice(arena, resolved.names) catch return 1;
+            }
+        }
         if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
+
         const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
         defer scope.restore();
 
@@ -126,9 +153,8 @@ fn runStages(
             expression.reportMisuse(sh, name);
             return 2;
         }
-        const words = command.resolveAliases(sh, arena, cmd.words) catch return 1;
         var argv: std.ArrayList([]const u8) = .empty;
-        expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
+        expand_mod.expandCommand(sh, arena, resolved.words, &argv) catch |err| return runtime.expression_error(sh, err);
         if (argv.items.len == 0) continue;
 
         const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
@@ -142,10 +168,12 @@ fn runStages(
 
     if (stages.items.len == 0) return 0;
 
+    const mark = command.suppressAliases(alias_names.items) catch return aliasTooDeep(sh);
+    defer command.restoreAliases(mark);
     const text = pipelineText(arena, commands) catch "pipeline";
     if (background) return startBackground(sh, arena, stages.items, text, runtime.expression_error);
     const statuses = arena.alloc(u8, stages.items.len) catch return runtime.expression_error(sh, error.OutOfMemory);
-    statuses_out.* = statuses;
+    outcome.statuses = statuses;
     return waitStages(sh, arena, stages.items, text, runtime.expression_error, statuses);
 }
 
@@ -177,30 +205,43 @@ fn runSingle(
     background: bool,
     opened: *std.ArrayList(i32),
     runtime: Runtime,
+    outcome: *Outcome,
 ) u8 {
-    if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
     if (expression.misuse(cmd.words)) |name| {
         expression.reportMisuse(sh, name);
         return 2;
     }
 
-    const words = command.resolveAliases(sh, arena, cmd.words) catch return 1;
+    const resolved = command.resolveAliases(sh, arena, cmd.words) catch return 1;
+    if (resolved.body != null) {
+        // An alias with operators runs like `{ body args; }` in this command's
+        // place, so its redirections and assignments cover the whole body.
+        var grouped = cmd;
+        grouped.group = (command.aliasStatements(sh, arena, resolved) catch |err| return runtime.expression_error(sh, err)) orelse return 2;
+        grouped.words = &.{};
+        const mark = command.suppressAliases(resolved.names) catch return aliasTooDeep(sh);
+        defer command.restoreAliases(mark);
+        return runSingle(sh, arena, grouped, background, opened, runtime, outcome);
+    }
+    if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
+
+    const substitutions = sh.substitutions;
     var argv: std.ArrayList([]const u8) = .empty;
-    sh.subst_status = null;
-    expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
+    expand_mod.expandCommand(sh, arena, resolved.words, &argv) catch |err| return runtime.expression_error(sh, err);
 
     const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
     if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null) {
-        // `NAME=value` on its own outlives the command line. Like bash, a
-        // command with no words has the status of its last substitution.
+        // `NAME=value` on its own outlives the command line.
         assign.persist(sh, arena, cmd.assigns) catch |err| return runtime.expression_error(sh, err);
-        return sh.subst_status orelse 0;
+        // POSIX: the status of the last command substitution performed, else 0.
+        return if (sh.substitutions != substitutions) sh.last_status else 0;
     }
 
     const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
     defer scope.restore();
 
     if (cmd.group != null and !background) {
+        outcome.grouped = true;
         const statements = cmd.group.?;
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
         sh.default_in = prepared.fds.in;
@@ -254,7 +295,9 @@ pub fn launchStage(
     argv: []const []const u8,
     redirects: []const proc.Redirection,
 ) Error!proc.Stage {
-    const resolved = try proc.resolve(arena, argv[0], sh.pathEnv()) orelse {
+    // Paths and non-executable matches still go to `execve`, whose error the
+    // child reports by name ("Permission denied", "Is a directory", ...).
+    const resolved = try proc.locate(arena, argv[0], sh.pathEnv()) orelse {
         const payload = try arena.create(MissingCommandPayload);
         payload.* = .{ .message = try command.commandNotFoundMessage(sh, arena, argv[0]) };
         return .{
@@ -284,6 +327,11 @@ pub fn launchStage(
         .stdio = .{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err },
         .redirects = redirects,
     };
+}
+
+fn aliasTooDeep(sh: *Shell) u8 {
+    sys.writeStr(sh.default_err, "wsh: alias expansion nested too deeply\n");
+    return 1;
 }
 
 fn startBackground(

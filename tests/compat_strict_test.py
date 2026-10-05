@@ -108,6 +108,9 @@ class SetBuiltinTests(BashComparison):
     def test_listing_quotes_values(self):
         self.assert_like_bash("x='a b'; y=\"it's\"; w=plain; e=; set | grep -E '^(x|y|w|e)='")
 
+    def test_allexport_exports_assignments(self):
+        self.assert_like_bash("set -a; x=1; sh -c 'echo [$x]'; set +a; y=2; sh -c 'echo [$y]'")
+
     def test_dollar_dash_reports_flags(self):
         result = run_shell("set -eux; echo $-; set +ex -fC; echo $-")
         self.assertEqual(result.stdout, b"eux\nfuC\n")
@@ -531,6 +534,22 @@ class InteractiveExitTests(unittest.TestCase):
         self.assertFalse(session.exited(timeout=0.5))
         session.send(b"\x04")
         self.assertTrue(session.exited(), session.buf[-300:])
+
+    def test_hangup_runs_the_exit_trap(self):
+        session = Session()
+        self.addCleanup(session.close)
+        self.assertTrue(session.read_until(PROMPT), session.buf[-200:])
+        with tempfile.TemporaryDirectory(prefix="wsh-strict-") as temp_dir:
+            marker = pathlib.Path(temp_dir) / "marker"
+            # The typed line never contains `armed-42`, so seeing it means the
+            # trap is set.
+            session.send(f"trap 'echo bye > {marker}' EXIT; echo armed-$((40 + 2))\r")
+            self.assertTrue(session.read_until(b"armed-42"), session.buf[-300:])
+            os.kill(session.pid, signal.SIGHUP)
+            self.assertTrue(session.exited(), session.buf[-300:])
+            self.assertTrue(os.WIFEXITED(session.status))
+            self.assertEqual(os.WEXITSTATUS(session.status), 129)
+            self.assertEqual(marker.read_text(), "bye\n")
 
     def test_interactive_exit_runs_the_exit_trap(self):
         session = Session()

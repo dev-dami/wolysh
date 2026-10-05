@@ -61,9 +61,7 @@ pub fn run(
     }
     _ = linux.close(fds[0]);
 
-    if (proc.waitPid(launched.pids[0], 0)) |st| {
-        sh.last_status = st.exitCode();
-        sh.subst_status = st.exitCode();
-    }
+    if (proc.waitPid(launched.pids[0], 0)) |st| sh.last_status = st.exitCode();
+    sh.substitutions +%= 1;
     return try out.toOwnedSlice(arena);
 }

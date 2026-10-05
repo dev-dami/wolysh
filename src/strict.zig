@@ -127,6 +127,8 @@ pub fn runExitTrap(sh: *Shell) void {
     const runner = sh.trap_runner orelse return;
     exit_trap_status = sh.last_status;
     defer exit_trap_status = null;
+    // A hangup or Ctrl-C that ends the shell must not also stop its trap.
+    sh.interrupted = false;
     sh.should_exit = false;
     sh.return_pending = false;
     sh.break_pending = false;

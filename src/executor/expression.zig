@@ -59,17 +59,19 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
             const operand = try evaluateInner(context, sh, arena, unary.operand);
             return switch (unary.op) {
                 .not => Value{ .boolean = !operand.truthy() },
-                .neg => switch (operand) {
-                    .int => |integer| Value{ .int = -integer },
-                    .float => |float| Value{ .float = -float },
-                    else => Value{ .int = -(operand.asInt() orelse 0) },
+                .neg => operations.negate(operand) catch |err| switch (err) {
+                    error.NotANumber => reportNotANumber(sh, arena, operand),
+                    else => |other| other,
                 },
             };
         },
         .bin => |binary| {
             const lhs = try evaluateInner(context, sh, arena, binary.lhs);
             const rhs = try evaluateInner(context, sh, arena, binary.rhs);
-            return try operations.binary(arena, binary.op, lhs, rhs);
+            return operations.binary(arena, binary.op, lhs, rhs) catch |err| switch (err) {
+                error.NotANumber => reportNotANumber(sh, arena, operations.nonNumber(lhs, rhs)),
+                else => |other| other,
+            };
         },
         .call => |call| {
             if (try expression_functions.evaluate(sh, arena, call.callee, call.args, context, &evaluateCallback)) |result| {
@@ -78,6 +80,14 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
             return context.execute_call(sh, arena, call.callee, call.args);
         },
     }
+}
+
+fn reportNotANumber(sh: *Shell, arena: std.mem.Allocator, operand: Value) Error {
+    const text = operand.renderAlloc(arena) catch |err| return err;
+    sys.writeStr(sh.default_err, "wsh: not a number: '");
+    sys.writeStr(sh.default_err, text);
+    sys.writeStr(sh.default_err, "'\n");
+    return error.ExecutionFailed;
 }
 
 fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value {

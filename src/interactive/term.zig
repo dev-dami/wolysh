@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const posix = std.posix;
-const sys = @import("../sys.zig");
+const proc = @import("../proc.zig");
 
 pub const RawMode = struct {
     fd: i32,
@@ -40,12 +40,19 @@ pub const RawMode = struct {
     }
 };
 
-/// Reads one byte, blocking until it arrives.
+/// Reads one byte, blocking until it arrives. A SIGHUP ends the wait like end
+/// of input, so the shell can hang up instead of waiting for a key.
 pub fn readByte(fd: i32) ?u8 {
     var b: [1]u8 = undefined;
-    const n = sys.readSome(fd, &b) orelse return null;
-    if (n == 0) return null;
-    return b[0];
+    while (!proc.hangupPending()) {
+        const rc = std.os.linux.read(fd, &b, 1);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => return if (rc == 0) null else b[0],
+            .INTR => continue,
+            else => return null,
+        }
+    }
+    return null;
 }
 
 /// Reads a byte with a short timeout (100 ms), used to tell a bare ESC from an

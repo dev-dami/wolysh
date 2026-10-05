@@ -50,6 +50,10 @@ pub fn displayWidth(text: []const u8) usize {
                 i += 1;
                 while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) i += 1;
                 if (i < text.len) i += 1;
+            } else if (i < text.len and text[i] == ']') {
+                // OSC (title, OSC 133 marks): runs to BEL or ESC \.
+                while (i < text.len and text[i] != 0x07 and text[i] != 0x1b) i += 1;
+                if (i < text.len) i += if (text[i] == 0x1b) @min(2, text.len - i) else 1;
             }
             continue;
         }
@@ -118,12 +122,11 @@ pub const Editor = struct {
         while (true) {
             const key = self.readKey();
             switch (key) {
+                // Ctrl-D is a byte; this is the terminal gone or a SIGHUP, so
+                // no more keys will come even with text on the line.
                 .eof => {
-                    if (self.buf.items.len == 0) {
-                        sys.writeStr(self.out_fd, "\r\n");
-                        return null;
-                    }
-                    self.deleteAtCursor();
+                    sys.writeStr(self.out_fd, "\r\n");
+                    return null;
                 },
                 .byte => |b| switch (self.handleByte(b)) {
                     .handled => {},
@@ -177,12 +180,11 @@ pub const Editor = struct {
         while (true) {
             const key = self.readKey();
             switch (key) {
+                // Ctrl-D is a byte; this is the terminal gone or a SIGHUP, so
+                // no more keys will come even with text on the line.
                 .eof => {
-                    if (self.buf.items.len == 0) {
-                        sys.writeStr(self.out_fd, "\r\n");
-                        return null;
-                    }
-                    self.deleteAtCursor();
+                    sys.writeStr(self.out_fd, "\r\n");
+                    return null;
                 },
                 .byte => |byte| {
                     if (byte == '\r' or byte == '\n') {

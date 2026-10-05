@@ -63,6 +63,20 @@ fn byLetter(letter: u8) ?usize {
     return null;
 }
 
+/// `-o NAME`/`+o NAME`, shared with the command line. False for an unknown
+/// name.
+pub fn setByName(opts: *Options, name: []const u8, on: bool) bool {
+    put(opts, byName(name) orelse return false, on);
+    return true;
+}
+
+/// `-e`/`+e` and the other option letters, shared with the command line.
+/// False for a letter that is not a shell option.
+pub fn setByLetter(opts: *Options, letter: u8, on: bool) bool {
+    put(opts, byLetter(letter) orelse return false, on);
+    return true;
+}
+
 pub fn run(ctx: Ctx) u8 {
     const args = ctx.argv[1..];
     if (args.len == 0) return listVariables(ctx);

@@ -68,13 +68,13 @@ pub const Value = union(enum) {
         return allocating.toOwnedSlice();
     }
 
-    /// Numeric view of the value, if it has one.
-    pub fn asFloat(self: Value) ?f64 {
+    /// The number this value stands for in arithmetic and comparisons: ints
+    /// and floats as they are, strings only when they are canonical decimal
+    /// numerals (see `isCanonicalNumber`). The result is `.int` or `.float`.
+    pub fn asNumber(self: Value) ?Value {
         return switch (self) {
-            .int => |i| @floatFromInt(i),
-            .float => |f| f,
-            .boolean => |b| if (b) 1 else 0,
-            .string => |s| std.fmt.parseFloat(f64, s) catch null,
+            .int, .float => self,
+            .string => |s| numberFromText(s),
             else => null,
         };
     }
@@ -82,7 +82,7 @@ pub const Value = union(enum) {
     pub fn asInt(self: Value) ?i64 {
         return switch (self) {
             .int => |i| i,
-            .float => |f| @intFromFloat(f),
+            .float => |f| floatToInt(f),
             .boolean => |b| if (b) 1 else 0,
             .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t"), 10) catch null,
             else => null,
@@ -90,12 +90,84 @@ pub const Value = union(enum) {
     }
 };
 
+/// `-?(0|[1-9][0-9]*)(\.[0-9]+)?`: the only spelling of a number a string can
+/// have. `007`, `1e3`, `inf` and ` 5` stay strings.
+pub fn isCanonicalNumber(text: []const u8) bool {
+    return canonicalLength(text) == text.len and text.len != 0;
+}
+
+/// A canonical numeral without a fractional part.
+pub fn isCanonicalInteger(text: []const u8) bool {
+    return isCanonicalNumber(text) and std.mem.indexOfScalar(u8, text, '.') == null;
+}
+
+fn canonicalLength(text: []const u8) usize {
+    var i: usize = 0;
+    if (i < text.len and text[i] == '-') i += 1;
+    if (i >= text.len or !std.ascii.isDigit(text[i])) return 0;
+    if (text[i] == '0') {
+        i += 1;
+    } else {
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+    }
+    if (i < text.len and text[i] == '.') {
+        const fraction = i + 1;
+        i = fraction;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+        if (i == fraction) return 0;
+    }
+    return i;
+}
+
+fn numberFromText(text: []const u8) ?Value {
+    if (!isCanonicalNumber(text)) return null;
+    if (std.mem.indexOfScalar(u8, text, '.') == null) {
+        if (std.fmt.parseInt(i64, text, 10)) |n| return Value{ .int = n } else |_| {}
+    }
+    const f = std.fmt.parseFloat(f64, text) catch return null;
+    return Value{ .float = f };
+}
+
+/// Truncates toward zero; null when `f` has no `i64` counterpart (NaN or out
+/// of range), where a plain `@intFromFloat` would be illegal behaviour.
+fn floatToInt(f: f64) ?i64 {
+    if (std.math.isNan(f)) return null;
+    const limit: f64 = 9223372036854775808.0; // 2^63
+    if (f >= limit or f < -limit) return null;
+    return @intFromFloat(f);
+}
+
 test "truthiness" {
     try std.testing.expect(!(@as(Value, .none)).truthy());
     try std.testing.expect((Value{ .int = 1 }).truthy());
     try std.testing.expect(!(Value{ .int = 0 }).truthy());
     try std.testing.expect((Value{ .string = "x" }).truthy());
     try std.testing.expect(!(Value{ .string = "" }).truthy());
+}
+
+test "only canonical decimal numerals are numbers" {
+    for ([_][]const u8{ "0", "-0", "7", "-12", "1.5", "1.10", "-0.25", "9223372036854775807" }) |text| {
+        try std.testing.expect(isCanonicalNumber(text));
+    }
+    for ([_][]const u8{ "", "-", "007", "+1", ".5", "5.", "1e3", "inf", "nan", " 5", "5 ", "1_000", "0x10", "--1" }) |text| {
+        try std.testing.expect(!isCanonicalNumber(text));
+    }
+    try std.testing.expect(isCanonicalInteger("-42"));
+    try std.testing.expect(!isCanonicalInteger("4.2"));
+
+    try std.testing.expectEqual(@as(i64, 42), (Value{ .string = "42" }).asNumber().?.int);
+    try std.testing.expectEqual(@as(f64, 1.5), (Value{ .string = "1.5" }).asNumber().?.float);
+    // Past the `i64` range a canonical integer is still a number.
+    try std.testing.expect((Value{ .string = "99999999999999999999" }).asNumber().? == .float);
+    try std.testing.expect((Value{ .string = "abc" }).asNumber() == null);
+    try std.testing.expect((Value{ .boolean = true }).asNumber() == null);
+    try std.testing.expect((@as(Value, .none)).asNumber() == null);
+}
+
+test "asInt refuses floats without an integer counterpart" {
+    try std.testing.expectEqual(@as(?i64, 3), (Value{ .float = 3.9 }).asInt());
+    try std.testing.expectEqual(@as(?i64, null), (Value{ .float = 1e300 }).asInt());
+    try std.testing.expectEqual(@as(?i64, null), (Value{ .float = std.math.nan(f64) }).asInt());
 }
 
 test "render" {
