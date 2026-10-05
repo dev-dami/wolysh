@@ -217,7 +217,12 @@ pub const Shell = struct {
             }
         }
         try sh.setEnv("PWD", sh.cwd);
-        if (sh.env.get("SHELL") == null) try sh.setEnv("SHELL", "/usr/local/bin/wsh");
+        if (sh.env.get("SHELL") == null) {
+            if (try fs.readLink(gpa, "/proc/self/exe")) |exe| {
+                defer gpa.free(exe);
+                try sh.setEnv("SHELL", exe);
+            }
+        }
 
         var host_buf: [linux.HOST_NAME_MAX]u8 = undefined;
         if (std.posix.gethostname(&host_buf) catch null) |name| {

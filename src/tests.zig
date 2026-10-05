@@ -22,6 +22,8 @@ test {
     _ = @import("executor/command.zig");
     _ = @import("executor/operations.zig");
     _ = @import("main.zig");
+    _ = @import("login.zig");
+    _ = @import("stdin_script.zig");
     _ = @import("interactive/editor.zig");
     _ = @import("interactive/prompt.zig");
     _ = @import("interactive/localtime.zig");
