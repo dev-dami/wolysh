@@ -59,9 +59,10 @@ pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
     if (eql(u8, name, "PPID")) return .{ .int = parent_pid orelse linux.getppid() };
     if (eql(u8, name, "UID")) return .{ .int = linux.getuid() };
     if (eql(u8, name, "EUID")) return .{ .int = linux.geteuid() };
-    if (eql(u8, name, "HOSTNAME")) return .{ .string = sh.hostname };
-    if (eql(u8, name, "HOSTTYPE")) return .{ .string = @tagName(builtin.cpu.arch) };
-    if (eql(u8, name, "OSTYPE")) return .{ .string = "linux-gnu" };
+    // bash sets these three only when the environment has not.
+    if (eql(u8, name, "HOSTNAME")) return if (sh.env.contains(name)) null else .{ .string = sh.hostname };
+    if (eql(u8, name, "HOSTTYPE")) return if (sh.env.contains(name)) null else .{ .string = @tagName(builtin.cpu.arch) };
+    if (eql(u8, name, "OSTYPE")) return if (sh.env.contains(name)) null else .{ .string = "linux-gnu" };
     if (eql(u8, name, "WSH_VERSION")) return .{ .string = build_options.version };
     return null;
 }

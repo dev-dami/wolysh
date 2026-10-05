@@ -99,6 +99,7 @@ fn run(ctx: Ctx, is_local: bool) u8 {
     }
     const names = ctx.argv[i..];
     if (opts.functions or opts.function_names) return printFunctions(ctx, names, opts.function_names);
+    if (is_local and names.len == 0) return printLocals(ctx);
     if (opts.print or names.len == 0) return printVariables(ctx, names, opts);
 
     var status: u8 = 0;
@@ -229,6 +230,18 @@ fn current(sh: *Shell, name: []const u8) ?Value {
     if (sh.vars.get(name)) |v| return if (v == .none) null else v;
     if (sh.getEnv(name)) |text| return Value{ .string = text };
     return null;
+}
+
+/// `local` alone lists the innermost function's locals.
+fn printLocals(ctx: Ctx) u8 {
+    const sh = ctx.sh;
+    const scope = sh.scopes.items[sh.scopes.items.len - 1];
+    for (scope.saved.items) |saved| {
+        const line = (arrays.describe(sh, sh.scratch(), saved.name) catch return 1) orelse continue;
+        ctx.out(line);
+        ctx.out("\n");
+    }
+    return 0;
 }
 
 /// True when `name` is already local to the innermost function scope.
@@ -392,12 +405,18 @@ test "declare inside a function is local" {
     defer sh.deinit();
 
     try sh.setVar("x", .{ .string = "outer" });
+    try sh.setAttrs("n", .{ .integer = true });
+    try sh.setVar("n", .{ .string = "1+1" });
     try sh.beginScope();
     _ = run(.{ .sh = &sh, .argv = &.{ "declare", "x=inner" }, .stderr = -1 }, false);
     _ = run(.{ .sh = &sh, .argv = &.{ "local", "-a", "fresh" }, .stderr = -1 }, true);
+    _ = run(.{ .sh = &sh, .argv = &.{ "local", "n=2*3" }, .stderr = -1 }, true);
     try testing.expectEqualStrings("inner", sh.getVar("x").?.string);
     try testing.expect(sh.getVar("fresh").? == .list);
+    try testing.expectEqualStrings("2*3", sh.getVar("n").?.string);
     sh.endScope();
     try testing.expectEqualStrings("outer", sh.getVar("x").?.string);
     try testing.expect(sh.getVar("fresh") == null);
+    try testing.expectEqual(@as(i64, 2), sh.getVar("n").?.int);
+    try testing.expect(sh.getAttrs("n").integer);
 }

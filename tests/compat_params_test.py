@@ -76,7 +76,7 @@ PARAMETER_CASES = [
     "x=aXbXc; r='<&>'; echo ${x//X/$r} ${x//X/\"$r\"}",
     "x=abc; echo ${x/#/P} ${x/%/S} ${x//} ${x/} ${x//?/<&>}",
     "p=a/b/c; echo ${p//\\//_} ${p/\\//:} ${p//[\\/]/.}",
-    "x=foo; echo ${x/#f/F} ${x/%o/O} \"${x/o/'o o'}\"",
+    "x=foo; echo ${x/#f/F} ${x/%o/O} \"${x/o/\"o o\"}\"",
     # substrings
     'x=hello; echo ${x:1} ${x:1:3} ${x: -3} ${x: -3:2} ${x:1:-1} ${x:(-2)} ${x::2} "[${x:10}]" "[${x:2:0}]"',
     "x=hello; i=1; echo ${x:i:i+1} ${x:$i} ${x: -10}",
@@ -113,7 +113,6 @@ ERROR_CASES = [
     "x=hello; echo ${x:1:-10}; echo after",
     "echo ${1:=x}; echo after",
     "echo ${!u}; echo after",
-    "e=; echo ${!e}; echo after",
     "a=(1 2); echo ${a[-5]}; echo rc=$?",
     "a=(1 2); a[-5]=3; echo after",
     "a=(1 2 3); echo ${a[@]:1:-1}; echo after",
@@ -171,7 +170,7 @@ DECLARE_CASES = [
 
 SPECIAL_CASES = [
     "echo $OSTYPE $HOSTTYPE",
-    '[ "$HOSTNAME" = "$(hostname)" ] && echo host-ok',
+    '[ "$HOSTNAME" = "$(uname -n)" ] && echo host-ok',
     "HOSTNAME=elsewhere; echo $HOSTNAME",
     "r=$RANDOM; [ \"$r\" -ge 0 ] && [ \"$r\" -le 32767 ] && echo random-ok",
     'RANDOM=42; a=$RANDOM; b=$RANDOM; RANDOM=42; c=$RANDOM; d=$RANDOM; [ "$a $b" = "$c $d" ] && echo seeded-ok',

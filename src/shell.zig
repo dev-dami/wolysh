@@ -407,13 +407,15 @@ pub const Shell = struct {
         if (self.scopes.items.len == 0) return;
         var scope = self.scopes.pop().?;
         while (scope.saved.pop()) |saved| {
-            self.setAttrs(saved.name, saved.attrs) catch {};
+            // The saved value is restored as it was, then its attributes.
+            self.setAttrs(saved.name, .{}) catch {};
             if (saved.was_set) {
                 self.setVar(saved.name, saved.previous) catch {};
             } else if (self.vars.fetchRemove(saved.name)) |kv| {
                 self.gpa.free(kv.key);
                 freeValue(self.gpa, kv.value);
             }
+            self.setAttrs(saved.name, saved.attrs) catch {};
             self.gpa.free(saved.name);
             freeValue(self.gpa, saved.previous);
         }
