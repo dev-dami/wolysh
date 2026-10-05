@@ -17,6 +17,7 @@ test {
     _ = @import("arith.zig");
     _ = @import("builtins.zig");
     _ = @import("exec.zig");
+    _ = @import("executor/timing.zig");
     _ = @import("main.zig");
     _ = @import("interactive/editor.zig");
     _ = @import("interactive/prompt.zig");

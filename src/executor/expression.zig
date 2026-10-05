@@ -80,6 +80,17 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
     }
 }
 
+const builtin_names = [_][]const u8{ "status", "pid", "cwd", "host", "argv", "env" };
+
+/// True when a bare name in an expression refers to something: a built-in
+/// name, a shell variable or an environment variable.
+pub fn isBound(sh: *const Shell, name: []const u8) bool {
+    for (builtin_names) |builtin_name| {
+        if (std.mem.eql(u8, name, builtin_name)) return true;
+    }
+    return sh.getVar(name) != null or sh.getEnv(name) != null;
+}
+
 fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "status")) return Value{ .int = sh.last_status };
     if (std.mem.eql(u8, name, "pid")) return Value{ .int = sh.pid };

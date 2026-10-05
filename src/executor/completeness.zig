@@ -5,6 +5,104 @@ const lexer = @import("../lexer.zig");
 /// leading tabs to be stripped.
 const Delimiter = struct { raw: []const u8, strip: bool };
 
+/// Reserved-word bookkeeping. A header (`if`, `while`, `function`, ...) is
+/// open until its body starts: `then`/`do` open a POSIX block that `fi`,
+/// `done` or `esac` close, while a `{` after a word starts a native body,
+/// which the brace count tracks.
+const Blocks = struct {
+    const Header = enum { if_, elif, loop, function };
+
+    headers: [64]Header = undefined,
+    header_count: usize = 0,
+    /// Open `then`/`do`/`case` blocks.
+    depth: i32 = 0,
+    /// The next word starts a command, so a reserved word is recognised.
+    command_start: bool = true,
+    /// Also inside a `case`, where `pattern)` is followed by a command.
+    case_depth: i32 = 0,
+    /// The input ends right after `name()`, whose body has not started.
+    open_definition: bool = false,
+
+    fn push(self: *Blocks, header: Header) void {
+        if (self.header_count < self.headers.len) {
+            self.headers[self.header_count] = header;
+            self.header_count += 1;
+        }
+    }
+
+    fn top(self: *const Blocks) ?Header {
+        return if (self.header_count == 0) null else self.headers[self.header_count - 1];
+    }
+
+    fn see(self: *Blocks, tok: lexer.Token) void {
+        const at_start = self.command_start;
+        self.open_definition = false;
+        switch (tok.tag) {
+            .word => {
+                self.command_start = false;
+                if (!at_start) {
+                    if (self.case_depth > 0 and tok.text.len > 1 and tok.text[tok.text.len - 1] == ')') self.command_start = true;
+                    return;
+                }
+                const text = tok.text;
+                if (eql(text, "if")) {
+                    self.push(.if_);
+                } else if (eql(text, "elif")) {
+                    self.push(.elif);
+                } else if (eql(text, "while") or eql(text, "until") or eql(text, "for") or eql(text, "select")) {
+                    self.push(.loop);
+                } else if (eql(text, "function")) {
+                    self.push(.function);
+                } else if (eql(text, "then")) {
+                    if (self.top()) |header| {
+                        if (header == .if_ or header == .elif) self.header_count -= 1;
+                        if (header == .if_) self.depth += 1;
+                    }
+                } else if (eql(text, "do")) {
+                    if (self.top() == .loop) {
+                        self.header_count -= 1;
+                        self.depth += 1;
+                    }
+                } else if (eql(text, "case")) {
+                    self.depth += 1;
+                    self.case_depth += 1;
+                } else if (eql(text, "esac")) {
+                    self.depth -= 1;
+                    self.case_depth -= 1;
+                } else if (eql(text, "fi") or eql(text, "done")) {
+                    self.depth -= 1;
+                } else if (std.mem.endsWith(u8, text, "()")) {
+                    self.open_definition = true;
+                }
+                // These keep the next word in command position.
+                self.command_start = eql(text, "if") or eql(text, "elif") or eql(text, "then") or
+                    eql(text, "else") or eql(text, "while") or eql(text, "until") or eql(text, "do") or
+                    eql(text, "!") or eql(text, "time");
+            },
+            .lbrace => {
+                // A `{` after a word opens a native body.
+                if (!at_start and self.top() != null) self.header_count -= 1;
+                self.command_start = true;
+            },
+            .lparen => {
+                if (self.top() == .function) self.header_count -= 1;
+                self.command_start = true;
+            },
+            .rparen => self.command_start = self.case_depth > 0,
+            .newline, .semi, .dsemi, .semi_amp, .dsemi_amp, .pipe, .pipepipe, .amp, .ampamp, .rbrace => self.command_start = true,
+            else => self.command_start = false,
+        }
+    }
+
+    fn open(self: *const Blocks) bool {
+        return self.depth > 0 or self.header_count > 0 or self.open_definition;
+    }
+};
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
 pub fn isComplete(src: []const u8) bool {
     if (!quotesBalanced(src)) return false;
 
@@ -18,6 +116,7 @@ pub fn isComplete(src: []const u8) bool {
     var heredoc_count: usize = 0;
     var needs_heredoc_delimiter = false;
     var heredoc_strip = false;
+    var blocks = Blocks{};
 
     while (true) {
         const tok = lx.next();
@@ -25,6 +124,7 @@ pub fn isComplete(src: []const u8) bool {
             if (heredoc_count != 0 or needs_heredoc_delimiter) return false;
             break;
         }
+        blocks.see(tok);
         if (needs_heredoc_delimiter) {
             if (tok.tag != .word or heredoc_count == heredoc_delimiters.len) return false;
             heredoc_delimiters[heredoc_count] = .{ .raw = tok.text, .strip = heredoc_strip };
@@ -55,6 +155,7 @@ pub fn isComplete(src: []const u8) bool {
     }
 
     if (braces > 0 or parens > 0 or brackets > 0) return false;
+    if (blocks.open()) return false;
     if (expectsMore(last)) return false;
     if (last == .word and wordExpectsMore(last_text)) return false;
 

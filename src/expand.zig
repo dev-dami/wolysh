@@ -26,6 +26,9 @@ const Mode = enum {
     command_word,
     /// A single value: no splitting, no globbing.
     literal,
+    /// A single pattern (`case` items): no splitting, and text from a quoted
+    /// context stays backslash-escaped so it matches literally.
+    pattern,
 };
 
 fn isSpaceByte(c: u8) bool {
@@ -79,6 +82,14 @@ pub fn expandWord(
 /// markers left behind.
 pub fn expandLiteral(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u8) Error![]const u8 {
     var ex = Expander{ .sh = sh, .arena = arena, .mode = .literal };
+    try ex.scan(word);
+    return arena.dupe(u8, ex.buf.items);
+}
+
+/// Expands a word to one glob pattern for `glob.matchSegment`: quoted parts
+/// are escaped, unquoted expansions keep their metacharacters live.
+pub fn expandPattern(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u8) Error![]const u8 {
+    var ex = Expander{ .sh = sh, .arena = arena, .mode = .pattern };
     try ex.scan(word);
     return arena.dupe(u8, ex.buf.items);
 }
@@ -183,7 +194,7 @@ pub const Expander = struct {
 
     /// Appends an unquoted value, splitting it into fields on `IFS`.
     fn appendSplitRaw(self: *Expander, bytes: []const u8) Error!void {
-        if (self.mode == .literal) return self.appendRaw(bytes);
+        if (self.mode != .command_word) return self.appendRaw(bytes);
         if (bytes.len == 0) return;
         var seps: [64]u8 = undefined;
         const ifs = self.ifsSpec(&seps);
@@ -235,9 +246,9 @@ pub const Expander = struct {
     }
 
     /// Emits the pending field, globbing it when it still has live
-    /// metacharacters. Does nothing in literal mode.
+    /// metacharacters. Does nothing outside command words.
     fn flush(self: *Expander) Error!void {
-        if (self.mode == .literal) return;
+        if (self.mode != .command_word) return;
         if (!self.active) {
             self.buf.clearRetainingCapacity();
             return;

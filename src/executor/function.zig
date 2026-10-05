@@ -19,7 +19,7 @@ pub const Runtime = struct {
 
 pub fn run(
     sh: *Shell,
-    _: []const u8,
+    name: []const u8,
     source: []const u8,
     argv: []const []const u8,
     runtime: Runtime,
@@ -30,7 +30,8 @@ pub fn run(
     }
 
     const arena = sh.scratch();
-    var parser = parser_mod.Parser.init(arena, source);
+    // Numbering from the definition's own line keeps `$LINENO` meaningful.
+    var parser = parser_mod.Parser.initAt(arena, source, sh.getFuncLine(name));
     const program = parser.parseProgram() catch {
         reportSyntaxError(sh, &parser);
         return 2;
@@ -47,6 +48,7 @@ pub fn run(
     const saved_positional = sh.positional;
     const saved_return = sh.return_pending;
     const saved_code = sh.return_code;
+    const saved_line = sh.current_line;
     sh.positional = if (argv.len > 1) argv[1..] else &.{};
     sh.return_pending = false;
     sh.beginScope() catch return 1;
@@ -57,7 +59,10 @@ pub fn run(
         sh.positional = saved_positional;
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
+        sh.current_line = saved_line;
     }
+    // A local binding, so the caller's FUNCNAME comes back on return.
+    sh.setLocal("FUNCNAME", .{ .string = name }) catch return 1;
 
     for (declaration.params, 0..) |param, index| {
         const arg_index = index + 1;

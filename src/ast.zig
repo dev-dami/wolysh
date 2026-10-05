@@ -3,7 +3,9 @@
 //! wolysh keeps commands and language expressions in the same grammar but in
 //! different positions: at statement level an unquoted word starts a *command*,
 //! while keywords (`let`, `if`, `for`, `while`, `fn`, `return`, `env`, `alias`)
-//! introduce language constructs whose operands are *expressions*.
+//! introduce language constructs whose operands are *expressions*. Control
+//! flow (`if`, loops, `case`, `select`) is a compound *command*, so it can be
+//! redirected, piped and backgrounded like any other command.
 
 const std = @import("std");
 
@@ -76,6 +78,9 @@ pub const Command = struct {
     group: ?[]Stmt = null,
     /// Temporary environment assignments written before the command word.
     assigns: []PrefixAssign = &.{},
+    /// `if`, loops, `case` and `select`. Like a group, a compound command runs
+    /// in the current shell unless it is piped or backgrounded.
+    compound: ?*Compound = null,
 };
 
 pub const ChainOp = enum { and_, or_ };
@@ -94,7 +99,14 @@ pub const Pipeline = struct {
     links: []ChainLink = &.{},
     /// A leading `!` inverts the status of the pipeline it precedes.
     negate: bool = false,
+    /// Source line of the pipeline's first word, for `$LINENO`.
+    line: u32 = 0,
+    time: TimeMode = .none,
 };
+
+/// `time PIPELINE` reports elapsed and CPU time; `time -p` uses the POSIX
+/// format.
+pub const TimeMode = enum { none, default, posix };
 
 pub const BinOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
 
@@ -119,6 +131,7 @@ pub const Expr = union(enum) {
 pub const VarDecl = struct {
     name: []const u8,
     value: *Expr,
+    line: u32 = 0,
 };
 
 pub const EnvOp = enum { set, append };
@@ -127,26 +140,71 @@ pub const EnvAssign = struct {
     name: []const u8,
     op: EnvOp,
     value: *Expr,
+    line: u32 = 0,
+};
+
+/// The test of an `if`, `while` or `until`: a native expression, a command
+/// list whose status decides, or both. Both are kept when the condition is
+/// nothing but bare names joined by `!`, `&&` and `||` (`if ! ready {`): it
+/// is an expression when every name is a variable and commands otherwise.
+pub const Condition = struct {
+    expr: ?*Expr = null,
+    list: ?[]Stmt = null,
 };
 
 pub const If = struct {
-    cond: *Expr,
+    cond: Condition,
     then: *Block,
-    /// The `else` branch. `else if` is desugared into a block holding one
-    /// nested `if_` statement.
+    /// The `else` branch. `else if` and `elif` are desugared into a block
+    /// holding one nested `if` command.
     else_: ?*Block,
 };
 
 pub const For = struct {
     name: []const u8,
     /// The `in` clause is a word list, so `for f in *.rs` globs naturally.
+    /// Without `in` it is `"$@"`.
     items: []Word,
     body: *Block,
 };
 
 pub const While = struct {
-    cond: *Expr,
+    cond: Condition,
     body: *Block,
+    /// `until`: loop while the condition fails.
+    until: bool = false,
+};
+
+/// What follows a `case` item's body: `;;` stops, `;&` runs the next body
+/// without testing it, `;;&` goes on testing the remaining patterns.
+pub const CaseNext = enum { stop, fallthrough, test_next };
+
+pub const CaseItem = struct {
+    patterns: []Word,
+    body: []Stmt,
+    next: CaseNext,
+};
+
+pub const Case = struct {
+    word: Word,
+    items: []CaseItem,
+};
+
+pub const Compound = struct {
+    /// Source text of the whole command, shown by `jobs`.
+    text: []const u8 = "",
+    kind: Kind,
+
+    pub const Kind = union(enum) {
+        if_: If,
+        for_: For,
+        while_: While,
+        case_: Case,
+        select_: For,
+        /// `return`, `break` or `continue` where a command is expected, as in
+        /// `[ -f x ] || return 1`.
+        statement: Stmt,
+    };
 };
 
 pub const Param = struct {
@@ -157,19 +215,19 @@ pub const Param = struct {
 pub const FnDecl = struct {
     name: []const u8,
     params: []Param,
+    /// A POSIX definition (`name() { ...; } > log`) has one statement here:
+    /// the compound command together with its redirections.
     body: *Block,
     /// The declaration's own source text. Function bodies are stored as source
     /// and re-parsed on each call, so the AST of the defining line can be freed.
     source: []const u8 = "",
+    line: u32 = 0,
 };
 
 pub const Stmt = union(enum) {
     pipeline: Pipeline,
     var_decl: VarDecl,
     env_assign: EnvAssign,
-    if_: If,
-    for_: For,
-    while_: While,
     fn_decl: FnDecl,
     return_: ?*Expr,
     /// `break N`: how many enclosing loops to leave (at least 1).

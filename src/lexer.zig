@@ -39,6 +39,10 @@ pub const Tag = enum {
     amp,
     ampamp,
     semi,
+    /// `;;`, `;&` and `;;&` end a `case` item.
+    dsemi,
+    semi_amp,
+    dsemi_amp,
     out,
     out_append,
     in,
@@ -104,6 +108,7 @@ pub const State = struct {
     mode: Mode,
     depth: u16,
     group_depth: u16,
+    case_pattern: bool,
 };
 
 fn isSpace(c: u8) bool {
@@ -122,6 +127,21 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
+fn isSpecialParam(c: u8) bool {
+    return isDigit(c) or switch (c) {
+        '?', '#', '$', '!', '@', '*', '-' => true,
+        else => false,
+    };
+}
+
+fn isIdentifierText(s: []const u8) bool {
+    if (s.len == 0 or !isIdentStart(s[0])) return false;
+    for (s[1..]) |c| {
+        if (!isIdentChar(c)) return false;
+    }
+    return true;
+}
+
 /// Characters that always end a command word, in both modes.
 fn isStructural(c: u8) bool {
     return switch (c) {
@@ -137,13 +157,23 @@ pub const Lexer = struct {
     mode: Mode = .word,
     depth: u16 = 0,
     group_depth: u16 = 0,
+    /// Set while the parser reads `case` patterns: `(`, `)` and `|` delimit
+    /// patterns there, except inside an extglob group such as `@(a|b)`.
+    case_pattern: bool = false,
 
     pub fn init(src: []const u8) Lexer {
         return .{ .src = src };
     }
 
     pub fn save(self: *const Lexer) State {
-        return .{ .pos = self.pos, .line = self.line, .mode = self.mode, .depth = self.depth, .group_depth = self.group_depth };
+        return .{
+            .pos = self.pos,
+            .line = self.line,
+            .mode = self.mode,
+            .depth = self.depth,
+            .group_depth = self.group_depth,
+            .case_pattern = self.case_pattern,
+        };
     }
 
     pub fn restore(self: *Lexer, s: State) void {
@@ -152,6 +182,7 @@ pub const Lexer = struct {
         self.mode = s.mode;
         self.depth = s.depth;
         self.group_depth = s.group_depth;
+        self.case_pattern = s.case_pattern;
     }
 
     fn tok(self: *Lexer, tag: Tag, start: usize, depth_before: u16) Token {
@@ -236,6 +267,18 @@ pub const Lexer = struct {
             },
             ';' => {
                 self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == ';') {
+                    self.pos += 1;
+                    if (self.pos < self.src.len and self.src[self.pos] == '&') {
+                        self.pos += 1;
+                        return self.tok(.dsemi_amp, start, depth_before);
+                    }
+                    return self.tok(.dsemi, start, depth_before);
+                }
+                if (self.pos < self.src.len and self.src[self.pos] == '&') {
+                    self.pos += 1;
+                    return self.tok(.semi_amp, start, depth_before);
+                }
                 return self.tok(.semi, start, depth_before);
             },
             '>' => {
@@ -337,7 +380,7 @@ pub const Lexer = struct {
             } else {
                 self.pos += 1;
                 const token = self.tok(.lparen, start, depth_before);
-                self.group_depth += 1;
+                if (!self.case_pattern) self.group_depth += 1;
                 return token;
             },
             ')' => if (self.mode == .expr) {
@@ -346,7 +389,7 @@ pub const Lexer = struct {
             } else {
                 self.pos += 1;
                 const token = self.tok(.rparen, start, depth_before);
-                if (self.group_depth > 0) self.group_depth -= 1;
+                if (!self.case_pattern and self.group_depth > 0) self.group_depth -= 1;
                 return token;
             },
             '[' => if (self.mode == .expr) {
@@ -378,14 +421,16 @@ pub const Lexer = struct {
                     return self.tok(.word, start, depth_before);
                 }
                 if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '{') {
-                    self.pos += 2;
-                    const inner_start = self.pos;
-                    while (self.pos < self.src.len and self.src[self.pos] != '}') self.pos += 1;
-                    const inner = self.src[inner_start..self.pos];
-                    if (self.pos < self.src.len) self.pos += 1;
-                    var t = self.tok(.ident, start, depth_before);
-                    t.text = inner;
-                    return t;
+                    self.skipExpansion();
+                    // `${name}` is a variable reference; anything else
+                    // (`${#name}`, `${name:-x}`, `${1}`) is expanded as a word.
+                    const closed = self.pos > start + 2 and self.src[self.pos - 1] == '}';
+                    if (closed and isIdentifierText(self.src[start + 2 .. self.pos - 1])) {
+                        var t = self.tok(.ident, start, depth_before);
+                        t.text = self.src[start + 2 .. self.pos - 1];
+                        return t;
+                    }
+                    return self.tok(.word, start, depth_before);
                 }
                 if (self.pos + 1 < self.src.len and isIdentStart(self.src[self.pos + 1])) {
                     self.pos += 1;
@@ -394,6 +439,12 @@ pub const Lexer = struct {
                     var t = self.tok(.ident, start, depth_before);
                     t.text = self.src[name_start..self.pos];
                     return t;
+                }
+                // `$?`, `$#`, `$1`, `$@` and friends become words, which the
+                // expression parser turns into expanded strings.
+                if (self.pos + 1 < self.src.len and isSpecialParam(self.src[self.pos + 1])) {
+                    self.pos += 2;
+                    return self.tok(.word, start, depth_before);
                 }
             }
             if (isIdentStart(c)) return self.scanIdent(start, depth_before);
@@ -497,6 +548,23 @@ pub const Lexer = struct {
         var embedded_parens: usize = 0;
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
+            if (self.case_pattern) {
+                if (c == '(') {
+                    embedded_parens += 1;
+                    self.pos += 1;
+                    continue;
+                }
+                if (c == ')') {
+                    if (embedded_parens == 0) break;
+                    embedded_parens -= 1;
+                    self.pos += 1;
+                    continue;
+                }
+                if (c == '|' and embedded_parens > 0) {
+                    self.pos += 1;
+                    continue;
+                }
+            }
             if (self.group_depth > 0 and c == '(') {
                 embedded_parens += 1;
                 self.pos += 1;
@@ -645,6 +713,49 @@ test "a spaced ampersand still backgrounds" {
     try std.testing.expectEqual(Tag.amp, lx.next().tag);
     try std.testing.expectEqual(Tag.out, lx.next().tag);
     try std.testing.expectEqualStrings("out.txt", lx.next().text);
+}
+
+test "case item terminators" {
+    var lx = Lexer.init("a;; b;& c;;& d;");
+    _ = lx.next();
+    try std.testing.expectEqual(Tag.dsemi, lx.next().tag);
+    _ = lx.next();
+    try std.testing.expectEqual(Tag.semi_amp, lx.next().tag);
+    _ = lx.next();
+    try std.testing.expectEqual(Tag.dsemi_amp, lx.next().tag);
+    _ = lx.next();
+    try std.testing.expectEqual(Tag.semi, lx.next().tag);
+}
+
+test "case patterns split on parens and bars outside extglob groups" {
+    var lx = Lexer.init("(a|b*) @(x|y)) z");
+    lx.case_pattern = true;
+    try std.testing.expectEqual(Tag.lparen, lx.next().tag);
+    try std.testing.expectEqualStrings("a", lx.next().text);
+    try std.testing.expectEqual(Tag.pipe, lx.next().tag);
+    try std.testing.expectEqualStrings("b*", lx.next().text);
+    try std.testing.expectEqual(Tag.rparen, lx.next().tag);
+    try std.testing.expectEqualStrings("@(x|y)", lx.next().text);
+    try std.testing.expectEqual(Tag.rparen, lx.next().tag);
+    try std.testing.expectEqual(@as(u16, 0), lx.group_depth);
+}
+
+test "special parameters in expression mode" {
+    var lx = Lexer.init("$? == 0 and ${#x} > $1 or ${name}");
+    lx.mode = .expr;
+    const status = lx.next();
+    try std.testing.expectEqual(Tag.word, status.tag);
+    try std.testing.expectEqualStrings("$?", status.text);
+    try std.testing.expectEqual(Tag.eq, lx.next().tag);
+    try std.testing.expectEqual(Tag.number, lx.next().tag);
+    try std.testing.expectEqual(Tag.ident, lx.next().tag);
+    try std.testing.expectEqualStrings("${#x}", lx.next().text);
+    try std.testing.expectEqual(Tag.gt, lx.next().tag);
+    try std.testing.expectEqualStrings("$1", lx.next().text);
+    try std.testing.expectEqual(Tag.ident, lx.next().tag);
+    const name = lx.next();
+    try std.testing.expectEqual(Tag.ident, name.tag);
+    try std.testing.expectEqualStrings("name", name.text);
 }
 
 test "comments" {
