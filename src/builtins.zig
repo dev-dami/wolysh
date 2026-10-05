@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const cd = @import("builtins/cd.zig");
 
 const Shell = shellmod.Shell;
 
@@ -271,12 +272,6 @@ fn nextArg(args: []const []const u8, index: *usize) []const u8 {
     return text;
 }
 
-fn builtinPwd(ctx: Ctx) u8 {
-    ctx.out(ctx.sh.cwd);
-    ctx.out("\n");
-    return 0;
-}
-
 fn builtinClear(ctx: Ctx) u8 {
     ctx.out("\x1b[2J\x1b[H");
     return 0;
@@ -295,43 +290,6 @@ fn builtinFalse(_: Ctx) u8 {
 }
 
 // --- directory -------------------------------------------------------------
-
-fn builtinCd(ctx: Ctx) u8 {
-    const target = ctx.arg(1) orelse ctx.sh.getEnv("HOME") orelse {
-        ctx.err("wsh: cd: HOME is not set\n");
-        return 1;
-    };
-
-    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var dest: []const u8 = target;
-    if (std.mem.eql(u8, target, "-")) {
-        dest = ctx.sh.getEnv("OLDPWD") orelse {
-            ctx.err("wsh: cd: OLDPWD is not set\n");
-            return 1;
-        };
-    }
-    dest = ctx.sh.tildeExpand(arena, dest) catch target;
-
-    const z = arena.dupeZ(u8, dest) catch return 1;
-    if (!fs.isDir(z)) {
-        ctx.errFmt("wsh: cd: {s}: not a directory\n", .{dest});
-        return 1;
-    }
-    if (!fs.chdir(z)) {
-        ctx.errFmt("wsh: cd: {s}: permission denied\n", .{dest});
-        return 1;
-    }
-    ctx.sh.updateCwd() catch {};
-    ctx.sh.setEnv("OLDPWD", dest) catch {};
-    if (std.mem.eql(u8, target, "-")) {
-        ctx.out(dest);
-        ctx.out("\n");
-    }
-    return 0;
-}
 
 fn builtinPushd(ctx: Ctx) u8 {
     const target = ctx.arg(1) orelse {
@@ -433,23 +391,71 @@ fn builtinExport(ctx: Ctx) u8 {
     return status;
 }
 
+const UnsetMode = enum {
+    /// No option: a variable, or else a function of that name (bash).
+    either,
+    variable,
+    function,
+};
+
+/// `unset [-v|-f] [--] NAME...`.
 fn builtinUnset(ctx: Ctx) u8 {
-    if (ctx.argv.len < 2) {
-        ctx.err("wsh: unset: expected a name\n");
-        return 1;
+    var mode: UnsetMode = .either;
+    var index: usize = 1;
+    while (index < ctx.argv.len) : (index += 1) {
+        const arg = ctx.argv[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            break;
+        }
+        if (arg.len < 2 or arg[0] != '-') break;
+        for (arg[1..]) |flag| {
+            switch (flag) {
+                'v' => mode = .variable,
+                'f' => mode = .function,
+                else => {
+                    ctx.errFmt("wsh: unset: -{c}: invalid option\nunset: usage: unset [-f] [-v] [name ...]\n", .{flag});
+                    return 2;
+                },
+            }
+        }
     }
     var status: u8 = 0;
-    var i: usize = 1;
-    while (i < ctx.argv.len) : (i += 1) {
-        const name = ctx.argv[i];
-        if (ctx.sh.isReadonly(name)) {
-            ctx.errFmt("wsh: unset: {s}: readonly variable\n", .{name});
-            status = 1;
-            continue;
-        }
-        if (!ctx.sh.unsetVar(name)) _ = ctx.sh.unsetEnv(name);
+    for (ctx.argv[index..]) |name| {
+        const function_only = validName(name) and !ctx.sh.hasVar(name) and
+            ctx.sh.getEnv(name) == null and ctx.sh.getFunc(name) != null;
+        const ok = switch (mode) {
+            .variable => unsetVariable(ctx, name),
+            .function => unsetFunction(ctx, name),
+            .either => if (function_only) unsetFunction(ctx, name) else unsetVariable(ctx, name),
+        };
+        if (!ok) status = 1;
     }
     return status;
+}
+
+/// Removes a variable from the shell and the environment alike; an unset
+/// name is not an error.
+fn unsetVariable(ctx: Ctx, name: []const u8) bool {
+    if (!validName(name)) {
+        ctx.errFmt("wsh: unset: `{s}': not a valid identifier\n", .{name});
+        return false;
+    }
+    if (ctx.sh.isReadonly(name)) {
+        ctx.errFmt("wsh: unset: {s}: cannot unset: readonly variable\n", .{name});
+        return false;
+    }
+    _ = ctx.sh.unsetVar(name);
+    _ = ctx.sh.unsetEnv(name);
+    return true;
+}
+
+fn unsetFunction(ctx: Ctx, name: []const u8) bool {
+    if (ctx.sh.funcs.fetchRemove(name)) |kv| {
+        ctx.sh.gpa.free(kv.key);
+        ctx.sh.gpa.free(kv.value);
+    }
+    return true;
 }
 
 fn builtinSet(ctx: Ctx) u8 {
@@ -786,76 +792,154 @@ fn builtinWait(ctx: Ctx) u8 {
 
 // --- signals ---------------------------------------------------------------
 
+const kill_usage = "wsh: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]\n";
+
+/// `kill [-s SIG | -n NUM | -SIG] TARGET...` and `kill -l|-L [SIG...]`. One
+/// signal option ends option parsing, so `kill -9 -123` signals group 123.
+/// Succeeds when at least one signal was delivered, as in bash.
 fn builtinKill(ctx: Ctx) u8 {
-    var sig: linux.SIG = .TERM;
-    // `kill -0` / `kill -s 0` only tests that the target exists.
-    var probe = false;
+    var sig: u32 = @intFromEnum(linux.SIG.TERM);
     var index: usize = 1;
-    while (index < ctx.argv.len) : (index += 1) {
+    if (index < ctx.argv.len) {
         const arg = ctx.argv[index];
+        if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "-L")) return listSignals(ctx, ctx.argv[index + 1 ..]);
         if (std.mem.eql(u8, arg, "--")) {
             index += 1;
-            break;
-        }
-        if (arg.len < 2 or arg[0] != '-') break;
-        if (std.mem.eql(u8, arg, "-s")) {
-            index += 1;
-            if (index >= ctx.argv.len) {
-                ctx.err("wsh: kill: -s needs a signal\n");
-                return 1;
-            }
-            if (std.mem.eql(u8, ctx.argv[index], "0")) {
-                probe = true;
-                continue;
-            }
-            sig = proc.signalFromName(ctx.argv[index]) orelse {
-                ctx.errFmt("wsh: kill: {s}: invalid signal\n", .{ctx.argv[index]});
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "-n")) {
+            const spec = ctx.arg(index + 1) orelse {
+                ctx.errFmt("wsh: kill: {s}: option requires an argument\n", .{arg});
                 return 1;
             };
-            continue;
+            sig = signalNumber(spec) orelse return invalidSignal(ctx, spec);
+            index += 2;
+        } else if (arg.len >= 2 and arg[0] == '-') {
+            sig = signalNumber(arg[1..]) orelse return invalidSignal(ctx, arg[1..]);
+            index += 1;
+            if (ctx.arg(index)) |next| {
+                if (std.mem.eql(u8, next, "--")) index += 1;
+            }
         }
-        if (std.mem.eql(u8, arg, "-0")) {
-            probe = true;
-            continue;
-        }
-        sig = proc.signalFromName(arg[1..]) orelse {
-            ctx.errFmt("wsh: kill: {s}: invalid signal\n", .{arg});
-            return 1;
-        };
     }
 
     if (index >= ctx.argv.len) {
-        ctx.err("wsh: kill: expected a pid or job\n");
-        return 1;
+        ctx.err(kill_usage);
+        return 2;
     }
 
-    var status: u8 = 0;
-    while (index < ctx.argv.len) : (index += 1) {
-        const target = ctx.argv[index];
+    var delivered = false;
+    for (ctx.argv[index..]) |target| {
         if (target.len != 0 and target[0] == '%') {
             const job = resolveJob(ctx, target) orelse {
                 ctx.errFmt("wsh: kill: {s}: no such job\n", .{target});
-                status = 1;
                 continue;
             };
-            if (!probe) proc.signalGroup(job.pgid, sig);
-            continue;
-        }
-        const pid = std.fmt.parseInt(i32, target, 10) catch {
-            ctx.errFmt("wsh: kill: {s}: invalid pid\n", .{target});
-            status = 1;
-            continue;
-        };
-        if (probe) {
-            if (!proc.probeProcess(pid)) {
-                ctx.errFmt("wsh: kill: {s}: no such process\n", .{target});
-                status = 1;
+            const err = proc.sendSignal(-job.pgid, sig);
+            if (err == .SUCCESS) {
+                delivered = true;
+            } else {
+                ctx.errFmt("wsh: kill: {s}: {s}\n", .{ target, proc.errorText(err) });
             }
             continue;
         }
-        proc.signalProcess(pid, sig);
+        const pid = std.fmt.parseInt(i32, target, 10) catch {
+            ctx.errFmt("wsh: kill: `{s}': not a pid or valid job spec\n", .{target});
+            continue;
+        };
+        const err = proc.sendSignal(pid, sig);
+        if (err == .SUCCESS) {
+            delivered = true;
+        } else {
+            ctx.errFmt("wsh: kill: ({d}) - {s}\n", .{ pid, proc.errorText(err) });
+        }
+    }
+    return if (delivered) 0 else 1;
+}
+
+fn invalidSignal(ctx: Ctx, spec: []const u8) u8 {
+    ctx.errFmt("wsh: kill: {s}: invalid signal specification\n", .{spec});
+    return 1;
+}
+
+/// `kill -l`: every signal as bash lays it out, five to a line. With
+/// operands, a number (or an exit status above 128) prints its name and a
+/// name prints its number.
+fn listSignals(ctx: Ctx, specs: []const []const u8) u8 {
+    var name_buf: [16]u8 = undefined;
+    if (specs.len == 0) {
+        var out = sys.StringBuilder.init(ctx.sh.gpa);
+        defer out.deinit();
+        var column: usize = 0;
+        var n: u32 = 1;
+        while (n <= Shell.max_signal) : (n += 1) {
+            const name = signalLabel(n, &name_buf) orelse continue;
+            out.print("{d: >2}) SIG{s}", .{ n, name }) catch return 1;
+            column += 1;
+            out.append(if (column % 5 == 0) "\n" else "\t") catch return 1;
+        }
+        if (column % 5 != 0) out.append("\n") catch return 1;
+        ctx.out(out.items());
+        return 0;
+    }
+    var status: u8 = 0;
+    for (specs) |spec| {
+        if (std.fmt.parseInt(u32, spec, 10)) |number| {
+            if (number == 0) {
+                ctx.out("EXIT\n");
+                continue;
+            }
+            if (signalLabel(if (number > 128) number - 128 else number, &name_buf)) |name| {
+                ctx.outFmt("{s}\n", .{name});
+                continue;
+            }
+        } else |_| {
+            if (signalNumber(spec)) |n| {
+                ctx.outFmt("{d}\n", .{n});
+                continue;
+            }
+        }
+        _ = invalidSignal(ctx, spec);
+        status = 1;
     }
     return status;
+}
+
+/// `KILL`, `SIGKILL`, `kill`, `9`, `RTMIN+1`: a signal number, 0 included.
+fn signalNumber(spec: []const u8) ?u32 {
+    if (spec.len != 0 and std.ascii.isDigit(spec[0])) {
+        const n = std.fmt.parseInt(u32, spec, 10) catch return null;
+        return if (n <= Shell.max_signal) n else null;
+    }
+    var upper_buf: [16]u8 = undefined;
+    if (spec.len > upper_buf.len) return null;
+    const upper = std.ascii.upperString(&upper_buf, spec);
+    const wanted = if (std.mem.startsWith(u8, upper, "SIG")) upper[3..] else upper;
+    var name_buf: [16]u8 = undefined;
+    var n: u32 = 1;
+    while (n <= Shell.max_signal) : (n += 1) {
+        const name = signalLabel(n, &name_buf) orelse continue;
+        if (std.mem.eql(u8, name, wanted)) return n;
+    }
+    return null;
+}
+
+/// Linux's name for signal `n` without the `SIG` prefix, numbering the
+/// real-time signals the way bash and glibc do. Null for 32 and 33, which
+/// glibc keeps for itself, and for anything out of range.
+fn signalLabel(n: u32, buf: *[16]u8) ?[]const u8 {
+    const named = [_][]const u8{
+        "HUP",  "INT",    "QUIT", "ILL",   "TRAP", "ABRT", "BUS",  "FPE",
+        "KILL", "USR1",   "SEGV", "USR2",  "PIPE", "ALRM", "TERM", "STKFLT",
+        "CHLD", "CONT",   "STOP", "TSTP",  "TTIN", "TTOU", "URG",  "XCPU",
+        "XFSZ", "VTALRM", "PROF", "WINCH", "IO",   "PWR",  "SYS",
+    };
+    const rtmin = 34;
+    const rtmax = Shell.max_signal;
+    if (n >= 1 and n <= named.len) return named[n - 1];
+    if (n < rtmin or n > rtmax) return null;
+    if (n == rtmin) return "RTMIN";
+    if (n == rtmax) return "RTMAX";
+    if (n - rtmin <= 15) return std.fmt.bufPrint(buf, "RTMIN+{d}", .{n - rtmin}) catch null;
+    return std.fmt.bufPrint(buf, "RTMAX-{d}", .{rtmax - n}) catch null;
 }
 
 fn builtinTrap(ctx: Ctx) u8 {
@@ -1147,7 +1231,8 @@ fn runExternal(ctx: Ctx, argv: []const []const u8) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const resolved = (proc.resolve(arena, argv[0], ctx.sh.pathEnv()) catch null) orelse {
+    // Like a plain command: `execve` failures are reported by the child.
+    const resolved = (proc.locate(arena, argv[0], ctx.sh.pathEnv()) catch null) orelse {
         ctx.errFmt("wsh: {s}: command not found\n", .{argv[0]});
         return 127;
     };
@@ -1216,9 +1301,9 @@ fn builtinExec(ctx: Ctx) u8 {
     const arena = arena_state.allocator();
 
     const name = ctx.argv[1];
-    const resolved = (proc.resolve(arena, name, ctx.sh.pathEnv()) catch null) orelse {
-        ctx.errFmt("wsh: exec: {s}: command not found\n", .{name});
-        return markExecFailure(ctx);
+    const resolved = (proc.locate(arena, name, ctx.sh.pathEnv()) catch null) orelse {
+        ctx.errFmt("wsh: exec: {s}: not found\n", .{name});
+        return markExecFailure(ctx, 127);
     };
     const path = arena.dupeZ(u8, resolved) catch return 127;
     const argv = proc.buildArgv(arena, ctx.argv[1..]) catch return 127;
@@ -1226,9 +1311,9 @@ fn builtinExec(ctx: Ctx) u8 {
 
     // Children get the default dispositions back; exec does not fork.
     proc.resetSignals();
-    const rc = linux.execve(path.ptr, argv, envp);
+    const err = linux.errno(linux.execve(path.ptr, argv, envp));
 
-    if (linux.errno(rc) == .NOEXEC) {
+    if (err == .NOEXEC) {
         const script_argv = arena.alloc([]const u8, ctx.argv.len + 1) catch return 127;
         script_argv[0] = "/bin/sh";
         script_argv[1] = resolved;
@@ -1237,17 +1322,21 @@ fn builtinExec(ctx: Ctx) u8 {
         _ = linux.execve("/bin/sh", shell_argv, envp);
     }
 
-    ctx.errFmt("wsh: exec: {s}: cannot execute\n", .{name});
-    return markExecFailure(ctx);
+    // Still here: an interactive shell carries on with its own dispositions.
+    if (ctx.sh.interactive) proc.shellSignals();
+    const buf = arena.alloc(u8, path.len + 512) catch return 127;
+    const failure = proc.describeExecFailure(buf, path, err);
+    ctx.err(failure.text);
+    return markExecFailure(ctx, failure.status);
 }
 
 /// A failed `exec` is fatal to a non-interactive shell, as POSIX requires.
-fn markExecFailure(ctx: Ctx) u8 {
+fn markExecFailure(ctx: Ctx, status: u8) u8 {
     if (!ctx.sh.interactive) {
         ctx.sh.should_exit = true;
-        ctx.sh.exit_code = 127;
+        ctx.sh.exit_code = status;
     }
-    return 127;
+    return status;
 }
 
 // --- read -------------------------------------------------------------------
@@ -1565,8 +1654,8 @@ pub fn validName(name: []const u8) bool {
 
 const table = [_]Builtin{
     .{ .name = ":", .summary = "do nothing successfully", .run = builtinNoop },
-    .{ .name = "cd", .summary = "change the working directory", .run = builtinCd },
-    .{ .name = "pwd", .summary = "print the working directory", .run = builtinPwd },
+    .{ .name = "cd", .summary = "change the working directory", .run = cd.builtinCd },
+    .{ .name = "pwd", .summary = "print the working directory", .run = cd.builtinPwd },
     .{ .name = "pushd", .summary = "push a directory onto the stack", .run = builtinPushd },
     .{ .name = "popd", .summary = "pop a directory off the stack", .run = builtinPopd },
     .{ .name = "dirs", .summary = "print the directory stack", .run = builtinDirs },
@@ -2107,11 +2196,48 @@ test "kill validates signals and targets" {
     const bad_signal = [_][]const u8{ "kill", "-s", "NOPE" };
     try testing.expectEqual(@as(u8, 1), builtinKill(Ctx{ .sh = &sh, .argv = &bad_signal, .stderr = -1 }));
 
+    // A missing operand is a usage error, as in bash.
     const no_target = [_][]const u8{"kill"};
-    try testing.expectEqual(@as(u8, 1), builtinKill(Ctx{ .sh = &sh, .argv = &no_target, .stderr = -1 }));
+    try testing.expectEqual(@as(u8, 2), builtinKill(Ctx{ .sh = &sh, .argv = &no_target, .stderr = -1 }));
 
     const no_such_job = [_][]const u8{ "kill", "-TERM", "%9" };
     try testing.expectEqual(@as(u8, 1), builtinKill(Ctx{ .sh = &sh, .argv = &no_such_job, .stderr = -1 }));
+
+    // A failed kill(2) is reported, not swallowed.
+    const cap = try Capture.open();
+    const no_such_process = [_][]const u8{ "kill", "2147483646" };
+    try testing.expectEqual(@as(u8, 1), builtinKill(Ctx{ .sh = &sh, .argv = &no_such_process, .stderr = cap.write_fd }));
+    const err = try cap.finish(testing.allocator);
+    defer testing.allocator.free(err);
+    try testing.expectEqualStrings("wsh: kill: (2147483646) - No such process\n", err);
+}
+
+test "kill -l names and numbers signals" {
+    var sh = try Shell.initBare(std.testing.allocator);
+    defer sh.deinit();
+
+    {
+        const cap = try Capture.open();
+        const argv = [_][]const u8{ "kill", "-l", "9", "137", "SIGTERM", "rtmin+1", "0" };
+        try testing.expectEqual(@as(u8, 0), builtinKill(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
+        const out = try cap.finish(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("KILL\nKILL\n15\n35\nEXIT\n", out);
+    }
+    {
+        const cap = try Capture.open();
+        const argv = [_][]const u8{ "kill", "-L" };
+        try testing.expectEqual(@as(u8, 0), builtinKill(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
+        const out = try cap.finish(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.startsWith(u8, out, " 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 4) SIGILL\t 5) SIGTRAP\n"));
+        try testing.expect(std.mem.indexOf(u8, out, "31) SIGSYS\t34) SIGRTMIN\t") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "63) SIGRTMAX-1\t64) SIGRTMAX\t\n"));
+    }
+    {
+        const argv = [_][]const u8{ "kill", "-l", "200" };
+        try testing.expectEqual(@as(u8, 1), builtinKill(Ctx{ .sh = &sh, .argv = &argv, .stdout = -1, .stderr = -1 }));
+    }
 }
 
 test "trap stores, lists and clears handlers" {

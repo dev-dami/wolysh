@@ -182,6 +182,48 @@ pub fn buildArgv(arena: std.mem.Allocator, items: []const []const u8) ![*:null]c
     return @ptrCast(arr.ptr);
 }
 
+/// Finds the file to `execve` for `name`. A name with a `/` is used as it is,
+/// so `execve` reports why it cannot run. Otherwise the first executable on
+/// `PATH` wins; failing that, the first other non-directory match, which
+/// `execve` then refuses with `Permission denied`, as in bash. Null when
+/// nothing on `PATH` matches.
+pub fn locate(arena: std.mem.Allocator, name: []const u8, path_env: []const u8) !?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return name;
+    var fallback: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
+        const z = try arena.dupeZ(u8, full);
+        const found = fs.kind(z) orelse continue;
+        if (found == .dir) continue;
+        if (fs.isExecutable(z)) return full;
+        if (fallback == null) fallback = full;
+    }
+    return fallback;
+}
+
+/// The C library's message for the errors the shell reports.
+pub fn errorText(err: linux.E) []const u8 {
+    return switch (err) {
+        .PERM => "Operation not permitted",
+        .NOENT => "No such file or directory",
+        .SRCH => "No such process",
+        .@"2BIG" => "Argument list too long",
+        .NOEXEC => "Exec format error",
+        .NOMEM => "Cannot allocate memory",
+        .ACCES => "Permission denied",
+        .NOTDIR => "Not a directory",
+        .ISDIR => "Is a directory",
+        .INVAL => "Invalid argument",
+        .TXTBSY => "Text file busy",
+        .NAMETOOLONG => "File name too long",
+        .LOOP => "Too many levels of symbolic links",
+        .IO => "Input/output error",
+        else => std.enums.tagName(linux.E, err) orelse "Unknown error",
+    };
+}
+
 /// Locates `name` on `PATH`. Returns null when it is not an executable file.
 pub fn resolve(arena: std.mem.Allocator, name: []const u8, path_env: []const u8) !?[]const u8 {
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
@@ -287,20 +329,61 @@ fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, pgid: 
 
     if (stage.child_fn) |f| f(stage.child_ctx.?);
 
-    if (stage.exec) |e| {
-        const rc = linux.execve(e.path, e.argv, e.envp);
-        if (linux.errno(rc) == .NOEXEC) {
-            if (e.shell_path) |sh| {
-                if (e.shell_argv) |argv| {
-                    _ = linux.execve(sh, argv, e.envp);
-                }
-            }
+    const e = stage.exec orelse {
+        const msg = "wsh: internal error: a stage has nothing to run\n";
+        _ = linux.write(2, msg.ptr, msg.len);
+        linux.exit(127);
+    };
+    const err = linux.errno(linux.execve(e.path, e.argv, e.envp));
+    if (err == .NOEXEC) {
+        if (e.shell_path) |sh| {
+            if (e.shell_argv) |argv| _ = linux.execve(sh, argv, e.envp);
         }
     }
+    var buf: [linux.PATH_MAX + 512]u8 = undefined;
+    const failure = describeExecFailure(&buf, std.mem.span(e.path), err);
+    _ = linux.write(2, failure.text.ptr, failure.text.len);
+    linux.exit(failure.status);
+}
 
-    const msg = "wsh: could not execute command\n";
-    _ = linux.write(2, msg.ptr, msg.len);
-    linux.exit(127);
+pub const ExecFailure = struct {
+    /// A whole `wsh: ...` line.
+    text: []const u8,
+    status: u8,
+};
+
+/// Explains a failed `execve` of `path` the way bash does: status 127 when
+/// the command does not exist, 126 when it exists but cannot run. Uses only
+/// `buf` and the stack, so a forked child can call it.
+pub fn describeExecFailure(buf: []u8, path: [:0]const u8, err: linux.E) ExecFailure {
+    var head: [256]u8 = undefined;
+    var status: u8 = 126;
+    const text = switch (err) {
+        .NOENT => if (interpreterOf(path, &head)) |interpreter|
+            std.fmt.bufPrint(buf, "wsh: {s}: {s}: bad interpreter: No such file or directory\n", .{ path, interpreter })
+        else blk: {
+            status = 127;
+            break :blk std.fmt.bufPrint(buf, "wsh: {s}: No such file or directory\n", .{path});
+        },
+        .ACCES => std.fmt.bufPrint(buf, "wsh: {s}: {s}\n", .{ path, if (fs.isDir(path)) "Is a directory" else "Permission denied" }),
+        else => std.fmt.bufPrint(buf, "wsh: {s}: {s}\n", .{ path, errorText(err) }),
+    } catch "wsh: cannot execute command: name too long\n";
+    return .{ .text = text, .status = status };
+}
+
+/// The interpreter named by a `#!` line, or null when `path` cannot be read
+/// or does not start with one.
+fn interpreterOf(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const fd = sys.openRead(path.ptr) orelse return null;
+    defer sys.closeFd(fd);
+    const n = sys.readAll(fd, buf);
+    const head = buf[0..n];
+    if (!std.mem.startsWith(u8, head, "#!")) return null;
+    const line = head[2 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    const end = std.mem.indexOfAny(u8, trimmed, " \t\r") orelse trimmed.len;
+    if (end == 0) return null;
+    return trimmed[0..end];
 }
 
 /// Forks every stage, wiring the pipes between them, and returns the pids.
@@ -371,6 +454,12 @@ pub fn launch(arena: std.mem.Allocator, stages: []const Stage, options: LaunchOp
 
 pub fn signalProcess(pid: i32, sig: linux.SIG) void {
     _ = linux.kill(pid, sig);
+}
+
+/// `kill(2)` with any signal number, real-time ones included, returning the
+/// errno so the caller can say why it failed. A negative `pid` names a group.
+pub fn sendSignal(pid: i32, sig: u32) linux.E {
+    return linux.errno(linux.syscall2(.kill, @bitCast(@as(isize, pid)), sig));
 }
 
 pub fn signalGroup(pgid: i32, sig: linux.SIG) void {

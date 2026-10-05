@@ -30,7 +30,10 @@ pub fn run(
     }
 
     const arena = sh.scratch();
-    var parser = parser_mod.Parser.init(arena, source);
+    // The body may `unset -f` or redefine this function, freeing `source`
+    // while its statements still point into it.
+    const owned = arena.dupe(u8, source) catch return 1;
+    var parser = parser_mod.Parser.init(arena, owned);
     const program = parser.parseProgram() catch {
         reportSyntaxError(sh, &parser);
         return 2;
