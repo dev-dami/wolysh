@@ -526,7 +526,8 @@ fn builtinWait(ctx: Ctx) u8 {
                 ctx.sh.jobs.removeAt(ctx.sh.gpa, job_index);
                 return status;
             }
-            if (!running or !ctx.sh.waitJobEvent()) return 127;
+            if (!running) return 127;
+            if (!ctx.sh.waitJobEvent()) return if (ctx.sh.interrupted) 130 else 127;
         }
     }
 
