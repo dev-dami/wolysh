@@ -12,6 +12,7 @@ const shell = @import("shell.zig");
 const glob = @import("glob.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
+const lexer = @import("lexer.zig");
 
 pub const Error = error{
     UnterminatedSubstitution,
@@ -760,6 +761,8 @@ fn findClosingDouble(s: []const u8, from: usize) usize {
 /// Finds the delimiter matching the opener at `open_index`, skipping quoted
 /// regions and nested openers.
 fn findMatching(s: []const u8, open_index: usize, open: u8, close: u8) ?usize {
+    // `$(...)` may hold a `case`, whose patterns end in an unmatched `)`.
+    if (open == '(' and open_index > 0 and s[open_index - 1] == '$') return lexer.closingParen(s, open_index);
     var depth: usize = 0;
     var i = open_index;
     while (i < s.len) : (i += 1) {

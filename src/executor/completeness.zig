@@ -186,6 +186,7 @@ fn quotesBalanced(src: []const u8) bool {
     var i: usize = 0;
     var in_single = false;
     var in_double = false;
+    var in_backtick = false;
     var line_start: usize = 0;
     var heredoc_delimiters: [64]Delimiter = undefined;
     var heredoc_count: usize = 0;
@@ -218,6 +219,8 @@ fn quotesBalanced(src: []const u8) bool {
             in_single = !in_single;
         } else if (c == '"' and !in_single) {
             in_double = !in_double;
+        } else if (c == '`' and !in_single) {
+            in_backtick = !in_backtick;
         } else if (c == '\n') {
             if (heredoc_count > 0 and !continuedLine(src[line_start..i])) {
                 const skipped = skipHereDocBodies(src, i + 1, heredoc_delimiters[0..heredoc_count]) orelse return false;
@@ -226,13 +229,14 @@ fn quotesBalanced(src: []const u8) bool {
                 line_start = i;
                 in_single = false;
                 in_double = false;
+                in_backtick = false;
                 continue;
             }
             line_start = i + 1;
         }
         i += 1;
     }
-    return !in_single and !in_double and heredoc_count == 0;
+    return !in_single and !in_double and !in_backtick and heredoc_count == 0;
 }
 
 const RawDelimiter = struct { raw: []const u8, end: usize, strip: bool };
