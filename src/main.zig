@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 const sys = @import("sys.zig");
 const shellmod = @import("shell.zig");
 const exec = @import("exec.zig");
+const strict = @import("strict.zig");
 const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
@@ -79,7 +80,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         sh.positional = parsed.rest;
         sh.script_name = "wsh";
         const status = if (options.check) exec.checkSource(&sh, command) else exec.runSource(&sh, command);
-        return status;
+        return strict.finish(&sh, status);
     }
 
     if (options.script) |script| {
@@ -92,7 +93,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         };
         defer gpa.free(data);
-        return if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data);
+        return strict.finish(&sh, if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data));
     }
 
     // No command and no script: interactive when stdin is a terminal,
@@ -104,7 +105,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const data = readAllStdin(gpa) orelse return 1;
         defer gpa.free(data);
         sh.script_name = "wsh";
-        return if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data);
+        return strict.finish(&sh, if (options.check) exec.checkSource(&sh, data) else exec.runSource(&sh, data));
     }
 
     return runRepl(&sh, gpa, options.no_config);
@@ -249,20 +250,24 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
             prompt.writeContinuation,
         ) orelse {
             sys.writeStr(1, "\n");
-            break;
+            if (strict.confirmExit(sh)) break;
+            continue;
         };
         if (editor_state.interrupted) continue;
         if (source.len == 0) continue;
 
         sh.hist.add(gpa, source) catch {};
+        const warned = sh.exit_warned;
         _ = exec.runSource(sh, source);
+        // Only an immediately repeated `exit` gets past the stopped-jobs warning.
+        if (warned) sh.exit_warned = false;
         // `let prompt = ...` or `let autosuggest = false` should take effect
         // on the very next prompt.
         sh.applyConfig();
     }
 
     saveHistory(sh);
-    return sh.exit_code;
+    return strict.finish(sh, sh.exit_code);
 }
 
 /// Puts the shell in its own process group and claims the terminal, which is

@@ -6,6 +6,7 @@ const fs = @import("../fs.zig");
 const lexer = @import("../lexer.zig");
 const shellmod = @import("../shell.zig");
 const sys = @import("../sys.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 const RunSource = *const fn (*Shell, []const u8) u8;
@@ -107,10 +108,13 @@ fn builtinSource(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8
     };
     // Extra arguments become the sourced file's positional parameters for the
     // duration of the run; `$0` is left alone.
-    const saved_positional = sh.positional;
-    defer sh.positional = saved_positional;
-    sh.positional = if (argv.len > 2) argv[2..] else &.{};
-    return run_source(sh, data);
+    const saved_positional = sh.pushPositional(if (argv.len > 2) argv[2..] else &.{});
+    defer sh.popPositional(saved_positional);
+    strict.traceDeeper();
+    const status = run_source(sh, data);
+    strict.traceShallower();
+    strict.runReturnTrap(sh);
+    return status;
 }
 
 fn builtinEval(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8 {
@@ -121,6 +125,8 @@ fn builtinEval(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8 {
         if (index != 0) joined.append(arena, ' ') catch return 1;
         joined.appendSlice(arena, part) catch return 1;
     }
+    strict.traceDeeper();
+    defer strict.traceShallower();
     return run_source(sh, joined.items);
 }
 

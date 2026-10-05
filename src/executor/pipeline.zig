@@ -10,6 +10,7 @@ const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
 const subshell = @import("subshell.zig");
 const assign = @import("assign.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 
@@ -46,24 +47,33 @@ fn childExecute(ctx_ptr: *anyopaque) noreturn {
     sh.job_control = false;
     sh.tty_fd = -1;
     sh.should_exit = false;
+    strict.enterSubshell(sh);
     payload.scope.apply() catch linux.exit(1);
-    linux.exit(command.dispatch(sh, payload.argv, payload.command_runtime));
+    strict.exitChild(sh, command.dispatch(sh, payload.argv, payload.command_runtime));
 }
 
 pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
-    var status = runPipeline(sh, chain.commands, chain.background, runtime);
-    if (chain.negate) status = invert(status);
-    for (chain.links) |link| {
+    var status = runLink(sh, chain, chain.links.len != 0, runtime);
+    for (chain.links, 0..) |link, index| {
         const should_run = switch (link.op) {
             .and_ => status == 0,
             .or_ => status != 0,
         };
-        if (should_run) {
-            status = runPipeline(sh, link.pipeline.commands, link.pipeline.background, runtime);
-            if (link.pipeline.negate) status = invert(status);
-        }
+        if (should_run) status = runLink(sh, link.pipeline, index + 1 < chain.links.len, runtime);
     }
     return status;
+}
+
+/// One pipeline of an `&&`/`||` list. Every part but the last, and any `!`
+/// pipeline, is a condition: its failure does not trip `set -e` or ERR.
+fn runLink(sh: *Shell, link: ast.Pipeline, more_follow: bool, runtime: Runtime) u8 {
+    const condition = more_follow or link.negate;
+    if (condition) sh.condition_depth += 1;
+    defer if (condition) {
+        sh.condition_depth -= 1;
+    };
+    const status = runPipeline(sh, link.commands, link.background, runtime);
+    return if (link.negate) invert(status) else status;
 }
 
 /// `! pipeline`: success and failure trade places, so a signal-killed pipeline
@@ -73,6 +83,23 @@ fn invert(status: u8) u8 {
 }
 
 fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runtime: Runtime) u8 {
+    var statuses: []const u8 = &.{};
+    const status = runStages(sh, commands, background, runtime, &statuses);
+    // A `{ ...; }` group's own status is not a command failure: the commands
+    // inside it were checked as they ran.
+    if (background or (commands.len == 1 and commands[0].group != null)) return status;
+    strict.setPipeStatus(sh, if (statuses.len != 0) statuses else &.{status});
+    strict.commandDone(sh, status);
+    return status;
+}
+
+fn runStages(
+    sh: *Shell,
+    commands: []const ast.Command,
+    background: bool,
+    runtime: Runtime,
+    statuses_out: *[]const u8,
+) u8 {
     const arena = sh.scratch();
     if (commands.len == 0) return 0;
 
@@ -83,6 +110,7 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
 
     var stages: std.ArrayList(proc.Stage) = .empty;
     for (commands) |cmd| {
+        if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
         const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
         defer scope.restore();
 
@@ -105,6 +133,7 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
 
         const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
         const call_argv = argv.toOwnedSlice(arena) catch return 1;
+        strict.traceCommand(sh, call_argv);
         const stage = makeStage(sh, arena, call_argv, prepared.redirects, scope, runtime) catch |err| {
             return runtime.expression_error(sh, err);
         };
@@ -115,7 +144,9 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
 
     const text = pipelineText(arena, commands) catch "pipeline";
     if (background) return startBackground(sh, arena, stages.items, text, runtime.expression_error);
-    return runForeground(sh, arena, stages.items, text, runtime.expression_error);
+    const statuses = arena.alloc(u8, stages.items.len) catch return runtime.expression_error(sh, error.OutOfMemory);
+    statuses_out.* = statuses;
+    return waitStages(sh, arena, stages.items, text, runtime.expression_error, statuses);
 }
 
 fn makeStage(
@@ -147,6 +178,7 @@ fn runSingle(
     opened: *std.ArrayList(i32),
     runtime: Runtime,
 ) u8 {
+    if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
     if (expression.misuse(cmd.words)) |name| {
         expression.reportMisuse(sh, name);
         return 2;
@@ -154,13 +186,15 @@ fn runSingle(
 
     const words = command.resolveAliases(sh, arena, cmd.words) catch return 1;
     var argv: std.ArrayList([]const u8) = .empty;
+    sh.subst_status = null;
     expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
 
     const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
     if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null) {
-        // `NAME=value` on its own outlives the command line.
+        // `NAME=value` on its own outlives the command line. Like bash, a
+        // command with no words has the status of its last substitution.
         assign.persist(sh, arena, cmd.assigns) catch |err| return runtime.expression_error(sh, err);
-        return 0;
+        return sh.subst_status orelse 0;
     }
 
     const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
@@ -192,6 +226,7 @@ fn runSingle(
     const call_argv = argv.toOwnedSlice(arena) catch return 1;
     const name = call_argv[0];
     const text = pipelineText(arena, &.{cmd}) catch name;
+    strict.traceCommand(sh, call_argv);
 
     if (command.isInternal(sh, name) and !background) {
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
@@ -276,9 +311,29 @@ pub fn runForeground(
     text: []const u8,
     expression_error: ErrorHandler,
 ) u8 {
-    const launched = proc.launch(arena, stages, .{ .new_group = sh.job_control }) catch |err| return expression_error(sh, err);
+    const statuses = arena.alloc(u8, stages.len) catch return expression_error(sh, error.OutOfMemory);
+    return waitStages(sh, arena, stages, text, expression_error, statuses);
+}
+
+/// Runs `stages` as a foreground job, recording each one's status in
+/// `statuses`. With `set -o pipefail` the result is the last non-zero status.
+fn waitStages(
+    sh: *Shell,
+    arena: std.mem.Allocator,
+    stages: []const proc.Stage,
+    text: []const u8,
+    expression_error: ErrorHandler,
+    statuses: []u8,
+) u8 {
+    const interrupted_before = strict.interruptPending();
+    const launched = proc.launch(arena, stages, .{ .new_group = sh.job_control }) catch |err| {
+        const status = expression_error(sh, err);
+        @memset(statuses, status);
+        return status;
+    };
+    @memset(statuses, 0);
     const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, true) catch return 1;
-    const outcome = sh.waitForeground(job);
+    const outcome = sh.waitForegroundStages(job, statuses);
 
     if (outcome.stopped) {
         job.state = .stopped;
@@ -292,7 +347,13 @@ pub fn runForeground(
 
     if (sh.jobs.indexOf(job)) |index| sh.jobs.removeAt(sh.gpa, index);
     if (outcome.signal) |signal| reportSignal(sh, signal);
-    return outcome.status;
+    strict.foregroundDone(outcome.signal, interrupted_before);
+    if (!sh.options.pipefail) return outcome.status;
+    var status: u8 = 0;
+    for (statuses) |stage_status| {
+        if (stage_status != 0) status = stage_status;
+    }
+    return status;
 }
 
 fn reportSignal(sh: *Shell, signal: u32) void {

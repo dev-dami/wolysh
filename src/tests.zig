@@ -16,6 +16,10 @@ test {
     _ = @import("expand.zig");
     _ = @import("arith.zig");
     _ = @import("builtins.zig");
+    _ = @import("builtins/set.zig");
+    _ = @import("builtins/trap.zig");
+    _ = @import("quote.zig");
+    _ = @import("strict.zig");
     _ = @import("exec.zig");
     _ = @import("main.zig");
     _ = @import("interactive/editor.zig");

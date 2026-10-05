@@ -16,6 +16,7 @@ const command = @import("executor/command.zig");
 const expression = @import("executor/expression.zig");
 const function = @import("executor/function.zig");
 const pipeline = @import("executor/pipeline.zig");
+const strict = @import("strict.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -97,16 +98,16 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
         .pipeline => |chain| return runChain(sh, chain),
 
         .var_decl => |decl| {
-            const v = evalExpr(sh, arena, decl.value) catch |err| return exprError(sh, err);
+            const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, exprError(sh, err));
             sh.assignVar(decl.name, v) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
         .env_assign => |assign| {
-            const v = evalExpr(sh, arena, assign.value) catch |err| return exprError(sh, err);
+            const v = evalExpr(sh, arena, assign.value) catch |err| return statementFailed(sh, exprError(sh, err));
             const text = v.renderAlloc(arena) catch return 1;
             const final = switch (assign.op) {
                 .set => text,
@@ -117,13 +118,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
             };
             sh.assignEnv(assign.name, final) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, assign.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
         .if_ => |branch| {
-            const cond = evalExpr(sh, arena, branch.cond) catch |err| return exprError(sh, err);
+            const cond = evalCondition(sh, arena, branch.cond) catch |err| return exprError(sh, err);
             if (cond.truthy()) return runStmts(sh, branch.then.stmts);
             if (branch.else_) |else_block| return runStmts(sh, else_block.stmts);
             return 0;
@@ -165,6 +166,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
             return 0;
         },
     }
+}
+
+/// A failed `let` or `env` statement counts as a failed command for `set -e`
+/// and the ERR trap.
+fn statementFailed(sh: *Shell, status: u8) u8 {
+    strict.commandDone(sh, status);
+    return status;
 }
 
 fn exprError(sh: *Shell, err: anyerror) u8 {
@@ -311,7 +319,7 @@ fn runWhile(sh: *Shell, loop: ast.While) u8 {
     var status: u8 = 0;
     while (true) {
         _ = iter_arena.reset(.retain_capacity);
-        const cond = evalExpr(sh, outer, loop.cond) catch |err| return exprError(sh, err);
+        const cond = evalCondition(sh, outer, loop.cond) catch |err| return exprError(sh, err);
         if (!cond.truthy()) break;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
@@ -332,12 +340,24 @@ fn evalExpr(sh: *Shell, arena: std.mem.Allocator, expr: *const ast.Expr) Error!V
     return expression.evaluate(sh, arena, expr, executeExpressionCall);
 }
 
+/// An `if`/`while` test: commands it runs may fail without `set -e` or the
+/// ERR trap firing.
+fn evalCondition(sh: *Shell, arena: std.mem.Allocator, expr: *const ast.Expr) Error!Value {
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
+    return evalExpr(sh, arena, expr);
+}
+
 fn executeExpressionCall(sh: *Shell, arena: std.mem.Allocator, callee: []const u8, args: []const *ast.Expr) Error!Value {
     const argv = try arena.alloc([]const u8, args.len + 1);
     argv[0] = callee;
     for (args, 0..) |arg, index| {
         argv[index + 1] = try (try evalExpr(sh, arena, arg)).renderAlloc(arena);
     }
+    // A call in an expression is a test whose result becomes a value, so a
+    // failure is not an error.
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
 
     if (command.isInternal(sh, callee)) {
         return Value{ .boolean = command.dispatch(sh, argv, commandRuntime()) == 0 };
