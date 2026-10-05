@@ -17,6 +17,7 @@ test {
     _ = @import("arith.zig");
     _ = @import("builtins.zig");
     _ = @import("builtins/printf.zig");
+    _ = @import("builtins/strftime.zig");
     _ = @import("builtins/options.zig");
     _ = @import("builtins/read.zig");
     _ = @import("builtins/describe.zig");

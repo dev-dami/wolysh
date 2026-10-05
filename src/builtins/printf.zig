@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtins = @import("../builtins.zig");
+const strftime = @import("strftime.zig");
 
 const Ctx = builtins.Ctx;
 const Allocator = std.mem.Allocator;
@@ -215,8 +216,19 @@ const Printer = struct {
                 },
                 'e', 'E', 'f', 'F', 'g', 'G', 'a', 'A' => try self.float(spec, conversion, self.floatArg()),
                 '(' => {
-                    self.ctx.err("wsh: printf: %(...)T time conversions are not supported\n");
-                    return .fail;
+                    const close = std.mem.indexOfScalarPos(u8, text, i, ')') orelse {
+                        self.ctx.err("wsh: printf: `(': missing closing parenthesis\n");
+                        return .fail;
+                    };
+                    if (close + 1 >= text.len or text[close + 1] != 'T') {
+                        self.ctx.err("wsh: printf: `(': time conversions are written %(format)T\n");
+                        return .fail;
+                    }
+                    const time_format = text[i..close];
+                    i = close + 2;
+                    var stamp: ?[]const u8 = null;
+                    try self.time(spec, time_format, &stamp);
+                    if (stamp == null) return .fail;
                 },
                 else => {
                     self.ctx.errFmt("wsh: printf: `{c}': invalid format character\n", .{conversion});
@@ -255,6 +267,43 @@ const Printer = struct {
             },
         }
         return i;
+    }
+
+    /// `%(format)T`: the argument is seconds since the epoch, -1 (or no
+    /// argument) is now. `stamp` stays null after a reported error.
+    fn time(self: *Printer, spec: Spec, time_format: []const u8, stamp: *?[]const u8) Allocator.Error!void {
+        var seconds: i64 = -1;
+        if (self.next < self.args.len) seconds = self.signedArg();
+        if (seconds == -1) {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+            seconds = ts.sec;
+        } else if (seconds == -2) {
+            self.ctx.err("wsh: printf: -2: the shell start time is not recorded\n");
+            return;
+        }
+        const tz = try self.timeZoneSetting();
+        const zone = strftime.load(self.arena, tz) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidTimeZone => {
+                self.ctx.errFmt("wsh: printf: TZ: cannot load time zone `{s}'\n", .{tz.?});
+                return;
+            },
+        };
+        var formatted: std.ArrayList(u8) = .empty;
+        try strftime.format(self.arena, &formatted, if (time_format.len == 0) "%X" else time_format, strftime.localTime(zone, seconds));
+        try self.pad(spec, "", truncate(formatted.items, spec.precision), false);
+        stamp.* = formatted.items;
+    }
+
+    fn timeZoneSetting(self: *Printer) Allocator.Error!?[]const u8 {
+        if (self.ctx.sh.getVar("TZ")) |v| {
+            return switch (v) {
+                .string => |s| s,
+                else => v.renderAlloc(self.arena) catch return error.OutOfMemory,
+            };
+        }
+        return self.ctx.sh.getEnv("TZ");
     }
 
     fn signedArg(self: *Printer) i64 {

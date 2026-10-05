@@ -284,7 +284,15 @@ pub fn hashBuiltin(ctx: Ctx) u8 {
             status = 1;
             continue;
         }
-        if (!report and std.mem.indexOfScalar(u8, name, '/') == null and (isBuiltinName(name) or ctx.sh.getFunc(name) != null)) continue;
+        // Builtins and functions are found without PATH: valid for `hash NAME`,
+        // but `-t` has no path to report for them.
+        if (std.mem.indexOfScalar(u8, name, '/') == null and (isBuiltinName(name) or ctx.sh.getFunc(name) != null)) {
+            if (report) {
+                ctx.errFmt("wsh: hash: {s}: not found\n", .{name});
+                status = 1;
+            }
+            continue;
+        }
         const path = (proc.resolve(arena, name, ctx.sh.pathEnv()) catch null) orelse {
             ctx.errFmt("wsh: hash: {s}: not found\n", .{name});
             status = 1;

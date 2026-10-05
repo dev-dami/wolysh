@@ -146,6 +146,16 @@ class PrintfTests(unittest.TestCase):
         self.assertEqual(result.stderr, b"wsh: printf: abc: invalid number\n")
         self.assertEqual(result.returncode, 1)
 
+    def test_time_conversion_matches_bash(self):
+        command = ("printf '%(%F %T %a %b %e %j %z %Z)T|%(%s %U %W %V %G)T\\n' 0 0 1719835200 1719835200 "
+                   "1705320000 1705320000 4102444800 4102444800; printf '[%20(%F)T][%-6(%y)T][%.4(%Y)T]\\n' 0 0 0")
+        for tz in ("UTC", "Europe/London", "America/New_York", "AEST-10AEDT,M10.1.0,M4.1.0/3"):
+            with self.subTest(tz=tz):
+                env = dict(os.environ, TZ=tz, LC_ALL="C")
+                self.assertEqual(run_shell(command, env=env).stdout, run_bash(command, env=env).stdout)
+        now = run_shell("printf '%(%s)T'")
+        self.assertLess(abs(int(now.stdout) - int(time.time())), 5)
+
     def test_printf_v_assigns(self):
         result = run_shell("printf -v out '%s-%03d' x 7; echo \"[$out]\"")
         self.assertEqual(result.stdout, b"[x-007]\n")
