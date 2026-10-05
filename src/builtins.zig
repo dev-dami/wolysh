@@ -14,6 +14,8 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const arrays = @import("arrays.zig");
+const declare_builtin = @import("builtins/declare.zig");
 
 const Shell = shellmod.Shell;
 
@@ -442,6 +444,10 @@ fn builtinUnset(ctx: Ctx) u8 {
     var i: usize = 1;
     while (i < ctx.argv.len) : (i += 1) {
         const name = ctx.argv[i];
+        if (arrays.unsetElement(ctx.sh, name)) |element_status| {
+            status |= element_status;
+            continue;
+        }
         if (ctx.sh.isReadonly(name)) {
             ctx.errFmt("wsh: unset: {s}: readonly variable\n", .{name});
             status = 1;
@@ -476,31 +482,7 @@ fn builtinSet(ctx: Ctx) u8 {
 }
 
 fn builtinLocal(ctx: Ctx) u8 {
-    if (ctx.argv.len < 2) {
-        ctx.err("wsh: local: expected a name\n");
-        return 1;
-    }
-    var status: u8 = 0;
-    for (ctx.argv[1..]) |spec| {
-        const at = std.mem.indexOfScalar(u8, spec, '=');
-        const name = if (at) |i| spec[0..i] else spec;
-        if (!validName(name)) {
-            ctx.errFmt("wsh: local: '{s}' is not a valid name\n", .{name});
-            status = 1;
-            continue;
-        }
-        if (ctx.sh.isReadonly(name)) {
-            ctx.errFmt("wsh: local: {s}: readonly variable\n", .{name});
-            status = 1;
-            continue;
-        }
-        const text = if (at) |i| spec[i + 1 ..] else "";
-        ctx.sh.setLocal(name, .{ .string = text }) catch {
-            ctx.errFmt("wsh: local: {s}: readonly variable\n", .{name});
-            return 1;
-        };
-    }
-    return status;
+    return declare_builtin.local(ctx);
 }
 
 fn builtinReadonly(ctx: Ctx) u8 {
@@ -1578,6 +1560,8 @@ const table = [_]Builtin{
     .{ .name = "unset", .summary = "remove a variable", .run = builtinUnset },
     .{ .name = "set", .summary = "list or set shell variables", .run = builtinSet },
     .{ .name = "local", .summary = "declare a function-local variable", .run = builtinLocal },
+    .{ .name = "declare", .summary = "set variable attributes and arrays", .run = declare_builtin.declare },
+    .{ .name = "typeset", .summary = "set variable attributes and arrays", .run = declare_builtin.declare },
     .{ .name = "readonly", .summary = "mark variables readonly", .run = builtinReadonly },
     .{ .name = "alias", .summary = "define or list aliases", .run = builtinAlias },
     .{ .name = "unalias", .summary = "remove an alias", .run = builtinUnalias },

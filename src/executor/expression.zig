@@ -77,6 +77,11 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
             }
             return context.execute_call(sh, arena, call.callee, call.args);
         },
+        .index => |indexing| {
+            const target = try evaluateInner(context, sh, arena, indexing.target);
+            const key = try evaluateInner(context, sh, arena, indexing.index);
+            return expression_functions.indexValue(sh, arena, target, key);
+        },
     }
 }
 

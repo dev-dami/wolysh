@@ -191,6 +191,8 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             return 1;
         },
         error.ExecutionFailed => return 1,
+        error.BadSubstitution => return expansionFailed(sh, 1),
+        error.UnboundVariable => return expansionFailed(sh, 127),
         error.ReadonlyVariable => {
             sys.writeStr(sh.default_err, "wsh: readonly variable\n");
             return 1;
@@ -202,6 +204,15 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             return 2;
         },
     }
+}
+
+/// A failed `${...}` (its message already printed) aborts the command, and a
+/// non-interactive shell exits as bash does.
+fn expansionFailed(sh: *Shell, status: u8) u8 {
+    if (sh.interactive) return 1;
+    sh.should_exit = true;
+    sh.exit_code = status;
+    return status;
 }
 
 fn reportReadonly(sh: *Shell, name: []const u8) void {

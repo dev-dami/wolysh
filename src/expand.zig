@@ -12,6 +12,11 @@ const shell = @import("shell.zig");
 const glob = @import("glob.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
+const sys = @import("sys.zig");
+const arrays = @import("arrays.zig");
+const compound = @import("compound.zig");
+const param_ops = @import("param_ops.zig");
+const special_vars = @import("special_vars.zig");
 
 pub const Error = error{
     UnterminatedSubstitution,
@@ -19,13 +24,29 @@ pub const Error = error{
     UnsupportedArithmetic,
     InvalidArithmetic,
     DivisionByZero,
+    /// A malformed or failed `${...}`; the message has been printed.
+    BadSubstitution,
+    /// `set -u` met an unset parameter, or `${name?word}` fired; the message
+    /// has been printed.
+    UnboundVariable,
 } || std.mem.Allocator.Error;
+
+/// Writes an expansion error to the shell's stderr.
+pub fn report(sh: *const shell.Shell, comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    w.print(fmt, args) catch {};
+    sys.writeStr(sh.default_err, w.buffered());
+}
 
 const Mode = enum {
     /// A word in a command position: split on whitespace, then glob.
     command_word,
     /// A single value: no splitting, no globbing.
     literal,
+    /// A `${name#pattern}` operand: one value in which quoted characters are
+    /// backslash-escaped, so they match literally.
+    pattern,
 };
 
 fn isSpaceByte(c: u8) bool {
@@ -38,12 +59,6 @@ fn isIdentStart(c: u8) bool {
 
 fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
-}
-
-fn allDigits(text: []const u8) bool {
-    if (text.len == 0) return false;
-    for (text) |c| if (!std.ascii.isDigit(c)) return false;
-    return true;
 }
 
 /// The field-splitting separators in force. `seps` borrows from the caller's
@@ -103,10 +118,50 @@ pub fn expandCommand(
     for (words, 0..) |word, index| {
         if (index == 0) {
             try expandWord(sh, arena, word, out);
+        } else if (out.items.len > 0 and isDeclaration(out.items[0])) {
+            try expandDeclarationArgument(sh, arena, word, out);
         } else {
             try expandArgument(sh, arena, word, out);
         }
     }
+}
+
+fn isDeclaration(name: []const u8) bool {
+    return std.mem.eql(u8, name, "declare") or std.mem.eql(u8, name, "typeset") or std.mem.eql(u8, name, "local");
+}
+
+/// An argument of `declare`, `typeset` or `local`. An unquoted `NAME=(...)`
+/// reaches the builtin unexpanded behind `compound.marker`, because only the
+/// builtin knows whether it builds an indexed or an associative array.
+/// `NAME=value` expands like an assignment: no splitting, no globbing. Names
+/// are never replaced by a variable's value.
+fn expandDeclarationArgument(
+    sh: *shell.Shell,
+    arena: std.mem.Allocator,
+    word: []const u8,
+    out: *std.ArrayList([]const u8),
+) Error!void {
+    if (compound.openParen(word) != null and word[word.len - 1] == ')') {
+        try out.append(arena, try std.mem.concat(arena, u8, &.{ &.{compound.marker}, word }));
+        return;
+    }
+    if (assignmentEquals(word)) |eq| {
+        const assigned = try expandLiteral(sh, arena, word[eq + 1 ..]);
+        try out.append(arena, try std.mem.concat(arena, u8, &.{ word[0 .. eq + 1], assigned }));
+        return;
+    }
+    try expandWord(sh, arena, word, out);
+}
+
+/// The `=` of an unquoted `NAME=`, `NAME+=` or `NAME[subscript]=` prefix.
+fn assignmentEquals(word: []const u8) ?usize {
+    if (word.len == 0 or !isIdentStart(word[0])) return null;
+    var i: usize = 1;
+    while (i < word.len and isIdentChar(word[i])) i += 1;
+    if (i < word.len and word[i] == '[') i = (compound.closeBracket(word, i) orelse return null) + 1;
+    if (i < word.len and word[i] == '+') i += 1;
+    if (i < word.len and word[i] == '=') return i;
+    return null;
 }
 
 fn expandArgument(
@@ -141,6 +196,7 @@ pub const Expander = struct {
     /// "print the value of `file`".
     bare_vars: bool = false,
     scratch: [256]u8 = undefined,
+    flag_buf: [8]u8 = undefined,
 
     // --- field handling -----------------------------------------------------
 
@@ -159,6 +215,12 @@ pub const Expander = struct {
             try self.buf.appendSlice(self.arena, bytes);
             return;
         }
+        if (self.mode == .pattern) {
+            // Every byte, so `&` in a replacement and extglob operators stay
+            // literal too.
+            for (bytes) |b| try self.buf.appendSlice(self.arena, &.{ '\\', b });
+            return;
+        }
         for (bytes) |b| {
             switch (b) {
                 ' ', '\t', '\n', '\r', '*', '?', '[', ']', '\\' => {
@@ -172,7 +234,7 @@ pub const Expander = struct {
 
     /// Appends an unquoted value, splitting it into fields on `IFS`.
     fn appendSplitRaw(self: *Expander, bytes: []const u8) Error!void {
-        if (self.mode == .literal) return self.appendRaw(bytes);
+        if (self.mode != .command_word) return self.appendRaw(bytes);
         if (bytes.len == 0) return;
         var seps: [64]u8 = undefined;
         const ifs = self.ifsSpec(&seps);
@@ -200,8 +262,21 @@ pub const Expander = struct {
             }
             const start = i;
             while (i < bytes.len and !isIfsSep(bytes[i], ifs)) i += 1;
-            try self.appendRaw(bytes[start..i]);
+            try self.appendExpanded(bytes[start..i]);
         }
+    }
+
+    /// Expansion output keeps its glob characters live, but a backslash in it
+    /// is data, not an escape: `x='a\b'; echo $x` prints `a\b`.
+    fn appendExpanded(self: *Expander, bytes: []const u8) Error!void {
+        var start: usize = 0;
+        for (bytes, 0..) |b, i| {
+            if (b != '\\') continue;
+            try self.appendRaw(bytes[start..i]);
+            try self.appendRaw("\\\\");
+            start = i + 1;
+        }
+        try self.appendRaw(bytes[start..]);
     }
 
     /// Ends the current field. A delimiter with nothing before it still yields
@@ -226,7 +301,7 @@ pub const Expander = struct {
     /// Emits the pending field, globbing it when it still has live
     /// metacharacters. Does nothing in literal mode.
     fn flush(self: *Expander) Error!void {
-        if (self.mode == .literal) return;
+        if (self.mode != .command_word) return;
         if (!self.active) {
             self.buf.clearRetainingCapacity();
             return;
@@ -273,7 +348,8 @@ pub const Expander = struct {
         // be split on whitespace or globbed.
         if (self.bare_vars) {
             if (bareIdentifier(word)) |name| {
-                if (self.sh.getVar(name)) |v| {
+                // Stored variables only: `echo UID` stays a word.
+                if (self.sh.vars.get(name)) |v| {
                     try self.appendQuoted(self.renderValue(v));
                     try self.flush();
                     return;
@@ -330,9 +406,9 @@ pub const Expander = struct {
                     i = if (end < word.len) end + 1 else word.len;
                 },
                 else => {
-                    // Bare whitespace cannot reach here from the lexer, but if
-                    // it does it separates fields.
-                    if (isSpaceByte(c)) {
+                    // Bare whitespace reaches here only from a `${x:-a b}`
+                    // operand, where it separates fields.
+                    if (isSpaceByte(c) and self.mode == .command_word) {
                         try self.flush();
                     } else {
                         try self.appendRaw(word[i .. i + 1]);
@@ -441,7 +517,10 @@ pub const Expander = struct {
                     return Error.UnterminatedSubstitution;
                 };
                 if (start + 2 < s.len and s[start + 2] == '(') {
-                    const result = try arith.evaluate(self.sh, self.arena, s[start + 3 .. close - 1]);
+                    // As in bash, `${a[i]}` and `${#a[@]}` expand before the
+                    // arithmetic is evaluated.
+                    const expr = try expandLiteral(self.sh, self.arena, s[start + 3 .. close - 1]);
+                    const result = try arith.evaluate(self.sh, self.arena, expr);
                     try self.emit(self.intText(result), quoted);
                 } else {
                     try self.substitute(s[start + 2 .. close], quoted);
@@ -456,42 +535,23 @@ pub const Expander = struct {
                 try self.emit(self.intText(self.sh.pid), quoted);
                 i.* = start + 2;
             },
-            '!' => {
-                try self.emit(self.intText(self.sh.last_bg_pid), quoted);
-                i.* = start + 2;
-            },
             '#' => {
                 try self.emit(self.intText(self.sh.positional.len), quoted);
-                i.* = start + 2;
-            },
-            '@' => {
-                try self.emitPositionals(quoted);
-                i.* = start + 2;
-            },
-            '*' => {
-                try self.emitStar(quoted);
                 i.* = start + 2;
             },
             '-' => {
                 try self.emit(self.optionLetters(), quoted);
                 i.* = start + 2;
             },
-            '0'...'9' => {
-                const idx = s[start + 1] - '0';
-                const text = if (idx == 0)
-                    self.sh.script_name
-                else if (idx <= self.sh.positional.len)
-                    self.sh.positional[idx - 1]
-                else
-                    "";
-                try self.emit(text, quoted);
+            '!', '@', '*', '0'...'9' => {
+                try self.expandSimple(s[start + 1 .. start + 2], quoted);
                 i.* = start + 2;
             },
             else => {
                 if (isIdentStart(next)) {
                     var j = start + 1;
                     while (j < s.len and isIdentChar(s[j])) j += 1;
-                    try self.emit(self.lookup(s[start + 1 .. j]), quoted);
+                    try self.expandSimple(s[start + 1 .. j], quoted);
                     i.* = j;
                 } else {
                     try self.appendRaw("$");
@@ -505,31 +565,26 @@ pub const Expander = struct {
         return std.fmt.bufPrint(&self.scratch, "{d}", .{n}) catch "0";
     }
 
-    /// `$@`: quoted, one field per positional parameter (so `"$@"` with no
-    /// parameters yields no field); unquoted, each parameter is split.
-    fn emitPositionals(self: *Expander, quoted: bool) Error!void {
-        const params = self.sh.positional;
-        for (params, 0..) |p, idx| {
-            if (idx != 0) try self.flush();
-            if (quoted) try self.appendQuoted(p) else try self.appendSplitRaw(p);
-        }
-        if (quoted and params.len == 0 and self.buf.items.len == 0) self.active = false;
-    }
-
-    /// `$*`: quoted, the parameters joined by the first character of `IFS` in
-    /// one field (empty when there are none); unquoted, the same joined text is
-    /// field-split.
-    fn emitStar(self: *Expander, quoted: bool) Error!void {
-        var seps: [64]u8 = undefined;
-        const ifs = self.ifsSpec(&seps);
-        const sep: []const u8 = if (!ifs.user_set) " " else if (ifs.seps.len > 0) ifs.seps[0..1] else "";
-        const params = self.sh.positional;
-        for (params, 0..) |p, idx| {
-            if (idx != 0) {
-                if (quoted) try self.appendQuoted(sep) else try self.appendSplitRaw(sep);
+    /// The fields of `$@`, `${name[@]}` and similar. `@`, quoted: one field
+    /// per item, so `"$@"` with no parameters yields no field. `*`, quoted:
+    /// the items joined by the first character of `IFS` in one field (empty
+    /// when there are none). Unquoted, each item is split. A single-value
+    /// context such as an assignment joins `@` with spaces and `*` with `IFS`.
+    fn emitList(self: *Expander, items: []const []const u8, star: bool, quoted: bool) Error!void {
+        if (star or self.mode != .command_word) {
+            const sep = if (star) self.starSeparator() else " ";
+            if (self.mode != .command_word) self.active = true;
+            for (items, 0..) |item, idx| {
+                if (idx != 0) try self.emit(sep, quoted);
+                try self.emit(item, quoted);
             }
-            if (quoted) try self.appendQuoted(p) else try self.appendSplitRaw(p);
+            return;
         }
+        for (items, 0..) |item, idx| {
+            if (idx != 0) try self.flush();
+            if (quoted) try self.appendQuoted(item) else try self.appendSplitRaw(item);
+        }
+        if (quoted and items.len == 0 and self.buf.items.len == 0) self.active = false;
     }
 
     /// `$-`: the option letters the shell is running with.
@@ -607,82 +662,474 @@ pub const Expander = struct {
         return std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{ prefix, mid, suffix });
     }
 
-    /// `${name}`, `${#name}`, `${name:-fallback}` and `${name:+alternate}`.
-    /// `name` may also be a positional parameter (`${1}`, `${10}`) or one of
-    /// the special parameters.
-    fn expandBraced(self: *Expander, inner: []const u8, quoted: bool) Error!void {
-        if (inner.len == 0) {
-            try self.appendRaw("$");
-            return;
-        }
+    // --- parameters ---------------------------------------------------------
 
-        // `${@}` and `${*}` keep their field semantics.
-        if (std.mem.eql(u8, inner, "@")) return self.emitPositionals(quoted);
-        if (std.mem.eql(u8, inner, "*")) return self.emitStar(quoted);
+    /// The value of one parameter: a single string, or the fields of `$@`,
+    /// `${name[@]}` and the other multi-field forms.
+    const Param = struct {
+        set: bool,
+        list: bool = false,
+        /// `*` rather than `@`: quoted, the fields join into one.
+        star: bool = false,
+        text: []const u8 = "",
+        items: []const []const u8 = &.{},
+        /// Each item's array index, for `${name[@]:offset}` on a sparse array;
+        /// null means the items are numbered from 0.
+        indices: ?[]const usize = null,
+        /// `$@` and `$*`, where offset 0 of `${@:offset}` is `$0`.
+        positional: bool = false,
+        /// `${scalar[@]}`, whose `${x[@]:offset}` slices the string.
+        scalar: bool = false,
+        /// `${name[@]}` of a variable that does not exist, as opposed to an
+        /// empty array; `set -u` rejects only the former's length.
+        undeclared: bool = false,
+    };
 
-        if (inner[0] == '#') {
-            // `${#}` is the positional count; `${#name}` is the length of name.
-            const text = if (inner.len == 1 or inner[1] == '@' or inner[1] == '*')
-                self.intText(self.sh.positional.len)
-            else
-                self.intText(self.lookup(inner[1..]).len);
-            try self.emit(text, quoted);
-            return;
-        }
-        if (std.mem.indexOf(u8, inner, ":-")) |at| {
-            const val = self.paramText(inner[0..at]);
-            try self.emit(if (val.len == 0) inner[at + 2 ..] else val, quoted);
-            return;
-        }
-        if (std.mem.indexOf(u8, inner, ":+")) |at| {
-            const val = self.paramText(inner[0..at]);
-            try self.emit(if (val.len != 0) inner[at + 2 ..] else "", quoted);
-            return;
-        }
-        try self.emit(self.paramText(inner), quoted);
+    /// `$name`, `$1`, `$!` and the other unbraced forms.
+    fn expandSimple(self: *Expander, name: []const u8, quoted: bool) Error!void {
+        const p = try self.resolve(name, null);
+        try self.requireSet(p, .{ .name = name, .subscript = null });
+        try self.emitParam(p, quoted);
     }
 
-    /// Resolves one parameter name (the text inside `${...}` or after `$`) to a
-    /// single value: positional parameters, the special parameters, then shell
-    /// variables and the environment.
-    fn paramText(self: *Expander, name: []const u8) []const u8 {
-        if (name.len == 1) {
-            switch (name[0]) {
-                '?' => return self.intText(self.sh.last_status),
-                '$' => return self.intText(self.sh.pid),
-                '!' => return self.intText(self.sh.last_bg_pid),
-                '-' => return self.optionLetters(),
-                '@', '*' => {
-                    var out: std.ArrayList(u8) = .empty;
-                    const sep: []const u8 = if (name[0] == '@') " " else self.starSeparator();
-                    for (self.sh.positional, 0..) |p, idx| {
-                        if (idx != 0) out.appendSlice(self.arena, sep) catch return "";
-                        out.appendSlice(self.arena, p) catch return "";
-                    }
-                    return out.items;
+    /// `${...}`; `Braced` lists the forms.
+    fn expandBraced(self: *Expander, inner: []const u8, quoted: bool) Error!void {
+        const b = parseBraced(inner) orelse {
+            report(self.sh, "wsh: ${{{s}}}: bad substitution\n", .{inner});
+            return error.BadSubstitution;
+        };
+        switch (b.op) {
+            .names => return self.emitList(try self.namesWithPrefix(b.name), b.star, quoted),
+            .keys => return self.emitList(try self.keysOf(b.name), b.star, quoted),
+            else => {},
+        }
+        const ref = Label{ .name = b.name, .subscript = b.subscript };
+        const p = if (b.indirect) try self.resolveIndirect(b.name, b.subscript) else try self.resolve(b.name, b.subscript);
+        switch (b.op) {
+            .names, .keys => unreachable,
+            .none => {
+                try self.requireSet(p, ref);
+                return self.emitParam(p, quoted);
+            },
+            .length => {
+                if (p.list) {
+                    if (p.undeclared) try self.requireSet(.{ .set = false }, ref);
+                    return self.emit(try self.number(p.items.len), quoted);
+                }
+                try self.requireSet(p, ref);
+                return self.emit(try self.number(param_ops.charCount(p.text)), quoted);
+            },
+            .use_default => {
+                if (isMissing(p, b.colon)) return self.emitOperand(b.word, quoted);
+                return self.emitParam(p, quoted);
+            },
+            .use_alternate => {
+                if (!isMissing(p, b.colon)) return self.emitOperand(b.word, quoted);
+            },
+            .assign_default => {
+                if (!isMissing(p, b.colon)) return self.emitParam(p, quoted);
+                if (b.indirect or !isIdentStart(b.name[0])) {
+                    report(self.sh, "wsh: {f}: cannot assign in this way\n", .{ref});
+                    return error.BadSubstitution;
+                }
+                try self.assignParam(b.name, b.subscript, try self.operandText(b.word));
+                return self.emitParam(try self.resolve(b.name, b.subscript), quoted);
+            },
+            .fail_unset => {
+                if (!isMissing(p, b.colon)) return self.emitParam(p, quoted);
+                const message = if (b.word.len != 0)
+                    try self.operandText(b.word)
+                else if (b.colon) "parameter null or not set" else "parameter not set";
+                report(self.sh, "wsh: {f}: {s}\n", .{ ref, message });
+                return error.UnboundVariable;
+            },
+            .substring => {
+                try self.requireSet(p, ref);
+                return self.emitParam(try self.substring(p, b.word, b.word2), quoted);
+            },
+            .transform => {
+                try self.requireSet(p, ref);
+                switch (b.word[0]) {
+                    'A' => return self.emit(try self.assignmentText(b.name, p), quoted),
+                    'K' => return self.emit(try self.keyValueText(b.name, p), quoted),
+                    else => return self.emitParam(try self.applyOperator(p, b), quoted),
+                }
+            },
+            .remove_prefix, .remove_suffix, .replace, .upper, .lower => {
+                try self.requireSet(p, ref);
+                return self.emitParam(try self.applyOperator(p, b), quoted);
+            },
+        }
+    }
+
+    fn emitParam(self: *Expander, p: Param, quoted: bool) Error!void {
+        if (p.list) return self.emitList(p.items, p.star, quoted);
+        return self.emit(p.text, quoted);
+    }
+
+    /// `set -u`: an unset parameter is an error, except the multi-field forms.
+    fn requireSet(self: *Expander, p: Param, ref: Label) Error!void {
+        if (p.set or p.list or !self.sh.options.nounset) return;
+        report(self.sh, "wsh: {f}: unbound variable\n", .{ref});
+        return error.UnboundVariable;
+    }
+
+    fn resolve(self: *Expander, name: []const u8, subscript: ?[]const u8) Error!Param {
+        const sh = self.sh;
+        if (std.ascii.isDigit(name[0])) {
+            const idx = std.fmt.parseInt(usize, name, 10) catch return .{ .set = false };
+            if (idx == 0) return .{ .set = true, .text = sh.script_name };
+            if (idx <= sh.positional.len) return .{ .set = true, .text = sh.positional[idx - 1] };
+            return .{ .set = false };
+        }
+        if (!isIdentStart(name[0])) {
+            return switch (name[0]) {
+                '@', '*' => .{
+                    .set = sh.positional.len != 0,
+                    .list = true,
+                    .star = name[0] == '*',
+                    .items = sh.positional,
+                    .positional = true,
                 },
-                else => {},
+                '#' => .{ .set = true, .text = try self.number(sh.positional.len) },
+                '?' => .{ .set = true, .text = try self.number(sh.last_status) },
+                '$' => .{ .set = true, .text = try self.number(sh.pid) },
+                '!' => if (sh.last_bg_pid == 0) .{ .set = false } else .{ .set = true, .text = try self.number(sh.last_bg_pid) },
+                '-' => .{ .set = true, .text = try self.arena.dupe(u8, self.optionLetters()) },
+                else => .{ .set = false },
+            };
+        }
+        const v = variable(sh, name);
+        const sub = subscript orelse {
+            // wsh rule: `$list` without a subscript is every element.
+            const val = v orelse return .{ .set = false };
+            return .{ .set = true, .text = try self.textOf(val) };
+        };
+        if (isAllSubscript(sub)) return self.allItems(v, sub[0] == '*');
+        return self.element(name, v, sub);
+    }
+
+    /// `${name[@]}`: the set elements in index order. A scalar is a
+    /// one-element array.
+    fn allItems(self: *Expander, v: ?value.Value, star: bool) Error!Param {
+        const val = v orelse return .{ .set = false, .list = true, .star = star, .undeclared = true };
+        var items: std.ArrayList([]const u8) = .empty;
+        var indices: std.ArrayList(usize) = .empty;
+        switch (val) {
+            .list => |list| for (list, 0..) |item, i| {
+                if (item == .none) continue;
+                try items.append(self.arena, try self.textOf(item));
+                try indices.append(self.arena, i);
+            },
+            .map => |entries| for (entries, 0..) |entry, i| {
+                if (entry.value == .none) continue;
+                try items.append(self.arena, try self.textOf(entry.value));
+                try indices.append(self.arena, i);
+            },
+            else => {
+                try items.append(self.arena, try self.textOf(val));
+                try indices.append(self.arena, 0);
+            },
+        }
+        return .{
+            .set = items.items.len != 0,
+            .list = true,
+            .star = star,
+            .items = items.items,
+            .indices = indices.items,
+            .scalar = val != .list and val != .map,
+        };
+    }
+
+    /// `${name[subscript]}`: an arithmetic index for an indexed array (negative
+    /// counts from the end), a key for an associative one.
+    fn element(self: *Expander, name: []const u8, v: ?value.Value, subscript: []const u8) Error!Param {
+        const val = v orelse return .{ .set = false };
+        if (val == .map) {
+            const key = try expandLiteral(self.sh, self.arena, subscript);
+            for (val.map) |entry| {
+                if (!std.mem.eql(u8, entry.key, key)) continue;
+                if (entry.value == .none) break;
+                return .{ .set = true, .text = try self.textOf(entry.value) };
+            }
+            return .{ .set = false };
+        }
+        const n = try self.arithOperand(subscript);
+        const len: usize = if (val == .list) val.list.len else 1;
+        const index: i64 = if (n < 0) n + @as(i64, @intCast(len)) else n;
+        if (index < 0) {
+            report(self.sh, "wsh: {s}: bad array subscript\n", .{name});
+            return .{ .set = false };
+        }
+        if (index >= len) return .{ .set = false };
+        const item = if (val == .list) val.list[@intCast(index)] else val;
+        if (item == .none) return .{ .set = false };
+        return .{ .set = true, .text = try self.textOf(item) };
+    }
+
+    /// `${!name}`: the parameter that `name`'s value names.
+    fn resolveIndirect(self: *Expander, name: []const u8, subscript: ?[]const u8) Error!Param {
+        const ref = try self.resolve(name, subscript);
+        if (!ref.set or ref.list) {
+            report(self.sh, "wsh: {f}: invalid indirect expansion\n", .{Label{ .name = name, .subscript = subscript }});
+            return error.BadSubstitution;
+        }
+        const target = ref.text;
+        if ((paramLength(target) orelse 0) != target.len or target.len == 0) {
+            report(self.sh, "wsh: {s}: invalid variable name\n", .{target});
+            return error.BadSubstitution;
+        }
+        const t = splitParam(target);
+        return self.resolve(t.name, t.subscript);
+    }
+
+    /// `${!prefix*}`: the names of set variables starting with `prefix`.
+    fn namesWithPrefix(self: *Expander, prefix: []const u8) Error![]const []const u8 {
+        const sh = self.sh;
+        var names: std.ArrayList([]const u8) = .empty;
+        var vars = sh.vars.iterator();
+        while (vars.next()) |entry| {
+            if (entry.value_ptr.* == .none or !std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            try names.append(self.arena, entry.key_ptr.*);
+        }
+        var env = sh.env.iterator();
+        while (env.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.startsWith(u8, name, prefix) and !sh.vars.contains(name)) try names.append(self.arena, name);
+        }
+        for (special_vars.names) |name| {
+            if (std.mem.startsWith(u8, name, prefix) and !sh.vars.contains(name) and sh.env.get(name) == null) {
+                try names.append(self.arena, name);
             }
         }
-        if (allDigits(name)) {
-            const idx = std.fmt.parseInt(usize, name, 10) catch return "";
-            if (idx == 0) return self.sh.script_name;
-            return if (idx <= self.sh.positional.len) self.sh.positional[idx - 1] else "";
-        }
-        return self.lookup(name);
+        std.mem.sort([]const u8, names.items, {}, lessThan);
+        return names.items;
     }
 
+    /// `${!name[@]}`: the indices of the set elements, or the keys.
+    fn keysOf(self: *Expander, name: []const u8) Error![]const []const u8 {
+        const val = variable(self.sh, name) orelse return &.{};
+        var keys: std.ArrayList([]const u8) = .empty;
+        switch (val) {
+            .list => |list| for (list, 0..) |item, i| {
+                if (item != .none) try keys.append(self.arena, try self.number(i));
+            },
+            .map => |entries| for (entries) |entry| try keys.append(self.arena, entry.key),
+            else => try keys.append(self.arena, "0"),
+        }
+        return keys.items;
+    }
+
+    /// `${name:offset}` and `${name:offset:length}`: characters of a string,
+    /// or elements of a list (`$@` counts `$0` as offset 0).
+    fn substring(self: *Expander, p: Param, offset_text: []const u8, length_text: ?[]const u8) Error!Param {
+        const offset = try self.arithOperand(offset_text);
+        const length: ?i64 = if (length_text) |text| try self.arithOperand(text) else null;
+        if (!p.list) return .{ .set = true, .text = try self.substringText(p.text, offset, length) };
+        if (p.scalar) {
+            const text = try self.substringText(p.items[0], offset, length);
+            return .{ .set = true, .list = true, .star = p.star, .items = try self.arena.dupe([]const u8, &.{text}) };
+        }
+        if (length) |l| {
+            if (l < 0) return self.negativeLength(l);
+        }
+        var items: std.ArrayList([]const u8) = .empty;
+        if (p.positional) {
+            const count: i64 = @intCast(p.items.len);
+            const start = if (offset < 0) offset + count + 1 else offset;
+            if (start == 0) try items.append(self.arena, self.sh.script_name);
+            if (start >= 0 and start <= count) try items.appendSlice(self.arena, p.items[@intCast(@max(start, 1) - 1)..]);
+        } else if (p.items.len != 0) {
+            const last_index: i64 = @intCast(if (p.indices) |ix| ix[ix.len - 1] else p.items.len - 1);
+            const start = if (offset < 0) offset + last_index + 1 else offset;
+            if (start >= 0) {
+                for (p.items, 0..) |item, i| {
+                    const index: i64 = @intCast(if (p.indices) |ix| ix[i] else i);
+                    if (index >= start) try items.append(self.arena, item);
+                }
+            }
+        }
+        if (length) |l| items.items.len = @min(items.items.len, @as(usize, @intCast(l)));
+        return .{ .set = true, .list = true, .star = p.star, .items = items.items };
+    }
+
+    /// Characters `offset` onwards; a negative offset counts from the end and
+    /// a negative length stops that many characters before it.
+    fn substringText(self: *Expander, text: []const u8, offset: i64, length: ?i64) Error![]const u8 {
+        const count: i64 = @intCast(param_ops.charCount(text));
+        const start = if (offset < 0) offset + count else offset;
+        if (start < 0 or start > count) return "";
+        var end = count;
+        if (length) |l| {
+            end = if (l < 0) count + l else start + @min(l, count - start);
+            if (end < start) return self.negativeLength(l);
+        }
+        return text[param_ops.charOffset(text, @intCast(start))..param_ops.charOffset(text, @intCast(end))];
+    }
+
+    fn negativeLength(self: *Expander, length: i64) Error {
+        report(self.sh, "wsh: {d}: substring expression < 0\n", .{length});
+        return error.BadSubstitution;
+    }
+
+    /// The pattern and case operators and `@` transforms, applied to the value
+    /// or to each element.
+    fn applyOperator(self: *Expander, p: Param, b: Braced) Error!Param {
+        const pattern = if (b.op == .transform) "" else try self.patternText(b.word);
+        const replacement = if (b.word2) |w| try self.patternText(w) else "";
+        var out = p;
+        if (p.list) {
+            const items = try self.arena.alloc([]const u8, p.items.len);
+            for (p.items, 0..) |item, i| items[i] = try self.applyText(item, b, pattern, replacement);
+            out.items = items;
+        } else {
+            out.text = try self.applyText(p.text, b, pattern, replacement);
+        }
+        return out;
+    }
+
+    fn applyText(self: *Expander, text: []const u8, b: Braced, pattern: []const u8, replacement: []const u8) Error![]const u8 {
+        const a = self.arena;
+        return switch (b.op) {
+            .remove_prefix => param_ops.removePrefix(a, text, pattern, b.twice),
+            .remove_suffix => param_ops.removeSuffix(a, text, pattern, b.twice),
+            .replace => param_ops.replace(a, text, pattern, replacement, b.mode),
+            .upper => param_ops.convertCase(a, text, pattern, true, !b.twice),
+            .lower => param_ops.convertCase(a, text, pattern, false, !b.twice),
+            .transform => switch (b.word[0]) {
+                'Q' => param_ops.quoteSingle(a, text),
+                'E' => param_ops.expandEscapes(a, text),
+                'U' => param_ops.caseAll(a, text, true),
+                'L' => param_ops.caseAll(a, text, false),
+                'u' => param_ops.capitalize(a, text),
+                'a' => a.dupe(u8, arrays.flagLetters(self.sh, b.name, &self.flag_buf)),
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+    }
+
+    /// `${name@A}`: an assignment that recreates the variable.
+    fn assignmentText(self: *Expander, name: []const u8, p: Param) Error![]const u8 {
+        if (variable(self.sh, name)) |v| {
+            if (v == .list or v == .map) return (try arrays.describe(self.sh, self.arena, name)) orelse "";
+        }
+        const quoted = try param_ops.quoteSingle(self.arena, p.text);
+        const flags = arrays.flagLetters(self.sh, name, &self.flag_buf);
+        if (flags.len == 0) return std.fmt.allocPrint(self.arena, "{s}={s}", .{ name, quoted });
+        return std.fmt.allocPrint(self.arena, "declare -{s} {s}={s}", .{ flags, name, quoted });
+    }
+
+    /// `${name@K}`: the value quoted, or an array's keys and quoted values.
+    fn keyValueText(self: *Expander, name: []const u8, p: Param) Error![]const u8 {
+        const v = variable(self.sh, name) orelse return param_ops.quoteSingle(self.arena, p.text);
+        var out: std.ArrayList(u8) = .empty;
+        switch (v) {
+            .list => |list| for (list, 0..) |item, i| {
+                if (item == .none) continue;
+                if (out.items.len != 0) try out.append(self.arena, ' ');
+                try out.print(self.arena, "{d} {s}", .{ i, try param_ops.quoteDouble(self.arena, try self.textOf(item)) });
+            },
+            .map => |entries| for (entries) |entry| {
+                if (out.items.len != 0) try out.append(self.arena, ' ');
+                try out.print(self.arena, "{s} {s}", .{
+                    try param_ops.quoteKey(self.arena, entry.key),
+                    try param_ops.quoteDouble(self.arena, try self.textOf(entry.value)),
+                });
+            },
+            else => return param_ops.quoteSingle(self.arena, p.text),
+        }
+        return out.items;
+    }
+
+    /// `${name:=word}`.
+    fn assignParam(self: *Expander, name: []const u8, subscript: ?[]const u8, text: []const u8) Error!void {
+        const result = if (subscript) |sub|
+            arrays.assignElement(self.sh, self.arena, name, sub, text, false)
+        else if (self.sh.isReadonly(name))
+            error.ReadonlyVariable
+        else
+            self.sh.setVar(name, .{ .string = text });
+        result catch |err| switch (err) {
+            error.ReadonlyVariable => {
+                report(self.sh, "wsh: {s}: readonly variable\n", .{name});
+                return error.BadSubstitution;
+            },
+            else => |e| return e,
+        };
+    }
+
+    /// A `${name:-word}` operand, expanded in place: inside double quotes it
+    /// stays one field, unquoted it splits like any other expansion.
+    fn emitOperand(self: *Expander, word: []const u8, quoted: bool) Error!void {
+        const saved = self.bare_vars;
+        self.bare_vars = false;
+        defer self.bare_vars = saved;
+        if (quoted) try self.scanOperandQuoted(word) else try self.scanText(word);
+    }
+
+    /// An operand inside double quotes: single quotes are literal and inner
+    /// double quotes only group, as in bash.
+    fn scanOperandQuoted(self: *Expander, word: []const u8) Error!void {
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < word.len) {
+            switch (word[i]) {
+                '\\' => i += 2,
+                '`' => i = skipBacktick(word, i + 1),
+                '$' => i = skipExpansion(word, i) orelse i + 1,
+                '"' => {
+                    try self.scanDouble(word[start..i]);
+                    const end = findClosingDouble(word, i + 1);
+                    try self.scanDouble(word[i + 1 .. end]);
+                    i = if (end < word.len) end + 1 else word.len;
+                    start = i;
+                },
+                else => i += 1,
+            }
+        }
+        try self.scanDouble(word[start..]);
+    }
+
+    /// An operand as one string, quotes removed.
+    fn operandText(self: *Expander, word: []const u8) Error![]const u8 {
+        var sub = Expander{ .sh = self.sh, .arena = self.arena, .mode = .literal };
+        try sub.scanText(word);
+        return sub.buf.items;
+    }
+
+    /// An operand as a pattern, with quoted characters escaped.
+    fn patternText(self: *Expander, word: []const u8) Error![]const u8 {
+        var sub = Expander{ .sh = self.sh, .arena = self.arena, .mode = .pattern };
+        try sub.scanText(word);
+        return sub.buf.items;
+    }
+
+    /// An arithmetic operand (a subscript, offset or length), expanded first.
+    fn arithOperand(self: *Expander, text: []const u8) Error!i64 {
+        const expanded = try expandLiteral(self.sh, self.arena, text);
+        return arith.evaluate(self.sh, self.arena, expanded);
+    }
+
+    fn number(self: *Expander, n: anytype) Error![]const u8 {
+        return std.fmt.allocPrint(self.arena, "{d}", .{n});
+    }
+
+    fn textOf(self: *Expander, v: value.Value) Error![]const u8 {
+        return switch (v) {
+            .string => |s| s,
+            else => v.renderAlloc(self.arena) catch return error.OutOfMemory,
+        };
+    }
+
+    /// The first character of `IFS` that `"$*"` joins with.
     fn starSeparator(self: *Expander) []const u8 {
         var seps: [64]u8 = undefined;
         const ifs = self.ifsSpec(&seps);
         if (!ifs.user_set) return " ";
-        return if (ifs.seps.len > 0) ifs.seps[0..1] else "";
-    }
-
-    /// Resolves a name to text: shell variables first, then the environment.
-    fn lookup(self: *Expander, name: []const u8) []const u8 {
-        if (self.sh.getVar(name)) |v| return self.renderValue(v);
-        return self.sh.getEnv(name) orelse "";
+        if (ifs.seps.len == 0) return "";
+        const c = ifs.seps[0];
+        return all_bytes[c .. @as(usize, c) + 1];
     }
 
     fn renderValue(self: *Expander, v: value.Value) []const u8 {
@@ -700,6 +1147,11 @@ pub const Expander = struct {
                 }
                 return w.buffered();
             },
+            .map => {
+                var w = std.Io.Writer.fixed(&self.scratch);
+                v.render(&w) catch {};
+                return w.buffered();
+            },
         }
     }
 
@@ -712,6 +1164,255 @@ pub const Expander = struct {
         try self.emit(std.mem.trimEnd(u8, result, "\n"), quoted);
     }
 };
+
+/// Every byte value once, so a one-byte separator can be returned by slice.
+const all_bytes = blk: {
+    var bytes: [256]u8 = undefined;
+    for (&bytes, 0..) |*b, i| b.* = @intCast(i);
+    break :blk bytes;
+};
+
+/// A variable's value, falling back to the environment. A declared but unset
+/// variable (`local x`) holds `none` and counts as unset.
+fn variable(sh: *shell.Shell, name: []const u8) ?value.Value {
+    if (sh.getVar(name)) |v| return if (v == .none) null else v;
+    if (sh.getEnv(name)) |text| return .{ .string = text };
+    return null;
+}
+
+/// Whether `${name-word}` (or, with `colon`, `${name:-word}`) uses its word.
+fn isMissing(p: Expander.Param, colon: bool) bool {
+    if (!p.set) return true;
+    if (!colon) return false;
+    if (p.list) return p.items.len == 0 or (p.items.len == 1 and p.items[0].len == 0);
+    return p.text.len == 0;
+}
+
+fn isAllSubscript(subscript: []const u8) bool {
+    return std.mem.eql(u8, subscript, "@") or std.mem.eql(u8, subscript, "*");
+}
+
+fn isName(text: []const u8) bool {
+    if (text.len == 0 or !isIdentStart(text[0])) return false;
+    for (text[1..]) |c| {
+        if (!isIdentChar(c)) return false;
+    }
+    return true;
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// How an error message names a parameter: `name`, `name[sub]` or `$1`.
+const Label = struct {
+    name: []const u8,
+    subscript: ?[]const u8,
+
+    pub fn format(self: Label, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (!isIdentStart(self.name[0])) try w.writeByte('$');
+        try w.writeAll(self.name);
+        if (self.subscript) |sub| try w.print("[{s}]", .{sub});
+    }
+};
+
+/// Length of the parameter at the start of `s`: a name with an optional
+/// `[subscript]`, a run of digits, or one special character.
+fn paramLength(s: []const u8) ?usize {
+    if (s.len == 0) return null;
+    if (isIdentStart(s[0])) {
+        var i: usize = 1;
+        while (i < s.len and isIdentChar(s[i])) i += 1;
+        if (i < s.len and s[i] == '[') return (compound.closeBracket(s, i) orelse return null) + 1;
+        return i;
+    }
+    if (std.ascii.isDigit(s[0])) {
+        var i: usize = 1;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        return i;
+    }
+    if (std.mem.indexOfScalar(u8, "@*#?-$!", s[0]) != null) return 1;
+    return null;
+}
+
+const ParamRef = struct { name: []const u8, subscript: ?[]const u8 };
+
+/// Splits a parameter that `paramLength` accepted into name and subscript.
+fn splitParam(s: []const u8) ParamRef {
+    if (s.len > 0 and s[s.len - 1] == ']') {
+        if (std.mem.indexOfScalar(u8, s, '[')) |open| return .{ .name = s[0..open], .subscript = s[open + 1 .. s.len - 1] };
+    }
+    return .{ .name = s, .subscript = null };
+}
+
+const Op = enum {
+    none,
+    length,
+    names,
+    keys,
+    use_default,
+    assign_default,
+    fail_unset,
+    use_alternate,
+    remove_prefix,
+    remove_suffix,
+    replace,
+    substring,
+    upper,
+    lower,
+    transform,
+};
+
+/// A parsed `${...}`:
+///
+///     ${p} ${#p} ${!p} ${!prefix*} ${!a[@]}
+///     ${p-w} ${p=w} ${p?w} ${p+w}, each also with `:`
+///     ${p#pat} ${p##pat} ${p%pat} ${p%%pat}
+///     ${p/pat/rep} ${p//pat/rep} ${p/#pat/rep} ${p/%pat/rep}
+///     ${p:off} ${p:off:len} ${p^} ${p^^} ${p,} ${p,,} ${p@X}
+const Braced = struct {
+    name: []const u8 = "",
+    subscript: ?[]const u8 = null,
+    /// `${!name}`: the parameter that `name`'s value names.
+    indirect: bool = false,
+    op: Op = .none,
+    /// `${p:-w}` rather than `${p-w}`: an empty value counts as unset.
+    colon: bool = false,
+    /// The doubled operators `##`, `%%`, `^^` and `,,`.
+    twice: bool = false,
+    /// `${!prefix*}` and `${!a[*]}` rather than their `@` forms.
+    star: bool = false,
+    mode: param_ops.ReplaceMode = .first,
+    /// The word, pattern, transform letter or substring offset.
+    word: []const u8 = "",
+    /// The replacement or substring length, when present.
+    word2: ?[]const u8 = null,
+};
+
+fn parseBraced(inner: []const u8) ?Braced {
+    var b = Braced{};
+    var rest = inner;
+    if (rest.len > 1 and rest[0] == '#') {
+        if (paramLength(rest[1..])) |n| {
+            if (n == rest.len - 1) {
+                const ref = splitParam(rest[1..]);
+                return .{ .name = ref.name, .subscript = ref.subscript, .op = .length };
+            }
+        }
+    }
+    if (rest.len > 1 and rest[0] == '!') {
+        rest = rest[1..];
+        const last = rest[rest.len - 1];
+        if ((last == '*' or last == '@') and isName(rest[0 .. rest.len - 1])) {
+            return .{ .name = rest[0 .. rest.len - 1], .op = .names, .star = last == '*' };
+        }
+        b.indirect = true;
+    }
+    const n = paramLength(rest) orelse return null;
+    const ref = splitParam(rest[0..n]);
+    b.name = ref.name;
+    b.subscript = ref.subscript;
+    rest = rest[n..];
+    if (rest.len == 0) {
+        if (b.indirect) {
+            if (ref.subscript) |sub| {
+                if (isAllSubscript(sub)) return .{ .name = ref.name, .op = .keys, .star = sub[0] == '*' };
+            }
+        }
+        return b;
+    }
+    switch (rest[0]) {
+        ':' => {
+            if (rest.len > 1 and std.mem.indexOfScalar(u8, "-=?+", rest[1]) != null) {
+                b.colon = true;
+                b.op = wordOp(rest[1]);
+                b.word = rest[2..];
+                return b;
+            }
+            b.op = .substring;
+            const body = rest[1..];
+            if (findTopLevel(body, ':')) |at| {
+                b.word = body[0..at];
+                b.word2 = body[at + 1 ..];
+            } else {
+                if (std.mem.trim(u8, body, " \t").len == 0) return null;
+                b.word = body;
+            }
+        },
+        '-', '=', '?', '+' => {
+            b.op = wordOp(rest[0]);
+            b.word = rest[1..];
+        },
+        '#', '%', '^', ',' => {
+            b.op = switch (rest[0]) {
+                '#' => .remove_prefix,
+                '%' => .remove_suffix,
+                '^' => .upper,
+                else => .lower,
+            };
+            b.twice = rest.len > 1 and rest[1] == rest[0];
+            b.word = rest[if (b.twice) 2 else 1..];
+        },
+        '/' => {
+            b.op = .replace;
+            var body = rest[1..];
+            if (body.len > 0) {
+                b.mode = switch (body[0]) {
+                    '/' => .all,
+                    '#' => .prefix,
+                    '%' => .suffix,
+                    else => .first,
+                };
+                if (b.mode != .first) body = body[1..];
+            }
+            if (findTopLevel(body, '/')) |at| {
+                b.word = body[0..at];
+                b.word2 = body[at + 1 ..];
+            } else {
+                b.word = body;
+            }
+        },
+        '@' => {
+            if (rest.len != 2 or std.mem.indexOfScalar(u8, "QEULuaAK", rest[1]) == null) return null;
+            b.op = .transform;
+            b.word = rest[1..2];
+        },
+        else => return null,
+    }
+    return b;
+}
+
+fn wordOp(c: u8) Op {
+    return switch (c) {
+        '-' => .use_default,
+        '=' => .assign_default,
+        '?' => .fail_unset,
+        else => .use_alternate,
+    };
+}
+
+/// The first `target` outside quotes, escapes, substitutions and parentheses.
+fn findTopLevel(s: []const u8, target: u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        switch (c) {
+            '\\' => i += 2,
+            '\'' => i = skipSingle(s, i + 1),
+            '"' => i = skipDouble(s, i + 1),
+            '`' => i = skipBacktick(s, i + 1),
+            '$' => i = skipExpansion(s, i) orelse i + 1,
+            else => {
+                if (c == target and depth == 0) return i;
+                if (c == '(') depth += 1;
+                if (c == ')') depth -|= 1;
+                i += 1;
+            },
+        }
+    }
+    return null;
+}
 
 fn findClosingDouble(s: []const u8, from: usize) usize {
     var i = from;
@@ -1373,4 +2074,102 @@ test "brace expansion lists, ranges and nesting" {
     try testing.expectEqual(@as(usize, 2), fields.items.len);
     try testing.expectEqualStrings("x1value", fields.items[0]);
     try testing.expectEqualStrings("x2value", fields.items[1]);
+}
+
+test "parameter operators" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    sh.scratch_override = arena;
+    try sh.setVar("p", .{ .string = "/a/b/c.tar.gz" });
+    try sh.setEnv("HOME", "/home/me");
+
+    const cases = [_][2][]const u8{
+        .{ "${p%/*}", "/a/b" },
+        .{ "${p%%.*}", "/a/b/c" },
+        .{ "${p#*/}", "a/b/c.tar.gz" },
+        .{ "${p##*/}", "c.tar.gz" },
+        .{ "${p#\"*\"}", "/a/b/c.tar.gz" },
+        .{ "${p/b/B}", "/a/B/c.tar.gz" },
+        .{ "${p//\\//_}", "_a_b_c.tar.gz" },
+        .{ "${p:3:3}", "b/c" },
+        .{ "${p: -2}", "gz" },
+        .{ "${unset:-$HOME}", "/home/me" },
+        .{ "${unset-~}", "/home/me" },
+        .{ "${p:+set}", "set" },
+        .{ "${#p}", "13" },
+        .{ "${p^^}", "/A/B/C.TAR.GZ" },
+        .{ "${p@Q}", "'/a/b/c.tar.gz'" },
+        .{ "${!p*}", "p" },
+    };
+    for (cases) |case| {
+        try testing.expectEqualStrings(case[1], try expandLiteral(&sh, arena, case[0]));
+    }
+
+    try testing.expectEqualStrings("abc", try expandLiteral(&sh, arena, "${fresh:=abc}"));
+    try testing.expectEqualStrings("abc", sh.getVar("fresh").?.string);
+
+    sh.default_err = -1;
+    try testing.expectError(error.BadSubstitution, expandLiteral(&sh, arena, "${p;x}"));
+    try testing.expectError(error.BadSubstitution, expandLiteral(&sh, arena, "${p:}"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${unset:?}"));
+    try testing.expectError(error.BadSubstitution, expandLiteral(&sh, arena, "${p:1:-20}"));
+}
+
+test "set -u rejects unset parameters outside the default forms" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    sh.default_err = -1;
+    sh.options.nounset = true;
+
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "$nope"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${nope}"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${#nope}"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${nope#x}"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "$1"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "$!"));
+    try testing.expectEqualStrings("d", try expandLiteral(&sh, arena, "${nope-d}"));
+    try testing.expectEqualStrings("e", try expandLiteral(&sh, arena, "${nope:-e}"));
+    try testing.expectEqualStrings("", try expandLiteral(&sh, arena, "${nope+f}"));
+    try testing.expectEqualStrings("", try expandLiteral(&sh, arena, "$@$*"));
+    try testing.expectEqualStrings("", try expandLiteral(&sh, arena, "${nope[@]}"));
+
+    try sh.setVar("a", .{ .list = &.{.{ .string = "x" }} });
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${a[3]}"));
+    try testing.expectEqualStrings("x", try expandLiteral(&sh, arena, "${a[0]}"));
+    try sh.setVar("empty", .{ .list = &.{} });
+    try testing.expectEqualStrings("0", try expandLiteral(&sh, arena, "${#empty[@]}"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${#nope[@]}"));
+}
+
+test "arrays expand by element" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    try sh.setVar("a", .{ .list = &.{ .{ .string = "x y" }, .none, .{ .string = "z" } } });
+    try sh.setVar("m", .{ .map = &.{ .{ .key = "k", .value = .{ .string = "v" } }, .{ .key = "j", .value = .{ .string = "w" } } } });
+
+    var fields: std.ArrayList([]const u8) = .empty;
+    try expandWord(&sh, arena, "\"${a[@]}\"", &fields);
+    try testing.expectEqual(@as(usize, 2), fields.items.len);
+    try testing.expectEqualStrings("x y", fields.items[0]);
+
+    try testing.expectEqualStrings("2", try expandLiteral(&sh, arena, "${#a[@]}"));
+    try testing.expectEqualStrings("0 2", try expandLiteral(&sh, arena, "${!a[@]}"));
+    try testing.expectEqualStrings("z", try expandLiteral(&sh, arena, "${a[-1]}"));
+    try testing.expectEqualStrings("x y z", try expandLiteral(&sh, arena, "$a"));
+    try testing.expectEqualStrings("v", try expandLiteral(&sh, arena, "${m[k]}"));
+    try testing.expectEqualStrings("k j", try expandLiteral(&sh, arena, "${!m[@]}"));
+    try testing.expectEqualStrings("x z", try expandLiteral(&sh, arena, "${a[@]% *}"));
+    try testing.expectEqualStrings("3", try expandLiteral(&sh, arena, "$(( ${#a[@]} + 1 ))"));
+
+    sh.current_line = 12;
+    try testing.expectEqualStrings("12", try expandLiteral(&sh, arena, "$LINENO"));
 }
