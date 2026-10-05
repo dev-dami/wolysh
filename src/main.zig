@@ -10,6 +10,7 @@ const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
 const prompt = @import("interactive/prompt.zig");
+const histexpand = @import("interactive/histexpand.zig");
 
 const Shell = shellmod.Shell;
 
@@ -254,8 +255,9 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         if (editor_state.interrupted) continue;
         if (source.len == 0) continue;
 
-        sh.hist.add(gpa, source) catch {};
-        _ = exec.runSource(sh, source);
+        const line = histexpand.apply(sh, source) orelse continue;
+        sh.hist.add(gpa, line) catch {};
+        _ = exec.runSource(sh, line);
         // `let prompt = ...` or `let autosuggest = false` should take effect
         // on the very next prompt.
         sh.applyConfig();
