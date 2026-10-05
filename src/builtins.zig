@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const test_builtin = @import("builtins/test.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1375,185 +1376,6 @@ fn builtinRead(ctx: Ctx) u8 {
     return 0;
 }
 
-// --- test ------------------------------------------------------------------
-
-const TestParser = struct {
-    args: []const []const u8,
-    pos: usize = 0,
-
-    fn peek(self: *TestParser) ?[]const u8 {
-        if (self.pos >= self.args.len) return null;
-        return self.args[self.pos];
-    }
-
-    fn next(self: *TestParser) ?[]const u8 {
-        const text = self.peek() orelse return null;
-        self.pos += 1;
-        return text;
-    }
-
-    /// `-o` binds loosest, then `-a`, then `!`, as POSIX specifies.
-    fn parseOr(self: *TestParser) ?bool {
-        var acc = self.parseAnd() orelse return null;
-        while (self.peek()) |tok| {
-            if (!std.mem.eql(u8, tok, "-o")) break;
-            _ = self.next();
-            const rhs = self.parseAnd() orelse return null;
-            acc = acc or rhs;
-        }
-        return acc;
-    }
-
-    fn parseAnd(self: *TestParser) ?bool {
-        var acc = self.parseNot() orelse return null;
-        while (self.peek()) |tok| {
-            if (!std.mem.eql(u8, tok, "-a")) break;
-            _ = self.next();
-            const rhs = self.parseNot() orelse return null;
-            acc = acc and rhs;
-        }
-        return acc;
-    }
-
-    fn parseNot(self: *TestParser) ?bool {
-        if (self.peek()) |tok| {
-            if (std.mem.eql(u8, tok, "!")) {
-                _ = self.next();
-                const inner = self.parseNot() orelse return null;
-                return !inner;
-            }
-        }
-        return self.parsePrimary();
-    }
-
-    fn parsePrimary(self: *TestParser) ?bool {
-        const tok = self.next() orelse return null;
-
-        if (std.mem.eql(u8, tok, "(")) {
-            const inner = self.parseOr() orelse return null;
-            const close = self.next() orelse return null;
-            if (!std.mem.eql(u8, close, ")")) return null;
-            return inner;
-        }
-
-        // A binary comparison wins when the next token is an operator, so an
-        // operand that happens to look like a unary flag (`test -n = -n`) is
-        // still compared rather than read as a flag.
-        if (self.peek()) |op| {
-            if (isBinaryOp(op)) {
-                _ = self.next();
-                const rhs = self.next() orelse return null;
-                return binaryTest(tok, op, rhs);
-            }
-        }
-
-        if (isUnaryOp(tok)) {
-            const operand = self.next() orelse return null;
-            return unaryTest(tok, operand);
-        }
-
-        // A bare word is true when non-empty.
-        return tok.len != 0;
-    }
-};
-
-fn isUnaryOp(tok: []const u8) bool {
-    if (tok.len != 2 or tok[0] != '-') return false;
-    return switch (tok[1]) {
-        'e', 'f', 'd', 'L', 'h', 'r', 'w', 'x', 's', 'z', 'n', 't' => true,
-        else => false,
-    };
-}
-
-fn isBinaryOp(tok: []const u8) bool {
-    return std.mem.eql(u8, tok, "=") or std.mem.eql(u8, tok, "==") or
-        std.mem.eql(u8, tok, "!=") or std.mem.eql(u8, tok, "-eq") or
-        std.mem.eql(u8, tok, "-ne") or std.mem.eql(u8, tok, "-lt") or
-        std.mem.eql(u8, tok, "-le") or std.mem.eql(u8, tok, "-gt") or
-        std.mem.eql(u8, tok, "-ge");
-}
-
-fn unaryTest(op: []const u8, operand: []const u8) ?bool {
-    switch (op[1]) {
-        'z' => return operand.len == 0,
-        'n' => return operand.len != 0,
-        't' => {
-            const fd = std.fmt.parseInt(i32, operand, 10) catch return false;
-            return sys.isTty(fd);
-        },
-        else => {},
-    }
-
-    var buf: [linux.PATH_MAX]u8 = undefined;
-    const z = cstr(&buf, operand) orelse return null;
-    return switch (op[1]) {
-        'e' => fs.exists(z),
-        'f' => fs.kind(z) == .file,
-        'd' => fs.kind(z) == .dir,
-        'L', 'h' => fs.kind(z) == .symlink,
-        'r' => sys.canAccess(z, 4),
-        'w' => sys.canAccess(z, 2),
-        'x' => sys.canAccess(z, 1),
-        's' => if (sys.fileSize(z)) |size| size > 0 else false,
-        else => null,
-    };
-}
-
-fn binaryTest(lhs: []const u8, op: []const u8, rhs: []const u8) ?bool {
-    if (std.mem.eql(u8, op, "=") or std.mem.eql(u8, op, "==")) return std.mem.eql(u8, lhs, rhs);
-    if (std.mem.eql(u8, op, "!=")) return !std.mem.eql(u8, lhs, rhs);
-
-    const left = std.fmt.parseInt(i64, lhs, 10) catch return null;
-    const right = std.fmt.parseInt(i64, rhs, 10) catch return null;
-    if (std.mem.eql(u8, op, "-eq")) return left == right;
-    if (std.mem.eql(u8, op, "-ne")) return left != right;
-    if (std.mem.eql(u8, op, "-lt")) return left < right;
-    if (std.mem.eql(u8, op, "-le")) return left <= right;
-    if (std.mem.eql(u8, op, "-gt")) return left > right;
-    return left >= right;
-}
-
-fn builtinTest(ctx: Ctx) u8 {
-    return runTest(ctx, false);
-}
-
-fn builtinBracket(ctx: Ctx) u8 {
-    return runTest(ctx, true);
-}
-
-fn runTest(ctx: Ctx, bracket: bool) u8 {
-    var args = ctx.argv[1..];
-    if (bracket) {
-        if (args.len == 0 or !std.mem.eql(u8, args[args.len - 1], "]")) {
-            ctx.err("wsh: [: missing `]'\n");
-            return 2;
-        }
-        args = args[0 .. args.len - 1];
-    }
-
-    // POSIX: no arguments is false, one argument is "is it non-empty".
-    if (args.len == 0) return 1;
-    if (args.len == 1) return if (args[0].len != 0) 0 else 1;
-
-    var parser = TestParser{ .args = args };
-    const result = parser.parseOr() orelse {
-        ctx.err("wsh: test: malformed expression\n");
-        return 2;
-    };
-    if (parser.pos != args.len) {
-        ctx.err("wsh: test: malformed expression\n");
-        return 2;
-    }
-    return if (result) 0 else 1;
-}
-
-fn cstr(buf: []u8, path: []const u8) ?[:0]const u8 {
-    if (path.len + 1 > buf.len) return null;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return buf[0..path.len :0];
-}
-
 pub fn validName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
@@ -1597,8 +1419,8 @@ const table = [_]Builtin{
     .{ .name = "shift", .summary = "shift positional parameters", .run = builtinShift },
     .{ .name = "umask", .summary = "get or set the file-creation mask", .run = builtinUmask },
     .{ .name = "exec", .summary = "replace the shell with a command", .run = builtinExec },
-    .{ .name = "test", .summary = "evaluate a condition", .run = builtinTest },
-    .{ .name = "[", .summary = "evaluate a condition", .run = builtinBracket },
+    .{ .name = "test", .summary = "evaluate a condition", .run = test_builtin.run },
+    .{ .name = "[", .summary = "evaluate a condition", .run = test_builtin.runBracket },
     .{ .name = "true", .summary = "return success", .run = builtinTrue },
     .{ .name = "false", .summary = "return failure", .run = builtinFalse },
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },
@@ -1862,75 +1684,6 @@ test "read splits on IFS, honours -r and prompts" {
         try testing.expectEqualStrings("prompt> ", out);
         try testing.expectEqualStrings("value", sh.getVar("answer").?.string);
     }
-}
-
-test "test builtin" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    {
-        const argv = [_][]const u8{ "test", "-d", "." };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv };
-        try std.testing.expectEqual(@as(u8, 0), builtinTest(ctx));
-    }
-    {
-        const argv = [_][]const u8{ "test", "-f", "." };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv };
-        try std.testing.expectEqual(@as(u8, 1), builtinTest(ctx));
-    }
-    {
-        const argv = [_][]const u8{ "test", "a", "=", "a" };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv };
-        try std.testing.expectEqual(@as(u8, 0), builtinTest(ctx));
-    }
-    {
-        const argv = [_][]const u8{ "test", "2", "-lt", "10" };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv };
-        try std.testing.expectEqual(@as(u8, 0), builtinTest(ctx));
-    }
-}
-
-test "test groups, negates and brackets" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    const cases = [_]struct { argv: []const []const u8, want: u8 }{
-        .{ .argv = &.{ "[", "a", "=", "a", "]" }, .want = 0 },
-        .{ .argv = &.{ "[", "-f", ".", "]" }, .want = 1 },
-        .{ .argv = &.{ "[", "-d", ".", "]" }, .want = 0 },
-        .{ .argv = &.{ "[", "-e", ".", "]" }, .want = 0 },
-        .{ .argv = &.{ "[", "-z", "", "]" }, .want = 0 },
-        .{ .argv = &.{ "[", "-n", "x", "]" }, .want = 0 },
-        .{ .argv = &.{ "[", "-x", "/bin/sh", "]" }, .want = 0 },
-        .{ .argv = &.{ "[", "!", "-f", ".", "]" }, .want = 0 },
-        .{ .argv = &.{ "test", "a", "=", "a", "-a", "b", "=", "b" }, .want = 0 },
-        .{ .argv = &.{ "test", "a", "=", "b", "-a", "b", "=", "b" }, .want = 1 },
-        .{ .argv = &.{ "test", "a", "=", "b", "-o", "b", "=", "b" }, .want = 0 },
-        .{ .argv = &.{ "test", "!", "a", "=", "b" }, .want = 0 },
-        .{ .argv = &.{ "test", "(", "a", "=", "a", ")", "-a", "c", "=", "c" }, .want = 0 },
-        .{ .argv = &.{ "test", "(", "a", "=", "b", "-o", "c", "=", "c", ")" }, .want = 0 },
-        .{ .argv = &.{ "test", "(", "a", "=", "b", ")", "-o", "c", "=", "c" }, .want = 0 },
-        .{ .argv = &.{ "test", "3", "-ge", "3" }, .want = 0 },
-        .{ .argv = &.{ "test", "3", "-ne", "3" }, .want = 1 },
-    };
-    for (cases) |case| {
-        const ctx = Ctx{ .sh = &sh, .argv = case.argv, .stderr = -1 };
-        const status = if (std.mem.eql(u8, case.argv[0], "[")) builtinBracket(ctx) else builtinTest(ctx);
-        try testing.expectEqual(case.want, status);
-    }
-
-    const missing = [_][]const u8{ "[", "a", "=", "a" };
-    try testing.expectEqual(@as(u8, 2), builtinBracket(Ctx{ .sh = &sh, .argv = &missing, .stderr = -1 }));
-
-    // POSIX: one argument is true when it is non-empty.
-    const single = [_][]const u8{ "test", "-f" };
-    try testing.expectEqual(@as(u8, 0), builtinTest(Ctx{ .sh = &sh, .argv = &single, .stderr = -1 }));
-    const empty = [_][]const u8{ "test", "" };
-    try testing.expectEqual(@as(u8, 1), builtinTest(Ctx{ .sh = &sh, .argv = &empty, .stderr = -1 }));
-
-    // An unclosed group is a syntax error.
-    const unclosed = [_][]const u8{ "test", "(", "a", "=", "a" };
-    try testing.expectEqual(@as(u8, 2), builtinTest(Ctx{ .sh = &sh, .argv = &unclosed, .stderr = -1 }));
 }
 
 test "type and command -v classify names" {
