@@ -549,7 +549,7 @@ fn printableLen(text: []const u8) ?usize {
     return len;
 }
 
-fn needsAnsiQuote(text: []const u8) bool {
+pub fn needsAnsiQuote(text: []const u8) bool {
     var i: usize = 0;
     while (i < text.len) {
         i += printableLen(text[i..]) orelse return true;
@@ -557,7 +557,7 @@ fn needsAnsiQuote(text: []const u8) bool {
     return false;
 }
 
-fn ansiQuote(arena: Allocator, out: *std.ArrayList(u8), text: []const u8) Allocator.Error!void {
+pub fn ansiQuote(arena: Allocator, out: *std.ArrayList(u8), text: []const u8) Allocator.Error!void {
     try out.appendSlice(arena, "$'");
     var i: usize = 0;
     while (i < text.len) {

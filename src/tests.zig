@@ -23,6 +23,9 @@ test {
     _ = @import("builtins/jobctl.zig");
     _ = @import("builtins/getopts.zig");
     _ = @import("builtins/help.zig");
+    _ = @import("builtins/process.zig");
+    _ = @import("builtins/dirstack.zig");
+    _ = @import("builtins/exports.zig");
     _ = @import("exec.zig");
     _ = @import("main.zig");
     _ = @import("interactive/editor.zig");

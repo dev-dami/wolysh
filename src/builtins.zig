@@ -20,6 +20,9 @@ const describe_builtin = @import("builtins/describe.zig");
 const jobctl_builtin = @import("builtins/jobctl.zig");
 const getopts_builtin = @import("builtins/getopts.zig");
 const help_builtin = @import("builtins/help.zig");
+const process_builtin = @import("builtins/process.zig");
+const dirstack_builtin = @import("builtins/dirstack.zig");
+const exports_builtin = @import("builtins/exports.zig");
 
 const Shell = shellmod.Shell;
 
@@ -238,105 +241,7 @@ fn builtinCd(ctx: Ctx) u8 {
     return 0;
 }
 
-fn builtinPushd(ctx: Ctx) u8 {
-    const target = ctx.arg(1) orelse {
-        if (!(ctx.sh.swapDirs() catch return 1)) {
-            ctx.err("wsh: pushd: directory stack empty\n");
-            return 1;
-        }
-        return printDirs(ctx);
-    };
-
-    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const dest = ctx.sh.tildeExpand(arena, target) catch target;
-    const z = arena.dupeZ(u8, dest) catch return 1;
-    if (!fs.isDir(z)) {
-        ctx.errFmt("wsh: pushd: {s}: not a directory\n", .{dest});
-        return 1;
-    }
-    if (!(ctx.sh.pushDir(z) catch return 1)) {
-        ctx.errFmt("wsh: pushd: {s}: cannot change directory\n", .{dest});
-        return 1;
-    }
-    return printDirs(ctx);
-}
-
-fn builtinPopd(ctx: Ctx) u8 {
-    if (!(ctx.sh.popDir() catch return 1)) {
-        ctx.err("wsh: popd: directory stack empty\n");
-        return 1;
-    }
-    return printDirs(ctx);
-}
-
-fn builtinDirs(ctx: Ctx) u8 {
-    return printDirs(ctx);
-}
-
-fn printDirs(ctx: Ctx) u8 {
-    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out = sys.StringBuilder.init(ctx.sh.gpa);
-    defer out.deinit();
-
-    out.append(ctx.sh.shortenHome(arena, ctx.sh.cwd) catch ctx.sh.cwd) catch return 1;
-    for (ctx.sh.dir_stack.items) |dir| {
-        out.append(" ") catch return 1;
-        out.append(ctx.sh.shortenHome(arena, dir) catch dir) catch return 1;
-    }
-    out.append("\n") catch return 1;
-    sys.writeStr(ctx.stdout, out.items());
-    return 0;
-}
-
 // --- environment and variables ---------------------------------------------
-
-fn builtinExport(ctx: Ctx) u8 {
-    if (ctx.argv.len == 1) {
-        var it = ctx.sh.env.iterator();
-        while (it.next()) |entry| {
-            ctx.outFmt("{s}={s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-        }
-        return 0;
-    }
-    var status: u8 = 0;
-    var i: usize = 1;
-    while (i < ctx.argv.len) : (i += 1) {
-        const spec = ctx.argv[i];
-        if (std.mem.indexOfScalar(u8, spec, '=')) |at| {
-            const name = spec[0..at];
-            if (!validName(name)) {
-                ctx.errFmt("wsh: export: '{s}' is not a valid name\n", .{name});
-                status = 1;
-                continue;
-            }
-            if (ctx.sh.isReadonly(name)) {
-                ctx.errFmt("wsh: export: {s}: readonly variable\n", .{name});
-                status = 1;
-                continue;
-            }
-            ctx.sh.setEnv(name, spec[at + 1 ..]) catch return 1;
-        } else {
-            // `export NAME` promotes an existing variable.
-            if (ctx.sh.isReadonly(spec)) {
-                ctx.errFmt("wsh: export: {s}: readonly variable\n", .{spec});
-                status = 1;
-                continue;
-            }
-            if (ctx.sh.getVar(spec)) |v| {
-                const text = v.renderAlloc(ctx.sh.gpa) catch return 1;
-                defer ctx.sh.gpa.free(text);
-                ctx.sh.setEnv(spec, text) catch return 1;
-            }
-        }
-    }
-    return status;
-}
 
 fn builtinUnset(ctx: Ctx) u8 {
     if (ctx.argv.len < 2) {
@@ -408,33 +313,14 @@ fn builtinLocal(ctx: Ctx) u8 {
     return status;
 }
 
-fn builtinReadonly(ctx: Ctx) u8 {
-    if (ctx.argv.len == 1) {
-        var it = ctx.sh.readonly.iterator();
-        while (it.next()) |entry| ctx.outFmt("readonly {s}\n", .{entry.key_ptr.*});
-        return 0;
-    }
-    var status: u8 = 0;
-    for (ctx.argv[1..]) |spec| {
-        const at = std.mem.indexOfScalar(u8, spec, '=');
-        const name = if (at) |i| spec[0..i] else spec;
-        if (!validName(name)) {
-            ctx.errFmt("wsh: readonly: '{s}' is not a valid name\n", .{name});
-            status = 1;
-            continue;
-        }
-        if (ctx.sh.isReadonly(name)) {
-            ctx.errFmt("wsh: readonly: {s}: readonly variable\n", .{name});
-            status = 1;
-            continue;
-        }
-        if (at) |i| ctx.sh.setVar(name, .{ .string = spec[i + 1 ..] }) catch return 1;
-        ctx.sh.markReadonly(name) catch return 1;
-    }
-    return status;
-}
-
 fn builtinAlias(ctx: Ctx) u8 {
+    if (ctx.argv.len >= 2 and std.mem.eql(u8, ctx.argv[1], "-p")) {
+        if (exports_builtin.listAliases(ctx) != 0) return 1;
+        if (ctx.argv.len == 2) return 0;
+        var rest = ctx;
+        rest.argv = ctx.argv[1..];
+        return builtinAlias(rest);
+    }
     if (ctx.argv.len == 1) {
         var it = ctx.sh.aliases.iterator();
         while (it.next()) |entry| {
@@ -458,18 +344,31 @@ fn builtinAlias(ctx: Ctx) u8 {
 }
 
 fn builtinUnalias(ctx: Ctx) u8 {
+    if (ctx.argv.len >= 2 and std.mem.eql(u8, ctx.argv[1], "-a")) {
+        var it = ctx.sh.aliases.iterator();
+        while (it.next()) |entry| {
+            ctx.sh.gpa.free(entry.key_ptr.*);
+            ctx.sh.gpa.free(entry.value_ptr.*);
+        }
+        ctx.sh.aliases.clearRetainingCapacity();
+        return 0;
+    }
     if (ctx.argv.len < 2) {
         ctx.err("wsh: unalias: expected a name\n");
         return 1;
     }
+    var status: u8 = 0;
     var i: usize = 1;
     while (i < ctx.argv.len) : (i += 1) {
         if (ctx.sh.aliases.fetchRemove(ctx.argv[i])) |kv| {
             ctx.sh.gpa.free(kv.key);
             ctx.sh.gpa.free(kv.value);
+        } else {
+            ctx.errFmt("wsh: unalias: {s}: not found\n", .{ctx.argv[i]});
+            status = 1;
         }
     }
-    return 0;
+    return status;
 }
 
 // --- exit ------------------------------------------------------------------
@@ -971,24 +870,6 @@ fn builtinShift(ctx: Ctx) u8 {
     return 0;
 }
 
-// --- umask ------------------------------------------------------------------
-
-fn builtinUmask(ctx: Ctx) u8 {
-    if (ctx.arg(1)) |text| {
-        const mode = std.fmt.parseInt(u32, text, 8) catch {
-            ctx.errFmt("wsh: umask: {s}: invalid octal mode\n", .{text});
-            return 1;
-        };
-        _ = sys.umask(mode);
-        return 0;
-    }
-    // There is no way to read the mask without setting it, so restore it.
-    const current = sys.umask(0);
-    _ = sys.umask(current);
-    ctx.outFmt("{o:0>3}\n", .{current});
-    return 0;
-}
-
 // --- exec -------------------------------------------------------------------
 
 fn builtinExec(ctx: Ctx) u8 {
@@ -1225,18 +1106,18 @@ const table = [_]Builtin{
     .{ .name = ":", .summary = "do nothing successfully", .run = builtinNoop },
     .{ .name = "cd", .summary = "change the working directory", .run = builtinCd },
     .{ .name = "pwd", .summary = "print the working directory", .run = builtinPwd },
-    .{ .name = "pushd", .summary = "push a directory onto the stack", .run = builtinPushd },
-    .{ .name = "popd", .summary = "pop a directory off the stack", .run = builtinPopd },
-    .{ .name = "dirs", .summary = "print the directory stack", .run = builtinDirs },
+    .{ .name = "pushd", .summary = "push a directory onto the stack", .run = dirstack_builtin.pushd },
+    .{ .name = "popd", .summary = "pop a directory off the stack", .run = dirstack_builtin.popd },
+    .{ .name = "dirs", .summary = "print the directory stack", .run = dirstack_builtin.dirs },
     .{ .name = "echo", .summary = "print arguments", .run = builtinEcho },
     .{ .name = "print", .summary = "print arguments", .run = builtinPrint },
     .{ .name = "printf", .summary = "format and print arguments", .run = printf_builtin.run },
     .{ .name = "exit", .summary = "exit the shell", .run = builtinExit },
-    .{ .name = "export", .summary = "set an environment variable", .run = builtinExport },
+    .{ .name = "export", .summary = "set an environment variable", .run = exports_builtin.exportBuiltin },
     .{ .name = "unset", .summary = "remove a variable", .run = builtinUnset },
     .{ .name = "set", .summary = "list or set shell variables", .run = builtinSet },
     .{ .name = "local", .summary = "declare a function-local variable", .run = builtinLocal },
-    .{ .name = "readonly", .summary = "mark variables readonly", .run = builtinReadonly },
+    .{ .name = "readonly", .summary = "mark variables readonly", .run = exports_builtin.readonlyBuiltin },
     .{ .name = "alias", .summary = "define or list aliases", .run = builtinAlias },
     .{ .name = "unalias", .summary = "remove an alias", .run = builtinUnalias },
     .{ .name = "jobs", .summary = "list background jobs", .run = jobctl_builtin.jobsBuiltin },
@@ -1253,7 +1134,7 @@ const table = [_]Builtin{
     .{ .name = "builtin", .summary = "run a shell builtin directly", .run = builtinBuiltin },
     .{ .name = "read", .summary = "read a line into variables", .run = read_builtin.read },
     .{ .name = "shift", .summary = "shift positional parameters", .run = builtinShift },
-    .{ .name = "umask", .summary = "get or set the file-creation mask", .run = builtinUmask },
+    .{ .name = "umask", .summary = "get or set the file-creation mask", .run = process_builtin.umask },
     .{ .name = "exec", .summary = "replace the shell with a command", .run = builtinExec },
     .{ .name = "test", .summary = "evaluate a condition", .run = builtinTest },
     .{ .name = "[", .summary = "evaluate a condition", .run = builtinBracket },
@@ -1266,6 +1147,9 @@ const table = [_]Builtin{
     .{ .name = "disown", .summary = "remove jobs from the job table", .run = jobctl_builtin.disownBuiltin },
     .{ .name = "getopts", .summary = "parse positional options", .run = getopts_builtin.run },
     .{ .name = "help", .summary = "describe builtins and the language", .run = help_builtin.run },
+    .{ .name = "ulimit", .summary = "get or set resource limits", .run = process_builtin.ulimit },
+    .{ .name = "times", .summary = "print shell and child CPU times", .run = process_builtin.times },
+    .{ .name = "logout", .summary = "exit a login shell", .run = process_builtin.logout },
 };
 
 // --- tests -----------------------------------------------------------------
@@ -1520,84 +1404,6 @@ test "shift moves positional parameters" {
     try testing.expectEqual(@as(u8, 1), builtinShift(Ctx{ .sh = &sh, .argv = &not_a_number, .stderr = -1 }));
 }
 
-test "umask round trips" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    const original = sys.umask(0);
-    _ = sys.umask(original);
-    defer _ = sys.umask(original);
-
-    {
-        const cap = try Capture.open();
-        const argv = [_][]const u8{"umask"};
-        try testing.expectEqual(@as(u8, 0), builtinUmask(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        const parsed = try std.fmt.parseInt(u32, std.mem.trimEnd(u8, out, "\n"), 8);
-        try testing.expectEqual(original, parsed);
-    }
-    {
-        const argv = [_][]const u8{ "umask", "077" };
-        try testing.expectEqual(@as(u8, 0), builtinUmask(Ctx{ .sh = &sh, .argv = &argv }));
-        _ = sys.umask(0o077);
-        try testing.expectEqual(@as(u32, 0o077), sys.umask(0));
-    }
-    {
-        const argv = [_][]const u8{ "umask", "abc" };
-        try testing.expectEqual(@as(u8, 1), builtinUmask(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-    }
-}
-
-test "pushd, dirs and popd walk a directory stack" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    const original = (try fs.getCwd(testing.allocator)) orelse return error.SkipZigTest;
-    defer testing.allocator.free(original);
-    const original_z = try testing.allocator.dupeZ(u8, original);
-    defer testing.allocator.free(original_z);
-    defer _ = fs.chdir(original_z);
-
-    {
-        const cap = try Capture.open();
-        const argv = [_][]const u8{ "pushd", "/" };
-        const ctx = Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd, .stderr = -1 };
-        try testing.expectEqual(@as(u8, 0), builtinPushd(ctx));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        var expected: [linux.PATH_MAX + 3]u8 = undefined;
-        const text = try std.fmt.bufPrint(&expected, "/ {s}\n", .{original});
-        try testing.expectEqualStrings(text, out);
-        try testing.expectEqual(@as(usize, 1), sh.dir_stack.items.len);
-    }
-    {
-        const cap = try Capture.open();
-        const argv = [_][]const u8{"popd"};
-        const ctx = Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd, .stderr = -1 };
-        try testing.expectEqual(@as(u8, 0), builtinPopd(ctx));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        var expected: [linux.PATH_MAX + 2]u8 = undefined;
-        const text = try std.fmt.bufPrint(&expected, "{s}\n", .{original});
-        try testing.expectEqualStrings(text, out);
-        try testing.expectEqual(@as(usize, 0), sh.dir_stack.items.len);
-    }
-    {
-        const argv = [_][]const u8{"popd"};
-        try testing.expectEqual(@as(u8, 1), builtinPopd(Ctx{ .sh = &sh, .argv = &argv, .stdout = -1, .stderr = -1 }));
-    }
-    {
-        const argv = [_][]const u8{"dirs"};
-        const cap = try Capture.open();
-        try testing.expectEqual(@as(u8, 0), builtinDirs(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        try testing.expect(out.len > 1);
-        try testing.expectEqual(@as(u8, '\n'), out[out.len - 1]);
-    }
-}
-
 test "kill validates signals and targets" {
     var sh = try Shell.initBare(std.testing.allocator);
     defer sh.deinit();
@@ -1679,7 +1485,7 @@ test "local and readonly builtins" {
 
     {
         const argv = [_][]const u8{ "readonly", "PI=3" };
-        try testing.expectEqual(@as(u8, 0), builtinReadonly(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
+        try testing.expectEqual(@as(u8, 0), exports_builtin.readonlyBuiltin(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
         try testing.expectEqualStrings("3", sh.getVar("PI").?.string);
         try testing.expect(sh.isReadonly("PI"));
     }

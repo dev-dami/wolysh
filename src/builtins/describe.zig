@@ -4,15 +4,16 @@ const std = @import("std");
 const builtins = @import("../builtins.zig");
 const options = @import("options.zig");
 const proc = @import("../proc.zig");
+const exports = @import("exports.zig");
 
 const Ctx = builtins.Ctx;
 const Allocator = std.mem.Allocator;
 
 /// Reserved words of the language, including the POSIX ones.
 pub const keywords = [_][]const u8{
-    "let",    "if",     "else", "for",  "while", "fn",       "return", "alias", "env",
-    "break",  "continue", "then", "elif", "fi",    "do",       "done",   "case",  "esac",
-    "until",  "function", "select", "time", "in",  "[[",       "]]",     "{",     "}",
+    "let",   "if",       "else",   "for",  "while", "fn", "return", "alias", "env",
+    "break", "continue", "then",   "elif", "fi",    "do", "done",   "case",  "esac",
+    "until", "function", "select", "time", "in",    "[[", "]]",     "{",     "}",
     "!",
 };
 
@@ -91,16 +92,10 @@ fn resolve(ctx: Ctx, arena: Allocator, name: []const u8, how: Lookup) Allocator.
     return matches.items;
 }
 
-fn writeAliasDefinition(ctx: Ctx, name: []const u8, text: []const u8) void {
-    ctx.outFmt("alias {s}='", .{name});
-    var rest = text;
-    while (std.mem.indexOfScalar(u8, rest, '\'')) |at| {
-        ctx.out(rest[0..at]);
-        ctx.out("'\\''");
-        rest = rest[at + 1 ..];
-    }
-    ctx.out(rest);
-    ctx.out("'\n");
+fn writeAliasDefinition(ctx: Ctx, arena: Allocator, name: []const u8, text: []const u8) Allocator.Error!void {
+    var out: std.ArrayList(u8) = .empty;
+    try exports.writeAlias(arena, &out, name, text);
+    ctx.out(out.items);
 }
 
 fn writeVerbose(ctx: Ctx, name: []const u8, match: Match) void {
@@ -215,7 +210,7 @@ pub fn commandBuiltin(ctx: Ctx) u8 {
             if (verbose) {
                 writeVerbose(ctx, name, match);
             } else switch (match.kind) {
-                .alias => writeAliasDefinition(ctx, name, match.detail),
+                .alias => writeAliasDefinition(ctx, arena, name, match.detail) catch return 1,
                 .file => ctx.outFmt("{s}\n", .{match.detail}),
                 else => ctx.outFmt("{s}\n", .{name}),
             }

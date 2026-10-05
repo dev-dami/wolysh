@@ -313,8 +313,6 @@ pub fn read(ctx: Ctx) u8 {
         return 1;
     };
     input.finish();
-    // A silent read swallowed the user's Enter; move to a fresh line.
-    if (silent and is_tty and status == 0 and delim == '\n' and nchars == null) ctx.err("\n");
     if (status == interrupt_status) return status;
     if (status == 2) return 1;
 
