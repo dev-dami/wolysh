@@ -16,6 +16,7 @@ const command = @import("executor/command.zig");
 const expression = @import("executor/expression.zig");
 const function = @import("executor/function.zig");
 const pipeline = @import("executor/pipeline.zig");
+const session = @import("interactive/session.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -83,10 +84,12 @@ pub const isComplete = completeness.isComplete;
 pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     var status: u8 = 0;
     for (stmts) |stmt| {
+        if (sh.interrupted) return 130;
         sh.runPendingTraps();
         status = runStmt(sh, stmt);
         sh.last_status = status;
-        if (sh.should_exit or sh.return_pending or sh.break_pending or sh.continue_pending) break;
+        session.checkDirectory(sh);
+        if (sh.should_exit or sh.return_pending or sh.break_pending or sh.continue_pending or sh.interrupted) break;
     }
     return status;
 }
@@ -280,6 +283,7 @@ fn runFor(sh: *Shell, loop: ast.For) u8 {
 
     var status: u8 = 0;
     for (items.items) |item| {
+        if (sh.interrupted) break;
         _ = iter_arena.reset(.retain_capacity);
         sh.setVar(loop.name, .{ .string = item }) catch return 1;
         status = runStmts(sh, loop.body.stmts);
@@ -309,10 +313,10 @@ fn runWhile(sh: *Shell, loop: ast.While) u8 {
     loop_depth += 1;
 
     var status: u8 = 0;
-    while (true) {
+    while (!sh.interrupted) {
         _ = iter_arena.reset(.retain_capacity);
         const cond = evalExpr(sh, outer, loop.cond) catch |err| return exprError(sh, err);
-        if (!cond.truthy()) break;
+        if (!cond.truthy() or sh.interrupted) break;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
         const brk = takeBreak(sh);
@@ -380,6 +384,25 @@ fn runFunction(sh: *Shell, name: []const u8, source: []const u8, argv: []const [
         .expression_error = exprError,
         .run_statements = runStmts,
     });
+}
+
+/// Calls the shell function `name` as an interactive hook. It runs apart from
+/// any loop the caller is in, so a stray `break` in it cannot leak out.
+/// Returns null when no such function is defined.
+pub fn callFunction(sh: *Shell, name: []const u8, args: []const []const u8) ?u8 {
+    const source = sh.getFunc(name) orelse return null;
+    const argv = sh.scratch().alloc([]const u8, args.len + 1) catch return 1;
+    argv[0] = name;
+    @memcpy(argv[1..], args);
+
+    const saved = .{ loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending };
+    loop_depth = 0;
+    break_level = 0;
+    continue_level = 0;
+    sh.break_pending = false;
+    sh.continue_pending = false;
+    defer loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending = saved;
+    return runFunction(sh, name, source, argv);
 }
 
 // --- substitution -----------------------------------------------------------

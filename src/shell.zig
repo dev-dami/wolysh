@@ -765,6 +765,11 @@ pub const Shell = struct {
         }
 
         self.takeTerminal();
+        // Ctrl-C reached the job, not the shell; stop the command line too,
+        // unless the user trapped SIGINT.
+        if (self.interactive and last_signal == @intFromEnum(linux.SIG.INT) and self.getTrap(@intFromEnum(linux.SIG.INT)) == null) {
+            self.interrupted = true;
+        }
         return .{ .status = last_status, .signal = last_signal };
     }
 
