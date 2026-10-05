@@ -30,6 +30,10 @@ test {
     _ = @import("builtins/dirstack.zig");
     _ = @import("builtins/exports.zig");
     _ = @import("builtins/test.zig");
+    _ = @import("builtins/set.zig");
+    _ = @import("builtins/trap.zig");
+    _ = @import("quote.zig");
+    _ = @import("strict.zig");
     _ = @import("exec.zig");
     _ = @import("executor/assign.zig");
     _ = @import("executor/command.zig");

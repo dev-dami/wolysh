@@ -68,15 +68,51 @@ fn setHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
     _ = linux.sigaction(sig, &act, null);
 }
 
-/// Installs a disposition for one signal. Used by `trap`; `null` restores the
-/// default action, which in the interactive shell is its own handling, so
-/// `trap - INT` does not let Ctrl-C kill the shell.
+/// Dispositions in force before `trap` first changed each signal, so `trap -
+/// SIG` puts back what the shell itself had (an interactive shell ignores
+/// SIGINT, for instance).
+var original_actions: [linux.NSIG]?linux.Sigaction = [_]?linux.Sigaction{null} ** linux.NSIG;
+/// Signals a `trap '' SIG` ignores. Children keep ignoring them.
+var trap_ignored: u64 = 0;
+
+fn signalBit(sig: linux.SIG) u64 {
+    return @as(u64, 1) << @intCast(@intFromEnum(sig) - 1);
+}
+
+/// Installs a disposition for one signal. Used by `trap`.
 pub fn installHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
     if (sig == .KILL or sig == .STOP) return;
-    if (handler == null and interrupt_flag != null) {
+    var act = std.mem.zeroes(linux.Sigaction);
+    act.handler = .{ .handler = handler };
+    var old: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(sig, &act, &old)) != .SUCCESS) return;
+    const index = @intFromEnum(sig);
+    if (original_actions[index] == null) original_actions[index] = old;
+    const ignoring = if (handler) |h| @intFromPtr(h) == @intFromPtr(linux.SIG.IGN.?) else false;
+    if (ignoring) trap_ignored |= signalBit(sig) else trap_ignored &= ~signalBit(sig);
+}
+
+/// `trap - SIG`: puts back the disposition the shell had before any trap. In
+/// the interactive shell that is its own handling, so `trap - INT` does not
+/// let Ctrl-C kill the shell.
+pub fn restoreHandler(sig: linux.SIG) void {
+    if (sig == .KILL or sig == .STOP) return;
+    trap_ignored &= ~signalBit(sig);
+    if (interrupt_flag != null) {
         if (interactiveDisposition(sig)) |own| return setHandler(sig, own);
     }
-    setHandler(sig, handler);
+    const original = original_actions[@intFromEnum(sig)] orelse return setHandler(sig, linux.SIG.DFL);
+    _ = linux.sigaction(sig, &original, null);
+}
+
+/// True when the shell started with `sig` at its default action, so catching
+/// it changes nothing but the chance to run cleanup first.
+pub fn startedDefault(sig: linux.SIG) bool {
+    // SIG_DFL is the null handler.
+    if (original_actions[@intFromEnum(sig)]) |original| return original.handler.handler == null;
+    var current: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(sig, null, &current)) != .SUCCESS) return false;
+    return current.handler.handler == null;
 }
 
 /// Signals that can never be caught or ignored.
@@ -205,18 +241,13 @@ pub fn shellSignals(interrupted: *bool) void {
 
 /// Children must get the default dispositions back, otherwise Ctrl-C would be
 /// ignored by everything the shell starts. Ignored signals survive `execve`,
-/// and caught ones would run the shell's handler in a forked builtin.
+/// and caught ones would run the shell's handler in a forked builtin. Signals
+/// `trap ''` ignores stay ignored, as in other shells.
 pub fn resetSignals() void {
     interrupt_flag = null;
-    setHandler(.INT, linux.SIG.DFL);
-    setHandler(.HUP, linux.SIG.DFL);
-    setHandler(.TERM, linux.SIG.DFL);
-    setHandler(.QUIT, linux.SIG.DFL);
-    setHandler(.TSTP, linux.SIG.DFL);
-    setHandler(.TTIN, linux.SIG.DFL);
-    setHandler(.TTOU, linux.SIG.DFL);
-    setHandler(.PIPE, linux.SIG.DFL);
-    setHandler(.CHLD, linux.SIG.DFL);
+    for ([_]linux.SIG{ .INT, .HUP, .TERM, .QUIT, .TSTP, .TTIN, .TTOU, .PIPE, .CHLD }) |sig| {
+        if (trap_ignored & signalBit(sig) == 0) setHandler(sig, linux.SIG.DFL);
+    }
 }
 
 /// Builds a null-terminated argument vector in `arena`.

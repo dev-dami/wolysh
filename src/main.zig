@@ -6,6 +6,8 @@ const build_options = @import("build_options");
 const sys = @import("sys.zig");
 const shellmod = @import("shell.zig");
 const exec = @import("exec.zig");
+const strict = @import("strict.zig");
+const set_builtin = @import("builtins/set.zig");
 const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
@@ -107,7 +109,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (sh.login) {
             if (sh.interactive) proc.shellSignals(&sh.interrupted);
             login.initialise(&sh, options.no_profile);
-            if (sh.should_exit) return sh.exit_code;
+            if (sh.should_exit) return strict.finish(&sh, sh.exit_code);
         }
         if (options.rcfile) |path| {
             if (!useRcFile(&sh, gpa, path)) return 1;
@@ -118,7 +120,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (options.name) |name| sh.script_name = name;
         if (options.check) return exec.checkSource(&sh, command);
         if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
-        return exec.runSource(&sh, command);
+        return strict.finish(&sh, exec.runSource(&sh, command));
     }
 
     if (options.script) |script| {
@@ -134,7 +136,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer gpa.free(data);
         if (options.check) return exec.checkSource(&sh, data);
         if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
-        return exec.runSource(&sh, data);
+        return strict.finish(&sh, exec.runSource(&sh, data));
     }
 
     if (options.check) {
@@ -142,7 +144,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer gpa.free(data);
         return exec.checkSource(&sh, data);
     }
-    if (!sh.interactive) return stdin_script.run(&sh);
+    if (!sh.interactive) return strict.finish(&sh, stdin_script.run(&sh));
 
     return runRepl(&sh, gpa, options.no_config);
 }
@@ -264,46 +266,26 @@ fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
     return result;
 }
 
-/// One letter of a short-option group; `on` is false for the `+` form.
+/// One letter of a short-option group; `on` is false for the `+` form. The
+/// shell options are the ones `set` takes.
 fn setFlag(options: *Options, letter: u8, on: bool) bool {
-    const shell = &options.shell;
+    if (set_builtin.setByLetter(&options.shell, letter, on)) return true;
+    // The invocation-only options have no `+` form.
+    if (!on) return false;
     switch (letter) {
-        'e' => shell.errexit = on,
-        'u' => shell.nounset = on,
-        'x' => shell.xtrace = on,
-        'f' => shell.noglob = on,
-        'C' => shell.noclobber = on,
-        'a' => shell.allexport = on,
-        else => {
-            // The invocation-only options have no `+` form.
-            if (!on) return false;
-            switch (letter) {
-                'c' => options.command_mode = true,
-                's' => options.read_stdin = true,
-                'i' => options.interactive = true,
-                'l' => options.login = true,
-                'n' => options.check = true,
-                else => return false,
-            }
-        },
+        'c' => options.command_mode = true,
+        's' => options.read_stdin = true,
+        'i' => options.interactive = true,
+        'l' => options.login = true,
+        'n' => options.check = true,
+        else => return false,
     }
     return true;
 }
 
-/// `-o NAME` names; each matches a `shellmod.Options` field.
-const named_options = [_][]const u8{
-    "errexit",   "nounset",   "xtrace",     "pipefail",  "noglob",
-    "noclobber", "allexport", "histexpand", "ignoreeof", "vi",
-};
-
+/// `-o NAME`: the names `set -o` takes.
 fn setNamedOption(shell: *shellmod.Options, name: []const u8, on: bool) bool {
-    inline for (named_options) |field| {
-        if (eql(name, field)) {
-            @field(shell, field) = on;
-            return true;
-        }
-    }
-    return false;
+    return set_builtin.setByName(shell, name, on);
 }
 
 fn unknownOption(arg: []const u8) ?ParsedArgs {
@@ -430,7 +412,8 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         ) orelse {
             if (proc.hangupPending()) return hangUp(sh);
             sys.writeStr(1, "\n");
-            break;
+            if (strict.confirmExit(sh)) break;
+            continue;
         };
         if (proc.hangupPending()) return hangUp(sh);
         // A SIGINT sent while the line was being typed must not cancel it.
@@ -442,7 +425,10 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         recordHistory(sh, line, &history_error_reported);
         prompt.command_number += 1;
         session.beforeCommand(sh, line);
+        const warned = sh.exit_warned;
         var status = exec.runSource(sh, line);
+        // Only an immediately repeated `exit` gets past the stopped-jobs warning.
+        if (warned) sh.exit_warned = false;
         if (sh.interrupted) {
             status = 130;
             sh.last_status = status;
@@ -455,13 +441,14 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         sh.applyConfig();
     }
 
-    return sh.exit_code;
+    return strict.finish(sh, sh.exit_code);
 }
 
 /// SIGHUP: entries already reached the history file as they were entered, so
-/// the jobs get the hangup and the shell exits.
+/// the jobs get the hangup, the EXIT trap runs and the shell exits.
 fn hangUp(sh: *Shell) u8 {
     session.hangUpJobs(sh);
+    strict.runExitTrap(sh);
     return 129;
 }
 

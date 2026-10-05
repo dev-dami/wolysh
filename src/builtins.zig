@@ -28,6 +28,9 @@ const process_builtin = @import("builtins/process.zig");
 const dirstack_builtin = @import("builtins/dirstack.zig");
 const exports_builtin = @import("builtins/exports.zig");
 const test_builtin = @import("builtins/test.zig");
+const strict = @import("strict.zig");
+const set_builtin = @import("builtins/set.zig");
+const trap_builtin = @import("builtins/trap.zig");
 
 const Shell = shellmod.Shell;
 
@@ -270,29 +273,6 @@ fn unsetFunction(ctx: Ctx, name: []const u8) bool {
     return true;
 }
 
-fn builtinSet(ctx: Ctx) u8 {
-    // `set` with no arguments lists shell variables; `set NAME value` assigns.
-    if (ctx.argv.len == 1) {
-        var it = ctx.sh.vars.iterator();
-        while (it.next()) |entry| {
-            var out: std.Io.Writer.Allocating = .init(ctx.sh.gpa);
-            defer out.deinit();
-            entry.value_ptr.render(&out.writer) catch continue;
-            ctx.outFmt("{s} = {s}\n", .{ entry.key_ptr.*, out.writer.buffered() });
-        }
-        return 0;
-    }
-    if (ctx.argv.len < 3) {
-        ctx.err("wsh: set: expected NAME VALUE\n");
-        return 1;
-    }
-    ctx.sh.assignVar(ctx.argv[1], .{ .string = ctx.argv[2] }) catch {
-        ctx.errFmt("wsh: set: {s}: readonly variable\n", .{ctx.argv[1]});
-        return 1;
-    };
-    return 0;
-}
-
 fn builtinLocal(ctx: Ctx) u8 {
     if (ctx.argv.len < 2) {
         ctx.err("wsh: local: expected a name\n");
@@ -382,16 +362,39 @@ fn builtinUnalias(ctx: Ctx) u8 {
 // --- exit ------------------------------------------------------------------
 
 fn builtinExit(ctx: Ctx) u8 {
-    var code = ctx.sh.last_status;
-    if (ctx.arg(1)) |arg| {
-        code = std.fmt.parseInt(u8, arg, 10) catch blk: {
-            ctx.errFmt("wsh: exit: {s}: numeric argument required\n", .{arg});
+    if (!strict.confirmExit(ctx.sh)) return 1;
+    var args = ctx.argv[1..];
+    if (args.len != 0 and std.mem.eql(u8, args[0], "--")) args = args[1..];
+    var code = strict.exitTrapStatus() orelse ctx.sh.last_status;
+    if (args.len != 0) {
+        code = exitStatus(args[0]) orelse blk: {
+            ctx.errFmt("wsh: exit: {s}: numeric argument required\n", .{args[0]});
             break :blk 2;
         };
+        if (args.len > 1) ctx.err("wsh: exit: too many arguments\n");
     }
     ctx.sh.exit_code = code;
     ctx.sh.should_exit = true;
     return code;
+}
+
+/// `exit N` keeps the low eight bits, so `exit 256` is 0 and `exit -1` is 255.
+fn exitStatus(text: []const u8) ?u8 {
+    var digits = std.mem.trim(u8, text, " \t\n");
+    var negative = false;
+    if (digits.len != 0 and (digits[0] == '-' or digits[0] == '+')) {
+        negative = digits[0] == '-';
+        digits = digits[1..];
+    }
+    if (digits.len == 0) return null;
+    var n: i64 = 0;
+    for (digits) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        n = std.math.mul(i64, n, 10) catch return null;
+        n = std.math.add(i64, n, c - '0') catch return null;
+    }
+    if (negative) n = -n;
+    return @intCast(@mod(n, 256));
 }
 
 // --- jobs ------------------------------------------------------------------
@@ -722,102 +725,6 @@ fn signalLabel(n: u32, buf: *[16]u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "RTMAX-{d}", .{rtmax - n}) catch null;
 }
 
-fn builtinTrap(ctx: Ctx) u8 {
-    if (ctx.argv.len == 1) return listTraps(ctx, &.{});
-
-    var index: usize = 1;
-    if (std.mem.eql(u8, ctx.argv[index], "-p")) {
-        index += 1;
-        return listTraps(ctx, ctx.argv[index..]);
-    }
-    if (std.mem.eql(u8, ctx.argv[index], "-")) {
-        index += 1;
-        return resetTraps(ctx, ctx.argv[index..]);
-    }
-    // A single bare signal resets that handler, like `trap - INT`. With two or
-    // more operands the first is the handler and the rest are the signals.
-    if (index + 1 == ctx.argv.len and allSignals(ctx.argv[index..])) return resetTraps(ctx, ctx.argv[index..]);
-    if (index + 1 >= ctx.argv.len) {
-        ctx.err("wsh: trap: expected a signal\n");
-        return 1;
-    }
-    return setTraps(ctx, ctx.argv[index], ctx.argv[index + 1 ..]);
-}
-
-fn allSignals(tokens: []const []const u8) bool {
-    if (tokens.len == 0) return false;
-    for (tokens) |token| {
-        if (proc.signalFromName(token) == null) return false;
-    }
-    return true;
-}
-
-fn listTraps(ctx: Ctx, tokens: []const []const u8) u8 {
-    if (tokens.len == 0) {
-        var sig: u32 = 1;
-        while (sig <= Shell.max_signal) : (sig += 1) {
-            if (ctx.sh.getTrap(sig)) |handler| printTrap(ctx, sig, handler);
-        }
-        return 0;
-    }
-    var status: u8 = 0;
-    for (tokens) |token| {
-        const sig = proc.signalFromName(token) orelse {
-            ctx.errFmt("wsh: trap: {s}: invalid signal\n", .{token});
-            status = 1;
-            continue;
-        };
-        const number = @intFromEnum(sig);
-        if (ctx.sh.getTrap(number)) |handler| printTrap(ctx, number, handler);
-    }
-    return status;
-}
-
-fn printTrap(ctx: Ctx, sig: u32, handler: []const u8) void {
-    ctx.outFmt("trap -- '{s}' {s}\n", .{ handler, proc.signalName(sig) });
-}
-
-fn setTraps(ctx: Ctx, handler: []const u8, tokens: []const []const u8) u8 {
-    var status: u8 = 0;
-    for (tokens) |token| {
-        const sig = proc.signalFromName(token) orelse {
-            ctx.errFmt("wsh: trap: {s}: invalid signal\n", .{token});
-            status = 1;
-            continue;
-        };
-        if (proc.isUncatchable(sig)) {
-            ctx.errFmt("wsh: trap: {s}: cannot be caught\n", .{token});
-            status = 1;
-            continue;
-        }
-        ctx.sh.setTrap(@intFromEnum(sig), handler) catch return 1;
-        if (handler.len == 0) {
-            proc.installHandler(sig, linux.SIG.IGN);
-        } else {
-            proc.installHandler(sig, shellmod.trapHandler);
-        }
-    }
-    return status;
-}
-
-fn resetTraps(ctx: Ctx, tokens: []const []const u8) u8 {
-    if (tokens.len == 0) {
-        ctx.err("wsh: trap: expected a signal\n");
-        return 1;
-    }
-    var status: u8 = 0;
-    for (tokens) |token| {
-        const sig = proc.signalFromName(token) orelse {
-            ctx.errFmt("wsh: trap: {s}: invalid signal\n", .{token});
-            status = 1;
-            continue;
-        };
-        _ = ctx.sh.clearTrap(@intFromEnum(sig));
-        proc.installHandler(sig, linux.SIG.DFL);
-    }
-    return status;
-}
-
 // --- lookup helpers --------------------------------------------------------
 
 fn builtinWhich(ctx: Ctx) u8 {
@@ -1002,7 +909,7 @@ const table = [_]Builtin{
     .{ .name = "export", .summary = "set an environment variable", .run = exports_builtin.exportBuiltin },
     .{ .name = "import-env", .summary = "import the environment a bash script exports", .run = import_env.run },
     .{ .name = "unset", .summary = "remove a variable", .run = builtinUnset },
-    .{ .name = "set", .summary = "list or set shell variables", .run = builtinSet },
+    .{ .name = "set", .summary = "set shell options and positional parameters", .run = set_builtin.run },
     .{ .name = "local", .summary = "declare a function-local variable", .run = builtinLocal },
     .{ .name = "readonly", .summary = "mark variables readonly", .run = exports_builtin.readonlyBuiltin },
     .{ .name = "alias", .summary = "define or list aliases", .run = builtinAlias },
@@ -1013,7 +920,7 @@ const table = [_]Builtin{
     .{ .name = "fg", .summary = "bring a job to the foreground", .run = builtinFg },
     .{ .name = "bg", .summary = "resume a job in the background", .run = builtinBg },
     .{ .name = "kill", .summary = "send a signal to a process or job", .run = builtinKill },
-    .{ .name = "trap", .summary = "set or clear signal handlers", .run = builtinTrap },
+    .{ .name = "trap", .summary = "run commands on signals and shell events", .run = trap_builtin.run },
     .{ .name = "history", .summary = "show command history", .run = history_builtin.run },
     .{ .name = "which", .summary = "locate a command", .run = builtinWhich },
     .{ .name = "type", .summary = "describe how a name would be resolved", .run = describe_builtin.typeBuiltin },
@@ -1070,13 +977,6 @@ const Capture = struct {
         return out.toOwnedSlice(allocator);
     }
 };
-
-var trap_hits: usize = 0;
-
-fn testTrapRunner(_: *Shell, _: []const u8) u8 {
-    trap_hits += 1;
-    return 0;
-}
 
 test "echo joins its arguments" {
     var sh = try Shell.initBare(std.testing.allocator);
@@ -1275,67 +1175,6 @@ test "kill -l names and numbers signals" {
     }
 }
 
-test "trap stores, lists and clears handlers" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    {
-        const argv = [_][]const u8{ "trap", "echo interrupted", "INT" };
-        try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-        try testing.expectEqualStrings("echo interrupted", sh.getTrap(2).?);
-    }
-    {
-        const argv = [_][]const u8{ "trap", "x", "KILL" };
-        try testing.expectEqual(@as(u8, 1), builtinTrap(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-    }
-    {
-        const argv = [_][]const u8{ "trap", "-", "INT" };
-        try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-        try testing.expect(sh.getTrap(2) == null);
-    }
-    {
-        const cap = try Capture.open();
-        const set = [_][]const u8{ "trap", "handler", "TERM" };
-        try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &set, .stderr = -1 }));
-        const listing = [_][]const u8{"trap"};
-        const ctx = Ctx{ .sh = &sh, .argv = &listing, .stdout = cap.write_fd, .stderr = -1 };
-        try testing.expectEqual(@as(u8, 0), builtinTrap(ctx));
-        const out = try cap.finish(testing.allocator);
-        defer testing.allocator.free(out);
-        try testing.expectEqualStrings("trap -- 'handler' TERM\n", out);
-
-        const reset = [_][]const u8{ "trap", "-", "TERM" };
-        try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &reset, .stderr = -1 }));
-        try testing.expect(sh.getTrap(15) == null);
-    }
-}
-
-test "a trapped signal is installed and its handler runs" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-    trap_hits = 0;
-    sh.trap_runner = testTrapRunner;
-
-    const argv = [_][]const u8{ "trap", "note", "USR1" };
-    try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-    try testing.expectEqualStrings("note", sh.getTrap(10).?);
-
-    _ = linux.kill(linux.getpid(), linux.SIG.USR1);
-    sh.runPendingTraps();
-    try testing.expectEqual(@as(usize, 1), trap_hits);
-
-    // An empty handler ignores the signal instead of running code.
-    const ignore = [_][]const u8{ "trap", "", "USR1" };
-    try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &ignore, .stderr = -1 }));
-    _ = linux.kill(linux.getpid(), linux.SIG.USR1);
-    sh.runPendingTraps();
-    try testing.expectEqual(@as(usize, 1), trap_hits);
-
-    const reset = [_][]const u8{ "trap", "-", "USR1" };
-    try testing.expectEqual(@as(u8, 0), builtinTrap(Ctx{ .sh = &sh, .argv = &reset, .stderr = -1 }));
-    try testing.expect(sh.getTrap(10) == null);
-}
-
 test "local and readonly builtins" {
     var sh = try Shell.initBare(std.testing.allocator);
     defer sh.deinit();
@@ -1345,11 +1184,6 @@ test "local and readonly builtins" {
         try testing.expectEqual(@as(u8, 0), exports_builtin.readonlyBuiltin(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
         try testing.expectEqualStrings("3", sh.getVar("PI").?.string);
         try testing.expect(sh.isReadonly("PI"));
-    }
-    {
-        const argv = [_][]const u8{ "set", "PI", "4" };
-        try testing.expectEqual(@as(u8, 1), builtinSet(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
-        try testing.expectEqualStrings("3", sh.getVar("PI").?.string);
     }
     {
         const argv = [_][]const u8{ "unset", "PI" };
@@ -1382,4 +1216,21 @@ test "colon, exec and clear are well behaved" {
 
     const missing = [_][]const u8{ "exec", "definitely-not-a-real-binary-xyz" };
     try testing.expectEqual(@as(u8, 127), builtinExec(Ctx{ .sh = &sh, .argv = &missing, .stderr = -1 }));
+}
+
+test "exit keeps the low eight bits and rejects non-numbers" {
+    try testing.expectEqual(@as(?u8, 0), exitStatus("256"));
+    try testing.expectEqual(@as(?u8, 255), exitStatus("-1"));
+    try testing.expectEqual(@as(?u8, 3), exitStatus(" 3 "));
+    try testing.expectEqual(@as(?u8, 4), exitStatus("+4"));
+    try testing.expectEqual(@as(?u8, null), exitStatus("abc"));
+    try testing.expectEqual(@as(?u8, null), exitStatus("-"));
+    try testing.expectEqual(@as(?u8, null), exitStatus("99999999999999999999"));
+
+    var sh = try Shell.initBare(std.testing.allocator);
+    defer sh.deinit();
+    const argv = [_][]const u8{ "exit", "nope" };
+    try testing.expectEqual(@as(u8, 2), builtinExit(Ctx{ .sh = &sh, .argv = &argv, .stderr = -1 }));
+    try testing.expect(sh.should_exit);
+    try testing.expectEqual(@as(u8, 2), sh.exit_code);
 }

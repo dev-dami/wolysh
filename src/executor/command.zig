@@ -10,6 +10,7 @@ const parser_mod = @import("../parser.zig");
 const proc = @import("../proc.zig");
 const shellmod = @import("../shell.zig");
 const sys = @import("../sys.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 const RunSource = *const fn (*Shell, []const u8) u8;
@@ -239,12 +240,10 @@ fn builtinSource(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8
     const data = (fs.readFileAlloc(arena, z, 16 << 20) catch null) orelse return sourceError(sh, name, "cannot read file");
 
     // Arguments become the file's positional parameters for the duration of
-    // the run; without them the file shares the caller's. `$0` is left alone.
-    const saved_positional = sh.positional;
-    if (argv.len > 2) sh.positional = argv[2..];
-    defer if (argv.len > 2) {
-        sh.positional = saved_positional;
-    };
+    // the run; without them the file shares the caller's, so its `set --`
+    // reaches the caller. `$0` is left alone.
+    const saved_positional: ?Shell.SavedPositional = if (argv.len > 2) sh.pushPositional(argv[2..]) else null;
+    defer if (saved_positional) |saved| sh.popPositional(saved);
 
     // `return` ends the sourced file only, with its status.
     const saved_return = sh.return_pending;
@@ -256,7 +255,10 @@ fn builtinSource(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
     }
+    strict.traceDeeper();
     const status = run_source(sh, data);
+    strict.traceShallower();
+    strict.runReturnTrap(sh);
     return if (sh.return_pending) sh.return_code else status;
 }
 
@@ -289,6 +291,8 @@ fn builtinEval(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8 {
         if (index != 0) joined.append(arena, ' ') catch return 1;
         joined.appendSlice(arena, part) catch return 1;
     }
+    strict.traceDeeper();
+    defer strict.traceShallower();
     return run_source(sh, joined.items);
 }
 

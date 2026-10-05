@@ -548,17 +548,25 @@ pub const Expander = struct {
 
     /// `$-`: the option letters the shell is running with.
     fn optionLetters(self: *Expander) []const u8 {
+        const o = self.sh.options;
+        const flags = [_]struct { u8, bool }{
+            .{ 'a', o.allexport },
+            .{ 'e', o.errexit },
+            .{ 'f', o.noglob },
+            .{ 'i', self.sh.interactive },
+            .{ 'l', self.sh.login },
+            .{ 'm', self.sh.job_control },
+            .{ 'u', o.nounset },
+            .{ 'x', o.xtrace },
+            .{ 'C', o.noclobber },
+            .{ 'E', o.errtrace },
+            // History expansion only ever applies to interactive input.
+            .{ 'H', o.histexpand and self.sh.interactive },
+        };
         var n: usize = 0;
-        if (self.sh.interactive) {
-            self.scratch[n] = 'i';
-            n += 1;
-        }
-        if (self.sh.login) {
-            self.scratch[n] = 'l';
-            n += 1;
-        }
-        if (self.sh.job_control) {
-            self.scratch[n] = 'm';
+        for (flags) |flag| {
+            if (!flag[1]) continue;
+            self.scratch[n] = flag[0];
             n += 1;
         }
         return self.scratch[0..n];
@@ -1190,10 +1198,17 @@ test "$- reports option letters, never its literal text" {
     try testing.expectEqualStrings("", try expandLiteral(&sh, arena, "$-"));
 
     sh.interactive = true;
-    try testing.expectEqualStrings("i", try expandLiteral(&sh, arena, "$-"));
+    try testing.expectEqualStrings("iH", try expandLiteral(&sh, arena, "$-"));
 
     sh.login = true;
-    try testing.expectEqualStrings("il", try expandLiteral(&sh, arena, "$-"));
+    try testing.expectEqualStrings("ilH", try expandLiteral(&sh, arena, "$-"));
+
+    sh.interactive = false;
+    sh.login = false;
+    sh.options.errexit = true;
+    sh.options.nounset = true;
+    sh.options.xtrace = true;
+    try testing.expectEqualStrings("eux", try expandLiteral(&sh, arena, "$-"));
 }
 
 test "$10 is one digit followed by a literal zero" {

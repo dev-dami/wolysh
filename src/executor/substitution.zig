@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const proc = @import("../proc.zig");
 const shellmod = @import("../shell.zig");
 const sys = @import("../sys.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 pub const RunSource = *const fn (*Shell, []const u8) u8;
@@ -22,7 +23,8 @@ fn child(ctx_ptr: *anyopaque) noreturn {
     sh.job_control = false;
     sh.tty_fd = -1;
     sh.should_exit = false;
-    linux.exit(payload.run_source(sh, payload.src));
+    strict.enterSubstitution(sh);
+    strict.exitChild(sh, payload.run_source(sh, payload.src));
 }
 
 pub fn run(
