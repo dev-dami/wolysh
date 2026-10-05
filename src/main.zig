@@ -10,6 +10,8 @@ const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
 const prompt = @import("interactive/prompt.zig");
+const session = @import("interactive/session.zig");
+const history = @import("history.zig");
 
 const Shell = shellmod.Shell;
 
@@ -219,7 +221,7 @@ fn readAllStdin(gpa: std.mem.Allocator) ?[]u8 {
 // --- interactive shell ------------------------------------------------------
 
 fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
-    proc.shellSignals();
+    proc.shellSignals(&sh.interrupted);
     takeControllingTerminal(sh);
 
     setupPaths(sh, gpa) catch {};
@@ -236,33 +238,84 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
 
     if (sh.login) sys.writeStr(1, "wolysh — type `help` in your shell for the language overview\n");
 
+    session.begin(sh);
+    defer session.end(sh);
+    var history_error_reported = false;
+
     while (!sh.should_exit) {
         sh.resetLineArena();
         sh.reapJobs();
         sh.notifyFinishedJobs(2);
+        if (proc.hangupPending()) return hangUp(sh);
+
+        sh.interrupted = false;
+        session.beforePrompt(sh);
+        sh.interrupted = false;
 
         prompt_allocating.writer.end = 0;
         prompt.write(&prompt_allocating.writer, sh) catch {};
+        prompt_allocating.writer.writeAll(session.promptEnd()) catch {};
+        // The editor redraws only the prompt's last line, so earlier lines of
+        // a multi-line prompt are printed once, up front.
+        const full_prompt = prompt_allocating.writer.buffered();
+        const last_line = if (std.mem.lastIndexOfScalar(u8, full_prompt, '\n')) |newline| newline + 1 else 0;
+        sys.writeStr(2, full_prompt[0..last_line]);
         const source = editor_state.readCommand(
-            prompt_allocating.writer.buffered(),
+            full_prompt[last_line..],
             exec.isComplete,
             prompt.writeContinuation,
         ) orelse {
+            if (proc.hangupPending()) return hangUp(sh);
             sys.writeStr(1, "\n");
             break;
         };
+        if (proc.hangupPending()) return hangUp(sh);
+        // A SIGINT sent while the line was being typed must not cancel it.
+        sh.interrupted = false;
         if (editor_state.interrupted) continue;
         if (source.len == 0) continue;
 
-        sh.hist.add(gpa, source) catch {};
-        _ = exec.runSource(sh, source);
+        recordHistory(sh, source, &history_error_reported);
+        prompt.command_number += 1;
+        session.beforeCommand(sh, source);
+        var status = exec.runSource(sh, source);
+        if (sh.interrupted) {
+            status = 130;
+            sh.last_status = status;
+            // Keep the echoed ^C on its own line, as bash does.
+            sys.writeStr(2, "\n");
+        }
+        session.afterCommand(status);
         // `let prompt = ...` or `let autosuggest = false` should take effect
         // on the very next prompt.
         sh.applyConfig();
     }
 
-    saveHistory(sh);
     return sh.exit_code;
+}
+
+/// SIGHUP: entries already reached the history file as they were entered, so
+/// the jobs get the hangup and the shell exits.
+fn hangUp(sh: *Shell) u8 {
+    session.hangUpJobs(sh);
+    return 129;
+}
+
+/// Adds an entered line to the history under `HISTCONTROL` and appends it to
+/// the history file at once. A file that cannot be written is reported once.
+fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) void {
+    var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
+    defer arena_state.deinit();
+    const control_text = prompt.textVar(sh, arena_state.allocator(), "HISTCONTROL") catch null;
+    const entry = (sh.hist.record(sh.gpa, source, history.Control.parse(control_text)) catch return) orelse return;
+    if (sh.history_path.len == 0) return;
+    sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
+        if (reported.*) return;
+        reported.* = true;
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot write {s}\n", .{sh.history_path}) catch return;
+        sys.writeStr(2, msg);
+    };
 }
 
 /// Puts the shell in its own process group and claims the terminal, which is
@@ -312,12 +365,11 @@ fn loadConfig(sh: *Shell) void {
 fn loadHistory(sh: *Shell) void {
     if (sh.history_path.len == 0) return;
     sh.hist.limit = sh.config.history_limit;
-    sh.hist.load(sh.gpa, sh.history_path) catch {};
-}
-
-fn saveHistory(sh: *Shell) void {
-    if (sh.history_path.len == 0) return;
-    sh.hist.save(sh.gpa, sh.history_path);
+    sh.hist.load(sh.gpa, sh.history_path) catch {
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot load {s}\n", .{sh.history_path}) catch return;
+        sys.writeStr(2, msg);
+    };
 }
 
 test "argument parsing" {

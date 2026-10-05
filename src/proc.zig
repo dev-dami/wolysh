@@ -69,9 +69,13 @@ fn setHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
 }
 
 /// Installs a disposition for one signal. Used by `trap`; `null` restores the
-/// default action.
+/// default action, which in the interactive shell is its own handling, so
+/// `trap - INT` does not let Ctrl-C kill the shell.
 pub fn installHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
     if (sig == .KILL or sig == .STOP) return;
+    if (handler == null and interrupt_flag != null) {
+        if (interactiveDisposition(sig)) |own| return setHandler(sig, own);
+    }
     setHandler(sig, handler);
 }
 
@@ -150,9 +154,48 @@ pub fn signalName(sig: u32) []const u8 {
     };
 }
 
-/// Signals the shell itself ignores while it waits for children.
-pub fn shellSignals() void {
-    setHandler(.INT, linux.SIG.IGN);
+/// The interactive shell's `Shell.interrupted`, raised by the SIGINT and SIGHUP
+/// handlers. Volatile because a handler writes it behind the compiler's back.
+var interrupt_flag: ?*volatile bool = null;
+var hangup_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn onInterrupt(_: linux.SIG) callconv(.c) void {
+    if (interrupt_flag) |flag| flag.* = true;
+}
+
+fn onHangup(_: linux.SIG) callconv(.c) void {
+    hangup_received.store(true, .monotonic);
+    if (interrupt_flag) |flag| flag.* = true;
+    // The shell may be blocked waiting for a foreground job; hang that up too,
+    // as a real terminal hangup does, so the shell gets to act on it.
+    var foreground: linux.pid_t = 0;
+    if (linux.errno(linux.tcgetpgrp(0, &foreground)) != .SUCCESS or foreground <= 0) return;
+    if (foreground != @as(linux.pid_t, @intCast(linux.getpgid(0)))) _ = linux.kill(-foreground, .HUP);
+}
+
+/// What the interactive shell does with `sig` when no trap is set.
+fn interactiveDisposition(sig: linux.SIG) ?linux.Sigaction.handler_fn {
+    return switch (sig) {
+        .INT => onInterrupt,
+        .HUP => onHangup,
+        .TERM, .QUIT, .TSTP, .TTIN, .TTOU, .PIPE => linux.SIG.IGN,
+        else => null,
+    };
+}
+
+/// True once SIGHUP reached the interactive shell; the REPL then hangs up.
+pub fn hangupPending() bool {
+    return hangup_received.load(.monotonic);
+}
+
+/// Dispositions for the interactive shell. SIGINT and SIGHUP are caught
+/// without `SA_RESTART`, so a blocking read or wait returns EINTR instead of
+/// resuming and the command line can stop; SIGTERM is ignored, as in bash.
+pub fn shellSignals(interrupted: *bool) void {
+    interrupt_flag = interrupted;
+    setHandler(.INT, onInterrupt);
+    setHandler(.HUP, onHangup);
+    setHandler(.TERM, linux.SIG.IGN);
     setHandler(.QUIT, linux.SIG.IGN);
     setHandler(.TSTP, linux.SIG.IGN);
     setHandler(.TTIN, linux.SIG.IGN);
@@ -161,9 +204,13 @@ pub fn shellSignals() void {
 }
 
 /// Children must get the default dispositions back, otherwise Ctrl-C would be
-/// ignored by everything the shell starts.
+/// ignored by everything the shell starts. Ignored signals survive `execve`,
+/// and caught ones would run the shell's handler in a forked builtin.
 pub fn resetSignals() void {
+    interrupt_flag = null;
     setHandler(.INT, linux.SIG.DFL);
+    setHandler(.HUP, linux.SIG.DFL);
+    setHandler(.TERM, linux.SIG.DFL);
     setHandler(.QUIT, linux.SIG.DFL);
     setHandler(.TSTP, linux.SIG.DFL);
     setHandler(.TTIN, linux.SIG.DFL);

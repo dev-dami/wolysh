@@ -24,4 +24,6 @@ test {
     _ = @import("main.zig");
     _ = @import("interactive/editor.zig");
     _ = @import("interactive/prompt.zig");
+    _ = @import("interactive/localtime.zig");
+    _ = @import("interactive/session.zig");
 }

@@ -10,6 +10,7 @@ const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
 const subshell = @import("subshell.zig");
 const assign = @import("assign.zig");
+const session = @import("../interactive/session.zig");
 
 const Shell = shellmod.Shell;
 
@@ -54,6 +55,9 @@ pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
     var status = runPipeline(sh, chain.commands, chain.background, runtime);
     if (chain.negate) status = invert(status);
     for (chain.links) |link| {
+        if (sh.interrupted) break;
+        // `cd dir && make`: chpwd runs before `make`, as it would in zsh.
+        session.checkDirectory(sh);
         const should_run = switch (link.op) {
             .and_ => status == 0,
             .or_ => status != 0,

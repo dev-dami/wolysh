@@ -111,6 +111,11 @@ def strip_ansi(b):
                 while j < len(b) and not (0x40 <= b[j] <= 0x7E):
                     j += 1
                 j += 1
+            elif j < len(b) and b[j:j+1] == b"]":
+                # OSC (terminal integration): ends at BEL or ESC \.
+                while j < len(b) and b[j] not in (0x07, 0x1B):
+                    j += 1
+                j += 2 if j < len(b) and b[j] == 0x1B else 1
             else:
                 j += 1
             i = j

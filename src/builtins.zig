@@ -15,6 +15,7 @@ const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
 const cd = @import("builtins/cd.zig");
+const history_builtin = @import("builtins/history.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1038,32 +1039,6 @@ fn resetTraps(ctx: Ctx, tokens: []const []const u8) u8 {
     return status;
 }
 
-// --- history ---------------------------------------------------------------
-
-fn builtinHistory(ctx: Ctx) u8 {
-    const sub = ctx.arg(1);
-    if (sub != null and std.mem.eql(u8, sub.?, "clear")) {
-        for (ctx.sh.hist.entries.items) |entry| ctx.sh.gpa.free(entry);
-        ctx.sh.hist.entries.clearRetainingCapacity();
-        return 0;
-    }
-
-    var limit: usize = 0; // 0 means everything
-    if (sub) |s| {
-        if (std.fmt.parseInt(usize, s, 10)) |n| {
-            limit = n;
-        } else |_| {}
-    }
-
-    const total = ctx.sh.hist.count();
-    const start = if (limit != 0 and total > limit) total - limit else 0;
-    var i = start;
-    while (i < total) : (i += 1) {
-        ctx.outFmt("{d: >5}  {s}\n", .{ i + 1, ctx.sh.hist.get(i) });
-    }
-    return 0;
-}
-
 // --- lookup helpers --------------------------------------------------------
 
 fn builtinWhich(ctx: Ctx) u8 {
@@ -1323,7 +1298,7 @@ fn builtinExec(ctx: Ctx) u8 {
     }
 
     // Still here: an interactive shell carries on with its own dispositions.
-    if (ctx.sh.interactive) proc.shellSignals();
+    if (ctx.sh.interactive) proc.shellSignals(&ctx.sh.interrupted);
     const buf = arena.alloc(u8, path.len + 512) catch return 127;
     const failure = proc.describeExecFailure(buf, path, err);
     ctx.err(failure.text);
@@ -1677,7 +1652,7 @@ const table = [_]Builtin{
     .{ .name = "bg", .summary = "resume a job in the background", .run = builtinBg },
     .{ .name = "kill", .summary = "send a signal to a process or job", .run = builtinKill },
     .{ .name = "trap", .summary = "set or clear signal handlers", .run = builtinTrap },
-    .{ .name = "history", .summary = "show command history", .run = builtinHistory },
+    .{ .name = "history", .summary = "show command history", .run = history_builtin.run },
     .{ .name = "which", .summary = "locate a command", .run = builtinWhich },
     .{ .name = "type", .summary = "describe how a name would be resolved", .run = builtinType },
     .{ .name = "command", .summary = "run a command bypassing functions", .run = builtinCommand },
