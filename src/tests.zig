@@ -15,6 +15,7 @@ test {
     _ = @import("shell.zig");
     _ = @import("expand.zig");
     _ = @import("arith.zig");
+    _ = @import("regex.zig");
     _ = @import("builtins.zig");
     _ = @import("builtins/test.zig");
     _ = @import("exec.zig");
