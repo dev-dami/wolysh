@@ -713,7 +713,7 @@ pub const Expander = struct {
             },
             .length => {
                 if (p.list) {
-                    if (p.undeclared) try self.requireSet(.{ .set = false }, ref);
+                    if (p.undeclared) try self.requireSet(.{ .set = false }, .{ .name = b.name, .subscript = null });
                     return self.emit(try self.number(p.items.len), quoted);
                 }
                 try self.requireSet(p, ref);

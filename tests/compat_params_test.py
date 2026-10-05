@@ -228,6 +228,8 @@ class BashComparisonTests(unittest.TestCase):
             "set -u; declare -A m; echo ${m[k]}; echo after",
             "set -u; echo \"${a[@]}\"; a=(); echo \"${a[@]}\" ${#a[@]}; echo after",
             "set -u; echo ${nope#x}; echo after",
+            "set -u; echo ${#nope[@]}; echo after",
+            "set -u; (echo $nope); echo \"after $?\"",
         ])
 
 
