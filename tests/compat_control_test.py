@@ -103,6 +103,22 @@ class ControlFlowTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(result.stdout, b"one\ntwo\nfirst\nsecond\nglob\npath\nparen\nstatus 0\n")
 
+    def test_case_and_loops_inside_substitutions(self):
+        result = run_shell(
+            'kind=$(case "$1" in *.tar.gz|*.tgz) echo tarball;; *.zip) echo zip;; *) echo other;; esac)\n'
+            'echo "$kind"\n'
+            'for word in `echo alpha beta`; do echo "[$word]"; done\n'
+            'case `echo x` in x) echo backquoted;; esac\n'
+            'if (test -n "$kind") then echo subshell-then; fi\n'
+            'while { false; } do :; done; echo group-do',
+            "release.tar.gz",
+        )
+        self.assert_success(result)
+        self.assertEqual(
+            result.stdout,
+            b"tarball\n[alpha]\n[beta]\nbackquoted\nsubshell-then\ngroup-do\n",
+        )
+
     def test_function_with_local_and_return(self):
         result = run_shell(
             'total=outside\n'
