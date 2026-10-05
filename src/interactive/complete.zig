@@ -1510,3 +1510,17 @@ test "helper processes time out" {
     try testing.expect(runHelper(&sh, arena, &.{ "sleep", "5" }, 100, false) == null);
     try testing.expect(nowMs() - started < 2000);
 }
+
+test "long options of a command come from its --help" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    defer resetCaches();
+    try sh.setEnv("PATH", "/usr/bin:/bin");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const res = try complete(&sh, arena_state.allocator(), "ls --almost-a", 13);
+    try testing.expectEqual(@as(usize, 1), res.items.len);
+    try testing.expectEqualStrings("--almost-all ", res.items[0]);
+    try testing.expect(option_cache.get("ls") != null);
+}
