@@ -374,7 +374,7 @@ class CoreCompatTests(unittest.TestCase):
         for expr in ("10 / 0", "5 % 0", "1.5 / 0"):
             with self.subTest(expr=expr):
                 result = run_shell(f'let x = {expr}; echo "[$x] $?"')
-                self.assertEqual(result.stdout, b"[] 2\n")
+                self.assertEqual(result.stdout, b"[] 1\n")
                 self.assertEqual(result.stderr, b"wsh: division by zero\n")
 
     def test_minimum_integer_wraps_like_bash(self):

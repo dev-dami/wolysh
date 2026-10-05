@@ -15,6 +15,7 @@ test {
     _ = @import("shell.zig");
     _ = @import("expand.zig");
     _ = @import("arith.zig");
+    _ = @import("regex.zig");
     _ = @import("builtins.zig");
     _ = @import("builtins/cd.zig");
     _ = @import("builtins/printf.zig");
@@ -28,6 +29,7 @@ test {
     _ = @import("builtins/process.zig");
     _ = @import("builtins/dirstack.zig");
     _ = @import("builtins/exports.zig");
+    _ = @import("builtins/test.zig");
     _ = @import("exec.zig");
     _ = @import("executor/assign.zig");
     _ = @import("executor/command.zig");
