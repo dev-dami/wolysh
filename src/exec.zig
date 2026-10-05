@@ -195,6 +195,10 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             sys.writeStr(sh.default_err, "wsh: readonly variable\n");
             return 1;
         },
+        error.BraceExpansionTooLarge => {
+            sys.writeStr(sh.default_err, "wsh: brace expansion: too many words\n");
+            return 1;
+        },
         else => {
             var buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{@errorName(err)}) catch "wsh: error\n";
