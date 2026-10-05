@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const printf_builtin = @import("builtins/printf.zig");
 
 const Shell = shellmod.Shell;
 
@@ -168,107 +169,6 @@ fn builtinPrint(ctx: Ctx) u8 {
     // `print` is the scripting-language spelling: it also renders non-string
     // values, but by the time a builtin runs everything is already a string.
     return builtinEcho(ctx);
-}
-
-fn builtinPrintf(ctx: Ctx) u8 {
-    const format = ctx.arg(1) orelse {
-        ctx.err("wsh: printf: expected a format string\n");
-        return 2;
-    };
-    const args = ctx.argv[2..];
-
-    var out = sys.StringBuilder.init(ctx.sh.gpa);
-    defer out.deinit();
-
-    // POSIX reuses the format until the arguments are exhausted; a pass that
-    // consumes nothing ends the loop, so a format without conversions prints
-    // exactly once.
-    var index: usize = 0;
-    var first = true;
-    while (first or index < args.len) {
-        first = false;
-        const before = index;
-        printfOnce(&out, format, args, &index);
-        if (index == before) break;
-    }
-
-    sys.writeStr(ctx.stdout, out.items());
-    return 0;
-}
-
-fn printfOnce(out: *sys.StringBuilder, format: []const u8, args: []const []const u8, index: *usize) void {
-    var i: usize = 0;
-    while (i < format.len) : (i += 1) {
-        const c = format[i];
-        if (c == '\\') {
-            const escape: u8 = if (i + 1 < format.len) format[i + 1] else 0;
-            i += 1;
-            switch (escape) {
-                'a' => out.append("\x07") catch return,
-                'b' => out.append("\x08") catch return,
-                'e' => out.append("\x1b") catch return,
-                'f' => out.append("\x0c") catch return,
-                'n' => out.append("\n") catch return,
-                'r' => out.append("\r") catch return,
-                't' => out.append("\t") catch return,
-                'v' => out.append("\x0b") catch return,
-                '\\' => out.append("\\") catch return,
-                '0'...'7' => {
-                    var octal: u32 = 0;
-                    var digits: usize = 0;
-                    if (format[i] == '0') i += 1;
-                    while (digits < 3 and i < format.len and format[i] >= '0' and format[i] <= '7') {
-                        octal = octal * 8 + (format[i] - '0');
-                        i += 1;
-                        digits += 1;
-                    }
-                    i -= 1;
-                    out.appendByte(@intCast(octal & 0xff)) catch return;
-                },
-                0 => {
-                    out.append("\\") catch return;
-                    return;
-                },
-                else => {
-                    out.append("\\") catch return;
-                    out.append(format[i .. i + 1]) catch return;
-                },
-            }
-            continue;
-        }
-        if (c != '%' or i + 1 >= format.len) {
-            out.appendByte(c) catch return;
-            continue;
-        }
-        i += 1;
-        switch (format[i]) {
-            '%' => out.append("%") catch return,
-            's' => out.append(nextArg(args, index)) catch return,
-            'd', 'i' => {
-                const text = nextArg(args, index);
-                const n = std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t"), 10) catch 0;
-                out.print("{d}", .{n}) catch return;
-            },
-            'c' => {
-                const text = nextArg(args, index);
-                if (text.len != 0) out.appendByte(text[0]) catch return;
-            },
-            else => {
-                out.append("%") catch return;
-                out.appendByte(format[i]) catch return;
-            },
-        }
-    }
-}
-
-fn nextArg(args: []const []const u8, index: *usize) []const u8 {
-    if (index.* >= args.len) {
-        index.* += 1;
-        return "";
-    }
-    const text = args[index.*];
-    index.* += 1;
-    return text;
 }
 
 fn builtinPwd(ctx: Ctx) u8 {
@@ -1572,7 +1472,7 @@ const table = [_]Builtin{
     .{ .name = "dirs", .summary = "print the directory stack", .run = builtinDirs },
     .{ .name = "echo", .summary = "print arguments", .run = builtinEcho },
     .{ .name = "print", .summary = "print arguments", .run = builtinPrint },
-    .{ .name = "printf", .summary = "format and print arguments", .run = builtinPrintf },
+    .{ .name = "printf", .summary = "format and print arguments", .run = printf_builtin.run },
     .{ .name = "exit", .summary = "exit the shell", .run = builtinExit },
     .{ .name = "export", .summary = "set an environment variable", .run = builtinExport },
     .{ .name = "unset", .summary = "remove a variable", .run = builtinUnset },
@@ -1701,33 +1601,6 @@ test "echo bundles flags and expands escapes" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings("stop", out);
     }
-}
-
-test "printf formats, escapes and reuses its format" {
-    var sh = try Shell.initBare(std.testing.allocator);
-    defer sh.deinit();
-
-    const cap = try Capture.open();
-    {
-        const argv = [_][]const u8{ "printf", "%s=%d\\n", "a", "3" };
-        try testing.expectEqual(@as(u8, 0), builtinPrintf(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-    }
-    {
-        const argv = [_][]const u8{ "printf", "%s\\n", "x", "y" };
-        try testing.expectEqual(@as(u8, 0), builtinPrintf(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-    }
-    {
-        const argv = [_][]const u8{ "printf", "%c%%", "Z" };
-        try testing.expectEqual(@as(u8, 0), builtinPrintf(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-    }
-    {
-        // No conversions: the format is printed once even with extra arguments.
-        const argv = [_][]const u8{ "printf", "hi\\n", "a", "b" };
-        try testing.expectEqual(@as(u8, 0), builtinPrintf(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
-    }
-    const out = try cap.finish(testing.allocator);
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("a=3\nx\ny\nZ%hi\n", out);
 }
 
 test "wait with no jobs succeeds and rejects unknown specs" {
