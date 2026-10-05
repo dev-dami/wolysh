@@ -1350,10 +1350,19 @@ fn builtinRead(ctx: Ctx) u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.sh.gpa);
 
+    // End of input before a newline fails, which is what ends
+    // `while read line; do ...; done`.
+    var at_eof = false;
     while (true) {
-        const c = sys.readByte(ctx.stdin) orelse break;
+        const c = sys.readByte(ctx.stdin) orelse {
+            at_eof = true;
+            break;
+        };
         if (!raw and c == '\\') {
-            const escaped = sys.readByte(ctx.stdin) orelse break;
+            const escaped = sys.readByte(ctx.stdin) orelse {
+                at_eof = true;
+                break;
+            };
             // Without -r, a trailing backslash continues onto the next line.
             if (escaped == '\n') continue;
             buf.append(ctx.sh.gpa, escaped) catch return 1;
@@ -1372,7 +1381,7 @@ fn builtinRead(ctx: Ctx) u8 {
         const field = nextField(line, &pos, ifs, last) orelse "";
         ctx.sh.assignVar(name, .{ .string = field }) catch return 1;
     }
-    return 0;
+    return if (at_eof) 1 else 0;
 }
 
 // --- test ------------------------------------------------------------------
