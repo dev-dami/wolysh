@@ -154,6 +154,7 @@ ARRAY_CASES = [
     "declare -A m=([b]=2 [a]=1 [c]=3); printf '%s\\n' \"${!m[@]}\" | sort | tr '\\n' ' '; "
     "printf '%s\\n' \"${m[@]}\" | sort | tr '\\n' ' '; echo",
     "declare -A m=([a]=1 [b]=2); unset 'm[a]'; declare -p m; echo ${#m[@]} ${m[b]}",
+    "declare -A m=([\"a b\"]=1 [c]=2 [d]=3); k=c; unset 'm[$k]' \"m[a b]\"; declare -p m; i=1; a=(x y z); unset 'a[i]'; echo ${!a[@]}",
 ]
 
 DECLARE_CASES = [

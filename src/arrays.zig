@@ -179,31 +179,32 @@ pub fn assignElement(
     append: bool,
 ) Error!void {
     if (sh.isReadonly(name)) return error.ReadonlyVariable;
-    var ptr = sh.vars.getPtr(name);
-    if (ptr == null or (ptr.?.* != .list and ptr.?.* != .map)) {
+    const existing = sh.vars.get(name);
+    if (existing == null or (existing.? != .list and existing.? != .map)) {
         var initial: []const Value = &.{};
         if (current(sh, name)) |v| {
             if (v != .none) initial = try arena.dupe(Value, &.{v});
         }
         try sh.setVar(name, .{ .list = initial });
-        ptr = sh.vars.getPtr(name);
+        // `RANDOM` and `SECONDS` take the assignment instead of storing it.
+        if (sh.vars.get(name) == null) return sh.setVar(name, .{ .string = text });
     }
-    const slot = ptr.?;
     const attrs = sh.getAttrs(name);
-    switch (slot.*) {
-        .map => |entries| {
-            const key = try expand.expandLiteral(sh, arena, subscript);
-            const index = findEntry(entries, key);
-            const old: ?Value = if (index) |i| entries[i].value else null;
-            try storeEntry(sh.gpa, slot, key, try combine(sh, arena, attrs, old, text, append));
-        },
-        .list => |items| {
-            const index = try resolveIndex(sh, arena, name, subscript, items.len);
-            const old: ?Value = if (index < items.len) items[index] else null;
-            try storeItem(sh.gpa, slot, index, try combine(sh, arena, attrs, old, text, append));
-        },
-        else => unreachable,
+    // The subscript and an `-i` value are expanded and evaluated first: that
+    // can assign other variables and move the stored array, so the slot is
+    // looked up again just before the store.
+    if (sh.vars.get(name).? == .map) {
+        const key = try expand.expandLiteral(sh, arena, subscript);
+        const entries = sh.vars.get(name).?.map;
+        const old: ?Value = if (findEntry(entries, key)) |i| entries[i].value else null;
+        const item = try combine(sh, arena, attrs, old, text, append);
+        return storeEntry(sh.gpa, sh.vars.getPtr(name).?, key, item);
     }
+    const index = try resolveIndex(sh, arena, name, subscript, sh.vars.get(name).?.list.len);
+    const items = sh.vars.get(name).?.list;
+    const old: ?Value = if (index < items.len) items[index] else null;
+    const item = try combine(sh, arena, attrs, old, text, append);
+    try storeItem(sh.gpa, sh.vars.getPtr(name).?, index, item);
 }
 
 /// Evaluates an indexed-array subscript. A negative index counts back from
@@ -399,61 +400,63 @@ pub fn unsetElement(sh: *Shell, spec: []const u8) ?u8 {
         expand.report(sh, "wsh: unset: {s}: readonly variable\n", .{name});
         return 1;
     }
-    const slot = sh.vars.getPtr(name) orelse return 0;
+    const stored = sh.vars.get(name) orelse return 0;
     const whole = std.mem.eql(u8, subscript, "@") or std.mem.eql(u8, subscript, "*");
-    switch (slot.*) {
-        .map => |entries| {
-            if (whole) {
-                sh.setVar(name, .{ .map = &.{} }) catch return 1;
-                return 0;
-            }
-            // The quoted argument was already expanded once; the key is used
-            // as written so `unset "m[$k]"` cannot expand twice.
-            const index = findEntry(entries, subscript) orelse return 0;
-            const shrunk = sh.gpa.alloc(value.Entry, entries.len - 1) catch return 1;
-            @memcpy(shrunk[0..index], entries[0..index]);
-            @memcpy(shrunk[index..], entries[index + 1 ..]);
-            shellmod.freeEntry(sh.gpa, entries[index]);
-            sh.gpa.free(entries);
-            slot.* = .{ .map = shrunk };
+    if (stored == .map) {
+        if (whole) {
+            sh.setVar(name, .{ .map = &.{} }) catch return 1;
             return 0;
-        },
-        .list => |items| {
-            if (whole) {
-                sh.setVar(name, .{ .list = &.{} }) catch return 1;
-                return 0;
-            }
-            const arena = sh.scratch();
-            const n = arith.evaluate(sh, arena, subscript) catch {
-                expand.report(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
-                return 1;
-            };
-            const index: i64 = if (n < 0) n + @as(i64, @intCast(items.len)) else n;
-            if (index < 0) {
-                expand.report(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
-                return 1;
-            }
-            if (index >= items.len) return 0;
-            const target = &@constCast(items)[@intCast(index)];
-            shellmod.freeValue(sh.gpa, target.*);
-            target.* = .none;
-            var len = items.len;
-            while (len > 0 and items[len - 1] == .none) len -= 1;
-            if (len != items.len) {
-                const shrunk = sh.gpa.alloc(Value, len) catch return 1;
-                @memcpy(shrunk, items[0..len]);
-                sh.gpa.free(items);
-                slot.* = .{ .list = shrunk };
-            }
-            return 0;
-        },
-        else => {
-            // A scalar is element 0 of itself.
-            const n = arith.evaluate(sh, sh.scratch(), subscript) catch return 1;
-            if (n == 0) _ = sh.unsetVar(name);
-            return 0;
-        },
+        }
+        // As in bash, the key is expanded here, so `unset 'm[$k]'` works.
+        const key = expand.expandLiteral(sh, sh.scratch(), subscript) catch return 1;
+        const entries = (sh.vars.get(name) orelse return 0).map;
+        const index = findEntry(entries, key) orelse return 0;
+        const shrunk = sh.gpa.alloc(value.Entry, entries.len - 1) catch return 1;
+        @memcpy(shrunk[0..index], entries[0..index]);
+        @memcpy(shrunk[index..], entries[index + 1 ..]);
+        shellmod.freeEntry(sh.gpa, entries[index]);
+        sh.gpa.free(entries);
+        sh.vars.getPtr(name).?.* = .{ .map = shrunk };
+        return 0;
     }
+    if (whole) {
+        if (stored == .list) {
+            sh.setVar(name, .{ .list = &.{} }) catch return 1;
+        } else {
+            _ = sh.unsetVar(name);
+        }
+        return 0;
+    }
+    const n = arith.evaluate(sh, sh.scratch(), subscript) catch {
+        expand.report(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
+        return 1;
+    };
+    // Looked up after the arithmetic, which may have moved the storage.
+    const slot = sh.vars.getPtr(name) orelse return 0;
+    if (slot.* != .list) {
+        // A scalar is element 0 of itself.
+        if (n == 0) _ = sh.unsetVar(name);
+        return 0;
+    }
+    const items = slot.list;
+    const index: i64 = if (n < 0) n + @as(i64, @intCast(items.len)) else n;
+    if (index < 0) {
+        expand.report(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
+        return 1;
+    }
+    if (index >= items.len) return 0;
+    const target = &@constCast(items)[@intCast(index)];
+    shellmod.freeValue(sh.gpa, target.*);
+    target.* = .none;
+    var len = items.len;
+    while (len > 0 and items[len - 1] == .none) len -= 1;
+    if (len != items.len) {
+        const shrunk = sh.gpa.alloc(Value, len) catch return 1;
+        @memcpy(shrunk, items[0..len]);
+        sh.gpa.free(items);
+        slot.* = .{ .list = shrunk };
+    }
+    return 0;
 }
 
 const testing = std.testing;
