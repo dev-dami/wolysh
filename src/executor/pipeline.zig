@@ -351,6 +351,8 @@ fn pipelineText(arena: std.mem.Allocator, commands: []const ast.Command) ![]cons
                 .out_dup => " >&",
                 .err_dup => " 2>&",
                 .in_dup => " <&",
+                .clobber => " >| ",
+                .read_write => " <> ",
                 else => " > ",
             };
             try out.appendSlice(arena, operator);

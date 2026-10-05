@@ -342,7 +342,7 @@ pub const Expander = struct {
                     else
                         false;
                     if (at_prefix) {
-                        if (try self.expandTilde(word, i, value_start != null)) |next| {
+                        if (try self.expandTilde(word, i)) |next| {
                             i = next;
                             continue;
                         }
@@ -413,14 +413,15 @@ pub const Expander = struct {
         }
     }
 
-    /// Expands the tilde-prefix starting at `word[i]` and returns the index
-    /// after it, or null to keep the `~` literal: an unknown user, an unset
-    /// variable, or a quoted or expanded character inside the prefix.
-    fn expandTilde(self: *Expander, word: []const u8, i: usize, in_assignment: bool) Error!?usize {
+    /// Expands the tilde-prefix starting at `word[i]`, which runs to the next
+    /// `/` or `:`, and returns the index after it; null keeps the `~` literal
+    /// (an unknown user, an unset variable, or a quoted or expanded character
+    /// inside the prefix).
+    fn expandTilde(self: *Expander, word: []const u8, i: usize) Error!?usize {
         var end = i + 1;
         while (end < word.len) : (end += 1) {
             const c = word[end];
-            if (c == '/' or (in_assignment and c == ':')) break;
+            if (c == '/' or c == ':') break;
             switch (c) {
                 '\'', '"', '\\', '$', '`' => return null,
                 else => {},
@@ -1137,6 +1138,11 @@ fn findBrace(word: []const u8) ?BraceGroup {
             i = skipExpansion(word, i) orelse i + 1;
             continue;
         }
+        if ((c == '<' or c == '>') and i + 1 < word.len and word[i + 1] == '(') {
+            // The list of a process substitution is expanded when it runs.
+            i = (findMatching(word, i + 1, '(', ')') orelse return null) + 1;
+            continue;
+        }
         if (c == '{') {
             if (findMatching(word, i, '{', '}')) |close| {
                 const content = word[i + 1 .. close];
@@ -1719,6 +1725,7 @@ test "tilde prefixes" {
     try testing.expectEqualStrings("~/x", try expandLiteral(&sh, arena, "\"~\"/x"));
     try testing.expectEqualStrings("~/x", try expandLiteral(&sh, arena, "~\"/x\""));
     try testing.expectEqualStrings("a~", try expandLiteral(&sh, arena, "a~"));
+    try testing.expectEqualStrings("/home/me:x", try expandLiteral(&sh, arena, "~:x"));
 
     // Assignment values expand after `=` and every `:`.
     try testing.expectEqualStrings("/home/me/bin:/home/me/lib", try expandAssignment(&sh, arena, "~/bin:~/lib"));

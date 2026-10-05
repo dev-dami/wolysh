@@ -174,7 +174,7 @@ class RedirectCompatibilityTests(unittest.TestCase):
     def test_process_substitution_as_arguments(self):
         self.same_as_bash(
             "cat <(echo a) <(echo b)\ndiff <(printf 'a\\n') <(printf 'b\\n')\necho status=$?\n"
-            "paste <(printf '1\\n2\\n') <(printf 'x\\ny\\n')\n"
+            "paste <(printf '1\\n2\\n') <(printf 'x\\ny\\n')\ncat <(echo {a,b})\n"
         )
 
     def test_process_substitution_as_redirect_target(self):
@@ -224,7 +224,7 @@ class RedirectCompatibilityTests(unittest.TestCase):
 
     def test_tilde_prefixes(self):
         self.same_as_bash(
-            "echo ~ ~/x ~root ~nosuchuser-wsh/x ~- a=~/x b=~:~ c=x:~ x:~\n"
+            "echo ~ ~/x ~root ~nosuchuser-wsh/x ~- a=~/x b=~:~ c=x:~ x:~ ~:x ~root: --opt=~\n"
             "echo \"~\" ~\"/x\" ~/\"x\"\n"
             "export P=~/bin:~/lib\necho $P\nx=~:~/a\necho $x\nreadonly R=~/r\necho $R\n"
         )
