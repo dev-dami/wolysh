@@ -7,6 +7,7 @@ const ast = @import("ast.zig");
 const parser_mod = @import("parser.zig");
 const shellmod = @import("shell.zig");
 const expand_mod = @import("expand.zig");
+const arith = @import("arith.zig");
 const proc = @import("proc.zig");
 const value = @import("value.zig");
 const fs = @import("fs.zig");
@@ -174,13 +175,11 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             sys.writeStr(sh.default_err, "wsh: out of memory\n");
             return 1;
         },
-        error.InvalidArithmetic => {
-            sys.writeStr(sh.default_err, "wsh: arithmetic syntax error\n");
-            return 2;
-        },
-        error.DivisionByZero => {
-            sys.writeStr(sh.default_err, "wsh: division by zero\n");
-            return 2;
+        error.InvalidArithmetic, error.DivisionByZero => {
+            var buf: [1100]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{arith.errorMessage()}) catch "wsh: arithmetic error\n";
+            sys.writeStr(sh.default_err, msg);
+            return 1;
         },
         error.UnterminatedSubstitution => {
             sys.writeStr(sh.default_err, "wsh: unterminated substitution\n");
