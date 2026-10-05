@@ -10,6 +10,7 @@
 const std = @import("std");
 const shell = @import("shell.zig");
 const glob = @import("glob.zig");
+const arith = @import("arith.zig");
 const value = @import("value.zig");
 
 pub const Error = error{
@@ -440,8 +441,8 @@ pub const Expander = struct {
                     return Error.UnterminatedSubstitution;
                 };
                 if (start + 2 < s.len and s[start + 2] == '(') {
-                    var arith = Arith{ .sh = self.sh, .arena = self.arena, .src = s[start + 3 .. close - 1] };
-                    try self.emit(self.intText(try arith.evaluate()), quoted);
+                    const result = try arith.evaluate(self.sh, self.arena, s[start + 3 .. close - 1]);
+                    try self.emit(self.intText(result), quoted);
                 } else {
                     try self.substitute(s[start + 2 .. close], quoted);
                 }
@@ -990,150 +991,6 @@ fn topLevelRangeSplit(content: []const u8) ?usize {
         i += 1;
     }
     return found;
-}
-
-/// A self-contained integer evaluator for `$(( ))`. Kept here rather than in
-/// the expression executor so expansion has no dependency on it.
-const Arith = struct {
-    sh: *shell.Shell,
-    arena: std.mem.Allocator,
-    src: []const u8,
-    pos: usize = 0,
-
-    fn evaluate(self: *Arith) Error!i64 {
-        self.skipSpace();
-        if (self.pos == self.src.len) return 0;
-        const n = try self.sum();
-        self.skipSpace();
-        if (self.pos != self.src.len) return Error.InvalidArithmetic;
-        return n;
-    }
-
-    fn skipSpace(self: *Arith) void {
-        while (self.pos < self.src.len and isSpaceByte(self.src[self.pos])) self.pos += 1;
-    }
-
-    fn sum(self: *Arith) Error!i64 {
-        var lhs = try self.product();
-        while (true) {
-            self.skipSpace();
-            if (self.pos >= self.src.len) break;
-            const op = self.src[self.pos];
-            if (op != '+' and op != '-') break;
-            self.pos += 1;
-            const rhs = try self.product();
-            lhs = if (op == '+') lhs +% rhs else lhs -% rhs;
-        }
-        return lhs;
-    }
-
-    fn product(self: *Arith) Error!i64 {
-        var lhs = try self.factor();
-        while (true) {
-            self.skipSpace();
-            if (self.pos >= self.src.len) break;
-            const op = self.src[self.pos];
-            if (op != '*' and op != '/' and op != '%') break;
-            self.pos += 1;
-            const rhs = try self.factor();
-            switch (op) {
-                '*' => lhs = lhs *% rhs,
-                '/' => {
-                    if (rhs == 0) return Error.DivisionByZero;
-                    lhs = @divTrunc(lhs, rhs);
-                },
-                else => {
-                    if (rhs == 0) return Error.DivisionByZero;
-                    lhs = @rem(lhs, rhs);
-                },
-            }
-        }
-        return lhs;
-    }
-
-    fn factor(self: *Arith) Error!i64 {
-        self.skipSpace();
-        if (self.pos >= self.src.len) return Error.InvalidArithmetic;
-        const c = self.src[self.pos];
-        switch (c) {
-            '+' => {
-                self.pos += 1;
-                return self.factor();
-            },
-            '-' => {
-                self.pos += 1;
-                return -%try self.factor();
-            },
-            '(' => {
-                self.pos += 1;
-                const n = try self.sum();
-                self.skipSpace();
-                if (self.pos >= self.src.len or self.src[self.pos] != ')') return Error.InvalidArithmetic;
-                self.pos += 1;
-                return n;
-            },
-            '$' => {
-                if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '(' and self.src[self.pos + 2] == '(') {
-                    const open = self.pos + 1;
-                    const close = findMatching(self.src, open, '(', ')') orelse return Error.InvalidArithmetic;
-                    var sub = Arith{ .sh = self.sh, .arena = self.arena, .src = self.src[open + 2 .. close - 1] };
-                    self.pos = close + 1;
-                    return sub.evaluate();
-                }
-                self.pos += 1;
-                return self.variable();
-            },
-            else => {
-                if (std.ascii.isDigit(c)) return self.number();
-                if (isIdentStart(c)) return self.variable();
-                return Error.InvalidArithmetic;
-            },
-        }
-    }
-
-    fn variable(self: *Arith) Error!i64 {
-        if (self.pos < self.src.len and self.src[self.pos] == '{') {
-            const close = std.mem.indexOfScalarPos(u8, self.src, self.pos, '}') orelse return Error.InvalidArithmetic;
-            const var_name = self.src[self.pos + 1 .. close];
-            self.pos = close + 1;
-            return self.lookup(var_name);
-        }
-        if (self.pos >= self.src.len or !isIdentStart(self.src[self.pos])) return Error.InvalidArithmetic;
-        const start = self.pos;
-        self.pos += 1;
-        while (self.pos < self.src.len and isIdentChar(self.src[self.pos])) self.pos += 1;
-        return self.lookup(self.src[start..self.pos]);
-    }
-
-    fn number(self: *Arith) Error!i64 {
-        const start = self.pos;
-        if (self.src[start] == '0' and start + 1 < self.src.len and std.ascii.isAlphabetic(self.src[start + 1])) {
-            self.pos = start + 2;
-            while (self.pos < self.src.len and std.ascii.isAlphanumeric(self.src[self.pos])) self.pos += 1;
-        } else {
-            while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) self.pos += 1;
-        }
-        return std.fmt.parseInt(i64, self.src[start..self.pos], 0) catch Error.InvalidArithmetic;
-    }
-
-    fn lookup(self: *Arith, name: []const u8) i64 {
-        if (self.sh.getVar(name)) |v| {
-            switch (v) {
-                .int => |n| return n,
-                .boolean => |b| return if (b) 1 else 0,
-                .string => |s| return parseInteger(s),
-                else => return 0,
-            }
-        }
-        if (self.sh.getEnv(name)) |s| return parseInteger(s);
-        return 0;
-    }
-};
-
-fn parseInteger(text: []const u8) i64 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return 0;
-    return std.fmt.parseInt(i64, trimmed, 0) catch 0;
 }
 
 // --- tests ------------------------------------------------------------------

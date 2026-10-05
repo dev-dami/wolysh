@@ -14,6 +14,7 @@ test {
     _ = @import("history.zig");
     _ = @import("shell.zig");
     _ = @import("expand.zig");
+    _ = @import("arith.zig");
     _ = @import("builtins.zig");
     _ = @import("exec.zig");
     _ = @import("main.zig");

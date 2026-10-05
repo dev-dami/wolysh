@@ -31,6 +31,26 @@ pub const Config = struct {
     history_limit: usize = 5000,
 };
 
+/// Behaviour switches set by `set` and `shopt`; the executor and expander read
+/// them.
+pub const Options = struct {
+    errexit: bool = false, // set -e
+    nounset: bool = false, // set -u
+    xtrace: bool = false, // set -x
+    pipefail: bool = false, // set -o pipefail
+    noglob: bool = false, // set -f
+    noclobber: bool = false, // set -C
+    allexport: bool = false, // set -a
+    vi: bool = false, // set -o vi
+    nullglob: bool = false, // shopt -s nullglob
+    failglob: bool = false, // shopt -s failglob
+    dotglob: bool = false, // shopt -s dotglob
+    nocaseglob: bool = false, // shopt -s nocaseglob
+    nocasematch: bool = false, // shopt -s nocasematch
+    globstar: bool = true, // shopt -s globstar
+    extglob: bool = true, // shopt -s extglob
+};
+
 /// Bit `N` is set when signal `N + 1` arrives. Written only from a signal
 /// handler, which is why it is a lock-free atomic rather than shell state.
 var trap_pending: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -113,6 +133,9 @@ pub const Shell = struct {
     line_arena: std.heap.ArenaAllocator,
 
     config: Config = .{},
+    options: Options = .{},
+    /// Source line of the statement being executed, for `$LINENO`.
+    current_line: u32 = 0,
     hostname: []const u8 = "",
     history_path: []const u8 = "",
     config_path: []const u8 = "",

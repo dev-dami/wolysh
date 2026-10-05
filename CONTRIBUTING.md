@@ -12,13 +12,13 @@ From the repository root, run:
 zig build fmt
 zig build test -Dtarget=x86_64-linux -Dcpu=baseline
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=baseline
-python3 tests/pty_test.py
-python3 tests/shell_compat_test.py
+(set -e; for test_file in tests/*_test.py; do python3 "$test_file"; done)
 ```
 
 `zig build fmt` runs `zig fmt --check src build.zig build.zig.zon`; run
 `zig fmt src build.zig build.zig.zon` to apply it. `zig build check` runs the
-format check together with the unit tests. CI runs all five commands.
+format check together with the unit tests. CI runs every command above, including
+each `tests/*_test.py` file.
 
 The test suites expect the ReleaseFast binary at `zig-out/bin/wsh` by default.
 To run the PTY tests against another binary, set `WSH=/absolute/path/to/wsh`.

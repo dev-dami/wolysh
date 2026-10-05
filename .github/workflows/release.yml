@@ -43,11 +43,12 @@ jobs:
           actual_version="$(zig-out/bin/wsh --version)"
           test "${actual_version}" = "wolysh ${expected_version}"
 
-      - name: Run interactive tests
-        run: python3 tests/pty_test.py
-
-      - name: Run shell compatibility tests
-        run: python3 tests/shell_compat_test.py
+      - name: Run interactive and compatibility tests
+        run: |
+          for test_file in tests/*_test.py; do
+            echo "== ${test_file}"
+            python3 "${test_file}"
+          done
 
       - name: Package release archive
         env:

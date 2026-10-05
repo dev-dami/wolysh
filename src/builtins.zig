@@ -26,26 +26,26 @@ pub const Ctx = struct {
     stderr: i32 = 2,
     run_source: ?*const fn (*Shell, []const u8) u8 = null,
 
-    fn arg(self: Ctx, index: usize) ?[]const u8 {
+    pub fn arg(self: Ctx, index: usize) ?[]const u8 {
         if (index >= self.argv.len) return null;
         return self.argv[index];
     }
 
-    fn out(self: Ctx, bytes: []const u8) void {
+    pub fn out(self: Ctx, bytes: []const u8) void {
         sys.writeStr(self.stdout, bytes);
     }
 
-    fn err(self: Ctx, bytes: []const u8) void {
+    pub fn err(self: Ctx, bytes: []const u8) void {
         sys.writeStr(self.stderr, bytes);
     }
 
-    fn errFmt(self: Ctx, comptime fmt: []const u8, args: anytype) void {
+    pub fn errFmt(self: Ctx, comptime fmt: []const u8, args: anytype) void {
         var buf: [512]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.err(text);
     }
 
-    fn outFmt(self: Ctx, comptime fmt: []const u8, args: anytype) void {
+    pub fn outFmt(self: Ctx, comptime fmt: []const u8, args: anytype) void {
         var buf: [1024]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.out(text);
@@ -1554,7 +1554,7 @@ fn cstr(buf: []u8, path: []const u8) ?[:0]const u8 {
     return buf[0..path.len :0];
 }
 
-fn validName(name: []const u8) bool {
+pub fn validName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
     for (name[1..]) |c| {
