@@ -45,14 +45,17 @@ fn lineOf(t: lexer.Token) u32 {
     return std.math.cast(u32, t.line) orelse std.math.maxInt(u32);
 }
 
-/// Function names may use a few punctuation characters bash accepts, but
-/// never quotes, expansions or a reserved word.
+/// Like bash, a function name may be almost any plain word (`0x0`, `a-b`,
+/// `x/y`), but never one with quotes, expansions or `=`, nor a reserved word.
 fn validFunctionName(name: []const u8) bool {
-    if (name.len == 0 or std.ascii.isDigit(name[0]) or name[0] == '-') return false;
+    if (name.len == 0 or name[0] == '-') return false;
     for (name) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.' and c != ':') return false;
+        switch (c) {
+            '\'', '"', '`', '$', '\\', '=', '(', ')', '{', '}', '[', ']', '*', '?', '~', '#' => return false,
+            else => {},
+        }
     }
-    return !oneOf(name, &list_terminators) and !oneOf(name, &compound_keywords) and !oneOf(name, &.{ "function", "time", "in" });
+    return !oneOf(name, &list_terminators) and !oneOf(name, &compound_keywords) and !oneOf(name, &.{ "function", "time", "in", "!" });
 }
 
 const compound_keywords = [_][]const u8{ "if", "while", "until", "for", "select", "case" };
@@ -962,8 +965,10 @@ pub const Parser = struct {
             switch (self.tok.tag) {
                 .word => {
                     if (after_body) {
+                        // A reserved word ends the command: `if (cmd) then`.
+                        if (oneOf(self.tok.text, &list_terminators)) break;
                         // After a group, subshell or compound command the only
-                        // word that may appear is a redirect's explicit
+                        // other word that may appear is a redirect's explicit
                         // descriptor number, as in `{ ...; } 2>file`.
                         const text = self.tok.text;
                         if (last_word == null and
