@@ -14,7 +14,8 @@
 //!   literals, identifiers and numbers become their own tokens, and the
 //!   arithmetic/comparison operators turn into operators.
 //!
-//! In both modes `|`, `&`, `;`, `<`, `>` and `{`/`}` stay structural.
+//! In both modes `|`, `&`, `;`, `<`, `>` and `{`/`}` stay structural, except
+//! that in word mode `<(` and `>(` start a process-substitution word.
 
 const std = @import("std");
 
@@ -36,12 +37,18 @@ pub const Tag = enum {
     // structural, both modes
     pipe,
     pipepipe,
+    /// `|&`: a pipe that also carries standard error (`2>&1 |`).
+    pipe_amp,
     amp,
     ampamp,
     semi,
     out,
     out_append,
+    /// `>|`: truncating output that ignores `noclobber`.
+    out_clobber,
     in,
+    /// `<>`: open for reading and writing without truncating.
+    in_out,
     here_doc,
     /// `<<-`: body lines and the delimiter have leading tabs stripped.
     here_doc_strip,
@@ -216,6 +223,10 @@ pub const Lexer = struct {
                     self.pos += 1;
                     return self.tok(.pipepipe, start, depth_before);
                 }
+                if (self.mode == .word and self.pos < self.src.len and self.src[self.pos] == '&') {
+                    self.pos += 1;
+                    return self.tok(.pipe_amp, start, depth_before);
+                }
                 return self.tok(.pipe, start, depth_before);
             },
             '&' => {
@@ -239,16 +250,27 @@ pub const Lexer = struct {
                 return self.tok(.semi, start, depth_before);
             },
             '>' => {
+                // `>(list)` is a process substitution, which is a word.
+                if (self.mode == .word and self.startsProcessSubstitution(self.pos)) return self.scanWord(start, depth_before);
                 self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '>') {
                     self.pos += 1;
                     return self.tok(.out_append, start, depth_before);
                 }
                 if (self.mode == .expr) return self.tok(.gt, start, depth_before);
+                if (self.pos < self.src.len and self.src[self.pos] == '|') {
+                    self.pos += 1;
+                    return self.tok(.out_clobber, start, depth_before);
+                }
                 return self.tok(.out, start, depth_before);
             },
             '<' => {
+                if (self.mode == .word and self.startsProcessSubstitution(self.pos)) return self.scanWord(start, depth_before);
                 self.pos += 1;
+                if (self.mode == .word and self.pos < self.src.len and self.src[self.pos] == '>') {
+                    self.pos += 1;
+                    return self.tok(.in_out, start, depth_before);
+                }
                 if (self.mode == .word and self.pos < self.src.len and self.src[self.pos] == '<') {
                     self.pos += 1;
                     if (self.pos < self.src.len and self.src[self.pos] == '<') {
@@ -470,6 +492,10 @@ pub const Lexer = struct {
                 self.pos += 2;
                 continue;
             }
+            if (c == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '\'') {
+                self.skipAnsiC();
+                continue;
+            }
             if (c == '\'') {
                 self.pos += 1;
                 while (self.pos < self.src.len and self.src[self.pos] != '\'') self.pos += 1;
@@ -492,11 +518,73 @@ pub const Lexer = struct {
         }
     }
 
+    /// Skips a `$'...'` string, where a backslash escapes the closing quote.
+    fn skipAnsiC(self: *Lexer) void {
+        self.pos += 2;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '\\' and self.pos + 1 < self.src.len) {
+                self.pos += 2;
+                continue;
+            }
+            self.pos += 1;
+            if (c == '\'') return;
+            if (c == '\n') self.line += 1;
+        }
+    }
+
+    fn startsProcessSubstitution(self: *const Lexer, p: usize) bool {
+        const c = self.src[p];
+        return (c == '<' or c == '>') and p + 1 < self.src.len and self.src[p + 1] == '(';
+    }
+
+    /// The `)` closing the group opened at `open`, skipping quoted text and
+    /// nested groups; null when the group does not close on this line.
+    fn groupClose(self: *const Lexer, open: usize) ?usize {
+        var depth: usize = 0;
+        var i = open;
+        while (i < self.src.len) : (i += 1) {
+            switch (self.src[i]) {
+                '\\' => i += 1,
+                '\'' => i = std.mem.indexOfScalarPos(u8, self.src, i + 1, '\'') orelse return null,
+                '"' => {
+                    i += 1;
+                    while (i < self.src.len and self.src[i] != '"') : (i += 1) {
+                        if (self.src[i] == '\\') i += 1;
+                    }
+                    if (i >= self.src.len) return null;
+                },
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if (depth == 0) return i;
+                },
+                '\n' => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
     /// Scans a bare command word, keeping quotes and escapes in the text.
     fn scanWord(self: *Lexer, start: usize, depth_before: u16) Token {
         var embedded_parens: usize = 0;
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
+            // `<(list)` / `>(list)` belong to the word, as does an extended
+            // glob group such as `@(a|b)`, whose `|` is not a pipe.
+            if (self.startsProcessSubstitution(self.pos)) {
+                self.skipExpansion();
+                continue;
+            }
+            if ((c == '?' or c == '*' or c == '+' or c == '@' or c == '!') and
+                self.pos + 1 < self.src.len and self.src[self.pos + 1] == '(')
+            {
+                if (self.groupClose(self.pos + 1)) |close| {
+                    self.pos = close + 1;
+                    continue;
+                }
+            }
             if (self.group_depth > 0 and c == '(') {
                 embedded_parens += 1;
                 self.pos += 1;
@@ -526,6 +614,10 @@ pub const Lexer = struct {
                 (self.src[self.pos + 1] == '{' or self.src[self.pos + 1] == '('))
             {
                 self.skipExpansion();
+                continue;
+            }
+            if (c == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '\'') {
+                self.skipAnsiC();
                 continue;
             }
             self.pos += 1;
@@ -654,4 +746,46 @@ test "comments" {
     try std.testing.expectEqual(Tag.newline, lx.next().tag);
     try std.testing.expectEqualStrings("echo", lx.next().text);
     try std.testing.expectEqualStrings("c", lx.next().text);
+}
+
+test "pipe-amp, clobber and read-write redirect tokens" {
+    var lx = Lexer.init("a |& b >| f <> g 10>h");
+    try std.testing.expectEqualStrings("a", lx.next().text);
+    try std.testing.expectEqual(Tag.pipe_amp, lx.next().tag);
+    try std.testing.expectEqualStrings("b", lx.next().text);
+    try std.testing.expectEqual(Tag.out_clobber, lx.next().tag);
+    try std.testing.expectEqualStrings("f", lx.next().text);
+    try std.testing.expectEqual(Tag.in_out, lx.next().tag);
+    try std.testing.expectEqualStrings("g", lx.next().text);
+    try std.testing.expectEqualStrings("10", lx.next().text);
+    try std.testing.expectEqual(Tag.out, lx.next().tag);
+    try std.testing.expectEqualStrings("h", lx.next().text);
+    try std.testing.expectEqual(Tag.eof, lx.next().tag);
+}
+
+test "process substitutions are words" {
+    var lx = Lexer.init("diff <(sort a | uniq) >(cat) < <(ls) x=<(y)");
+    try std.testing.expectEqualStrings("diff", lx.next().text);
+    try std.testing.expectEqualStrings("<(sort a | uniq)", lx.next().text);
+    try std.testing.expectEqualStrings(">(cat)", lx.next().text);
+    try std.testing.expectEqual(Tag.in, lx.next().tag);
+    try std.testing.expectEqualStrings("<(ls)", lx.next().text);
+    try std.testing.expectEqualStrings("x=<(y)", lx.next().text);
+    try std.testing.expectEqual(Tag.eof, lx.next().tag);
+}
+
+test "ANSI-C quoted words keep escaped quotes inside" {
+    var lx = Lexer.init("echo $'it\\'s' $'a\\tb'x done");
+    _ = lx.next();
+    try std.testing.expectEqualStrings("$'it\\'s'", lx.next().text);
+    try std.testing.expectEqualStrings("$'a\\tb'x", lx.next().text);
+    try std.testing.expectEqualStrings("done", lx.next().text);
+}
+
+test "extended glob groups stay in one word" {
+    var lx = Lexer.init("ls @(a|b).c !(x) | wc");
+    _ = lx.next();
+    try std.testing.expectEqualStrings("@(a|b).c", lx.next().text);
+    try std.testing.expectEqualStrings("!(x)", lx.next().text);
+    try std.testing.expectEqual(Tag.pipe, lx.next().tag);
 }

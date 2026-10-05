@@ -34,6 +34,9 @@ test {
     _ = @import("builtins/trap.zig");
     _ = @import("quote.zig");
     _ = @import("strict.zig");
+    _ = @import("builtins/shopt.zig");
+    _ = @import("executor/redirect.zig");
+    _ = @import("executor/procsub.zig");
     _ = @import("exec.zig");
     _ = @import("executor/assign.zig");
     _ = @import("executor/command.zig");
