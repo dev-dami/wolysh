@@ -100,13 +100,24 @@ pub fn expandCommand(
     words: []const []const u8,
     out: *std.ArrayList([]const u8),
 ) Error!void {
+    const names_variables = words.len > 0 and takesVariableNames(words[0]);
     for (words, 0..) |word, index| {
-        if (index == 0) {
+        if (index == 0 or names_variables) {
             try expandWord(sh, arena, word, out);
         } else {
             try expandArgument(sh, arena, word, out);
         }
     }
+}
+
+/// Builtins whose arguments are variable names. Rewriting a bare name to its
+/// value there would make `while read -r line` read into the previous line.
+fn takesVariableNames(command: []const u8) bool {
+    const names = [_][]const u8{ "read", "local", "export", "readonly", "unset", "declare", "typeset" };
+    for (names) |name| {
+        if (std.mem.eql(u8, command, name)) return true;
+    }
+    return false;
 }
 
 fn expandArgument(
