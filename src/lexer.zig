@@ -14,7 +14,8 @@
 //!   literals, identifiers and numbers become their own tokens, and the
 //!   arithmetic/comparison operators turn into operators.
 //!
-//! In both modes `|`, `&`, `;`, `<`, `>` and `{`/`}` stay structural.
+//! In both modes `|`, `&`, `;`, `<`, `>` and `{`/`}` stay structural, except
+//! that in word mode `<(` and `>(` start a process-substitution word.
 
 const std = @import("std");
 
