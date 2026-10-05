@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const complete_builtin = @import("builtins/complete.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1602,6 +1603,8 @@ const table = [_]Builtin{
     .{ .name = "true", .summary = "return success", .run = builtinTrue },
     .{ .name = "false", .summary = "return failure", .run = builtinFalse },
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },
+    .{ .name = "complete", .summary = "define how arguments of a command complete", .run = complete_builtin.runComplete },
+    .{ .name = "compgen", .summary = "print completion candidates", .run = complete_builtin.runCompgen },
 };
 
 // --- tests -----------------------------------------------------------------

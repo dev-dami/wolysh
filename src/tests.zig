@@ -20,4 +20,11 @@ test {
     _ = @import("main.zig");
     _ = @import("interactive/editor.zig");
     _ = @import("interactive/prompt.zig");
+    _ = @import("interactive/wcwidth.zig");
+    _ = @import("interactive/histexpand.zig");
+    _ = @import("interactive/highlight.zig");
+    _ = @import("interactive/term.zig");
+    _ = @import("interactive/vi.zig");
+    _ = @import("interactive/complete.zig");
+    _ = @import("builtins/complete.zig");
 }
