@@ -62,7 +62,7 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
     for (cmd.assigns) |assignment| {
         if (sh.isReadonly(assignment.name)) return error.ReadonlyVariable;
         const previous = if (sh.getEnv(assignment.name)) |old| try arena.dupe(u8, old) else null;
-        const assigned = try expand_mod.expandLiteral(sh, arena, assignment.value);
+        const assigned = try expand_mod.expandAssignment(sh, arena, assignment.value);
         try saved.append(arena, .{ .name = assignment.name, .value = previous, .assigned = assigned });
         try sh.setEnv(assignment.name, assigned);
     }
@@ -72,7 +72,7 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
 /// `NAME=value` with no command word: the assignment outlives the line.
 pub fn persist(sh: *Shell, arena: std.mem.Allocator, assigns: []const ast.PrefixAssign) Error!void {
     for (assigns) |assignment| {
-        const text = try expand_mod.expandLiteral(sh, arena, assignment.value);
+        const text = try expand_mod.expandAssignment(sh, arena, assignment.value);
         try sh.assignVar(assignment.name, .{ .string = text });
         try sh.assignEnv(assignment.name, text);
     }

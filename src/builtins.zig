@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const shopt = @import("builtins/shopt.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1209,30 +1210,49 @@ fn builtinUmask(ctx: Ctx) u8 {
 // --- exec -------------------------------------------------------------------
 
 fn builtinExec(ctx: Ctx) u8 {
-    if (ctx.argv.len < 2) return 0;
+    // The executor has already made the redirections permanent; without a
+    // command that is all `exec` does.
+    var first: usize = 1;
+    if (ctx.arg(1)) |option| {
+        if (std.mem.eql(u8, option, "--")) {
+            first = 2;
+        } else if (option.len > 1 and option[0] == '-') {
+            ctx.errFmt("wsh: exec: {s}: unsupported option\n", .{option});
+            return 2;
+        }
+    }
+    if (ctx.argv.len <= first) return 0;
+    const command_argv = ctx.argv[first..];
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const name = ctx.argv[1];
+    const name = command_argv[0];
     const resolved = (proc.resolve(arena, name, ctx.sh.pathEnv()) catch null) orelse {
         ctx.errFmt("wsh: exec: {s}: command not found\n", .{name});
         return markExecFailure(ctx);
     };
     const path = arena.dupeZ(u8, resolved) catch return 127;
-    const argv = proc.buildArgv(arena, ctx.argv[1..]) catch return 127;
+    const argv = proc.buildArgv(arena, command_argv) catch return 127;
     const envp = ctx.sh.buildEnvp(arena) catch return 127;
+
+    // Inside a redirected group or function the standard descriptors live
+    // elsewhere; the new program must find them on 0, 1 and 2.
+    const standard = [3]i32{ ctx.stdin, ctx.stdout, ctx.stderr };
+    for (standard, 0..) |fd, target| {
+        if (fd != target) _ = linux.dup3(fd, @intCast(target), 0);
+    }
 
     // Children get the default dispositions back; exec does not fork.
     proc.resetSignals();
     const rc = linux.execve(path.ptr, argv, envp);
 
     if (linux.errno(rc) == .NOEXEC) {
-        const script_argv = arena.alloc([]const u8, ctx.argv.len + 1) catch return 127;
+        const script_argv = arena.alloc([]const u8, command_argv.len + 1) catch return 127;
         script_argv[0] = "/bin/sh";
         script_argv[1] = resolved;
-        for (ctx.argv[2..], 0..) |argument, index| script_argv[index + 2] = argument;
+        for (command_argv[1..], 0..) |argument, index| script_argv[index + 2] = argument;
         const shell_argv = proc.buildArgv(arena, script_argv) catch return 127;
         _ = linux.execve("/bin/sh", shell_argv, envp);
     }
@@ -1597,6 +1617,7 @@ const table = [_]Builtin{
     .{ .name = "shift", .summary = "shift positional parameters", .run = builtinShift },
     .{ .name = "umask", .summary = "get or set the file-creation mask", .run = builtinUmask },
     .{ .name = "exec", .summary = "replace the shell with a command", .run = builtinExec },
+    .{ .name = "shopt", .summary = "set or list bash-style shell options", .run = shopt.run },
     .{ .name = "test", .summary = "evaluate a condition", .run = builtinTest },
     .{ .name = "[", .summary = "evaluate a condition", .run = builtinBracket },
     .{ .name = "true", .summary = "return success", .run = builtinTrue },

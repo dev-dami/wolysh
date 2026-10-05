@@ -8,6 +8,7 @@ const sys = @import("../sys.zig");
 const command = @import("command.zig");
 const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
+const procsub = @import("procsub.zig");
 const subshell = @import("subshell.zig");
 const assign = @import("assign.zig");
 
@@ -78,6 +79,8 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
 
     var opened: std.ArrayList(i32) = .empty;
     defer for (opened.items) |fd| sys.closeFd(fd);
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
 
     if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime);
 
@@ -156,6 +159,14 @@ fn runSingle(
     var argv: std.ArrayList([]const u8) = .empty;
     expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
 
+    // `exec`'s redirections change the shell's own descriptors for good.
+    if (!background and argv.items.len > 0 and std.mem.eql(u8, argv.items[0], "exec")) {
+        redirect.applyPersistent(sh, arena, cmd.redirects) catch |err| return runtime.expression_error(sh, err);
+        const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
+        defer scope.restore();
+        return command.dispatch(sh, argv.items, runtime.command);
+    }
+
     const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
     if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null) {
         // `NAME=value` on its own outlives the command line.
@@ -168,6 +179,8 @@ fn runSingle(
 
     if (cmd.group != null and !background) {
         const statements = cmd.group.?;
+        const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
+        defer high.restore();
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
         sh.default_in = prepared.fds.in;
         sh.default_out = prepared.fds.out;
@@ -194,6 +207,8 @@ fn runSingle(
     const text = pipelineText(arena, &.{cmd}) catch name;
 
     if (command.isInternal(sh, name) and !background) {
+        const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
+        defer high.restore();
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
         sh.default_in = prepared.fds.in;
         sh.default_out = prepared.fds.out;

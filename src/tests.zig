@@ -16,6 +16,9 @@ test {
     _ = @import("expand.zig");
     _ = @import("arith.zig");
     _ = @import("builtins.zig");
+    _ = @import("builtins/shopt.zig");
+    _ = @import("executor/redirect.zig");
+    _ = @import("executor/procsub.zig");
     _ = @import("exec.zig");
     _ = @import("main.zig");
     _ = @import("interactive/editor.zig");

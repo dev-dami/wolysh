@@ -220,7 +220,12 @@ fn readAllStdin(gpa: std.mem.Allocator) ?[]u8 {
 
 fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
     proc.shellSignals();
-    takeControllingTerminal(sh);
+    // The editor and job control keep private copies of the terminal, so
+    // `exec <file` or `exec 2>log` redirect commands without blinding the
+    // prompt. They sit at 255 and up, out of the way of script descriptors.
+    const term_in = sys.duplicateAbove(0, 255) orelse 0;
+    const term_out = sys.duplicateAbove(2, 255) orelse 2;
+    takeControllingTerminal(sh, term_in);
 
     setupPaths(sh, gpa) catch {};
     sh.setAlias("la", "ls -A") catch return 1;
@@ -228,7 +233,7 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
     if (!no_config) loadConfig(sh);
     loadHistory(sh);
 
-    var editor_state = editor_mod.Editor.init(sh, 0, 2);
+    var editor_state = editor_mod.Editor.init(sh, term_in, term_out);
     defer editor_state.deinit();
 
     var prompt_allocating: std.Io.Writer.Allocating = .init(gpa);
@@ -267,8 +272,8 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
 
 /// Puts the shell in its own process group and claims the terminal, which is
 /// what makes job control possible.
-fn takeControllingTerminal(sh: *Shell) void {
-    if (!sys.isTty(0)) return;
+fn takeControllingTerminal(sh: *Shell, tty_fd: i32) void {
+    if (!sys.isTty(tty_fd)) return;
 
     const my_pgid = sys.getpgid(0) orelse return;
     if (my_pgid != sys.getpid()) {
@@ -277,12 +282,12 @@ fn takeControllingTerminal(sh: *Shell) void {
     sh.shell_pgid = sys.getpgid(0) orelse sh.pid;
 
     while (true) {
-        const foreground = sys.tcgetpgrp(0) orelse break;
+        const foreground = sys.tcgetpgrp(tty_fd) orelse break;
         if (foreground == sh.shell_pgid) break;
         proc.signalGroup(sh.shell_pgid, .TTOU);
     }
 
-    sh.tty_fd = 0;
+    sh.tty_fd = tty_fd;
     sh.job_control = true;
 }
 

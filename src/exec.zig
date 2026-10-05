@@ -16,6 +16,7 @@ const command = @import("executor/command.zig");
 const expression = @import("executor/expression.zig");
 const function = @import("executor/function.zig");
 const pipeline = @import("executor/pipeline.zig");
+const procsub = @import("executor/procsub.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -261,6 +262,9 @@ fn takeContinue(sh: *Shell) LoopControl {
 
 fn runFor(sh: *Shell, loop: ast.For) u8 {
     const outer = sh.scratch();
+    // `for f in <(ls)` keeps the substitution open for the whole loop.
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
     // Items are expanded in the enclosing arena so they survive the per
     // iteration resets below.
     var items: std.ArrayList([]const u8) = .empty;
@@ -392,6 +396,7 @@ pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator)
 pub fn install(sh: *Shell) void {
     sh.subst_runner = substitutionRunner;
     sh.trap_runner = runSource;
+    procsub.run_source = runSource;
 }
 
 // --- tests ------------------------------------------------------------------
