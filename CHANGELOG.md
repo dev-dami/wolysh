@@ -7,6 +7,73 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-06
+
+Most of Bash's scripting language now works in wsh. Each area below is
+compared against Bash 5.3 in the test suite; `docs/language.md` lists the known
+differences.
+
+### Added
+
+- POSIX and Bash control flow: `if`/`elif`/`fi`, `case` with `;&` and `;;&`,
+  `until`, `select`, POSIX function definitions, `local`, and the `time`
+  keyword.
+- `[[ ]]` with pattern, regular-expression (`=~`, `BASH_REMATCH`), integer and
+  file tests; `(( ))`; and C-style `for (( init; test; step ))` loops. Regular
+  expressions use a new linear-time POSIX ERE engine.
+- Bash parameter expansion (`${var:=}`, `${var:?}`, `${var#pat}`,
+  `${var/pat/rep}`, `${var:off:len}`, case modification, `${!name}`,
+  `${!prefix*}`), indexed and associative arrays, `declare`/`typeset`
+  attributes, and special variables such as `RANDOM`, `SECONDS` and `LINENO`.
+- Bash integer arithmetic in `$(( ))`: every operator, bases (`16#ff`),
+  assignment, comma and the conditional operator.
+- `test` and `[` follow POSIX argument rules and support Bash's operators.
+- Redirections: `exec` redirections, `{fd}>file`, `<>`, `>|`, process
+  substitution `<( )` and `>( )`, ANSI-C quoting `$'...'`, Bash tilde rules,
+  extended globbing and the glob `shopt` options.
+- `set` with POSIX options, `set -euo pipefail`, `PIPESTATUS`, `set -x` with
+  `PS4`, and `trap` for signals, `EXIT`, `ERR`, `DEBUG` and `RETURN`.
+- Builtins: Bash `read`, `mapfile`/`readarray`, `getopts`, `printf` (including
+  `%(fmt)T`), `help`, `type`, `command -v`, `hash`, `ulimit`, `times`,
+  `logout`, `umask -S`, `pushd`/`popd`/`dirs`, and the Bash forms of `export`,
+  `readonly` and `alias`.
+- Command line: `-c` with `$0`, `-s`, `-i`, `-l`/`--login`, `-o`/`+o` and the
+  set option letters; scripts streamed on standard input; `import-env` for the
+  exported environment of a POSIX script.
+- Interactive shell: UTF-8 line editing with a kill ring, undo, bracketed
+  paste and vi mode; history expansion; programmable completion (`complete`,
+  `compgen`); keyword highlighting that honours `NO_COLOR`; `PS1` escapes,
+  `PROMPT_COMMAND`, and `precmd`, `preexec` and `chpwd` hooks.
+
+### Changed
+
+- A bare word in a command argument stays literal: `status=x; git status` runs
+  `git status`. Bare names still refer to variables inside language
+  expressions (`if count > 10 {`, `print name`).
+- `name=value` sets a shell variable without exporting it, so `unset` removes
+  it and child processes do not see it unless it is exported.
+- `wsh -c 'cmd' a b` sets `$0` to `a` and `$1` to `b`, as `bash -c` does.
+- `read` returns 1 at end of input, which ends `while read` loops.
+- An expansion error such as `${x:?message}` stops a non-interactive shell with
+  status 1.
+- Functions take precedence over builtins of the same name; `builtin` reaches
+  the builtin.
+- Native expression arithmetic is exact for integers and rejects non-numeric
+  operands instead of treating them as 0.
+- Background jobs print `[1] pid` only in interactive shells.
+
+### Fixed
+
+- `cd -` returns to the previous directory.
+- `return` in a sourced file returns to the caller instead of ending it.
+- `for`, `while` and `if` blocks honour redirections such as `> file`.
+- `$((minInt / -1))` no longer crashes the shell.
+- Ctrl-C stops `while` loops and `wait -n`; SIGHUP keeps history and is noticed
+  while the prompt is being drawn.
+- Multi-line history entries survive a reload.
+- The first stage of a pipeline joins its process group before running.
+- Brace ranges and word lists are no longer cut off at fixed sizes.
+
 ## [0.4.1] - 2026-10-04
 
 ### Fixed
@@ -128,7 +195,8 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dev-dami/wolysh/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dev-dami/wolysh/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dev-dami/wolysh/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/dev-dami/wolysh/compare/v0.3.4...v0.3.5
