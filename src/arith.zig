@@ -1025,7 +1025,8 @@ test "assignments respect readonly and keep exports in step" {
     try testing.expect(sh.getEnv("local_only") == null);
 
     sh.options.nounset = true;
-    try expectFailure(&sh, arena, "missing + 1", "missing: unbound variable");
+    // An unbound name is an expansion error, which ends a script.
+    try testing.expectError(error.UnboundVariable, evaluate(&sh, arena, "missing + 1"));
     sh.options.nounset = false;
     try expectValue(&sh, arena, "missing + 1", 1);
 }
