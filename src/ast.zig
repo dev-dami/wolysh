@@ -205,6 +205,28 @@ pub const Case = struct {
     items: []CaseItem,
 };
 
+/// The expression of `[[ ... ]]`. Operands stay words, expanded without
+/// splitting or globbing when the test runs.
+pub const Cond = union(enum) {
+    /// `-f file`, `-v name`, ...; a lone word is `-n word`.
+    unary: struct { op: []const u8, operand: Word },
+    /// The right side of `==`, `=` and `!=` is a pattern, and of `=~` a regular
+    /// expression.
+    binary: struct { op: []const u8, lhs: Word, rhs: Word },
+    not: *Cond,
+    and_: struct { lhs: *Cond, rhs: *Cond },
+    or_: struct { lhs: *Cond, rhs: *Cond },
+};
+
+/// `for (( init; test; step ))`: three arithmetic expressions, any of which
+/// may be empty. An empty test is true.
+pub const ArithFor = struct {
+    init: []const u8,
+    cond: []const u8,
+    step: []const u8,
+    body: *Block,
+};
+
 pub const Compound = struct {
     /// Source text of the whole command, shown by `jobs`.
     text: []const u8 = "",
@@ -219,6 +241,18 @@ pub const Compound = struct {
         /// `return`, `break`, `continue` or a function definition where a
         /// command is expected, as in `[ -f x ] || return 1`.
         statement: Stmt,
+        /// `[[ expression ]]`.
+        cond: *Cond,
+        /// `(( expression ))`: the text between the parentheses.
+        arith: []const u8,
+        arith_for: ArithFor,
+
+        /// `[[ ]]` and `(( ))` are tests whose status counts for `set -e`,
+        /// ERR and DEBUG like a simple command's, where a loop's or an `if`'s
+        /// only reports the commands inside it.
+        pub fn isTest(self: Kind) bool {
+            return self == .cond or self == .arith;
+        }
     };
 };
 

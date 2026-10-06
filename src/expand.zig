@@ -57,6 +57,10 @@ const Mode = enum {
     /// splitting, and quoted characters stay backslash-escaped so they match
     /// literally.
     pattern,
+    /// The right side of `[[ string =~ regex ]]`: like `pattern`, but quoted
+    /// text escapes only the characters a regular expression gives a
+    /// meaning, and an unquoted backslash is passed on (`\w`, `\.`).
+    regex,
 };
 
 fn isSpaceByte(c: u8) bool {
@@ -112,6 +116,14 @@ pub fn expandLiteral(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u
 /// are escaped, unquoted expansions keep their metacharacters live.
 pub fn expandPattern(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u8) Error![]const u8 {
     var ex = Expander{ .sh = sh, .arena = arena, .mode = .pattern };
+    try ex.scan(word);
+    return arena.dupe(u8, ex.buf.items);
+}
+
+/// Expands the right side of `=~` to one extended regular expression in which
+/// quoted parts match literally.
+pub fn expandRegex(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u8) Error![]const u8 {
+    var ex = Expander{ .sh = sh, .arena = arena, .mode = .regex };
     try ex.scan(word);
     return arena.dupe(u8, ex.buf.items);
 }
@@ -265,6 +277,13 @@ pub const Expander = struct {
             // Every byte, so `&` in a replacement and extglob operators stay
             // literal too.
             for (bytes) |b| try self.buf.appendSlice(self.arena, &.{ '\\', b });
+            return;
+        }
+        if (self.mode == .regex) {
+            for (bytes) |b| {
+                if (std.mem.indexOfScalar(u8, "\\.[]*^$()+?{}|", b) != null) try self.buf.append(self.arena, '\\');
+                try self.buf.append(self.arena, b);
+            }
             return;
         }
         for (bytes) |b| {
@@ -481,7 +500,11 @@ pub const Expander = struct {
                             i += 2;
                             continue;
                         }
-                        try self.appendQuoted(word[i + 1 .. i + 2]);
+                        if (self.mode == .regex) {
+                            try self.appendRaw(word[i .. i + 2]);
+                        } else {
+                            try self.appendQuoted(word[i + 1 .. i + 2]);
+                        }
                         i += 2;
                     } else {
                         try self.appendQuoted("\\");
