@@ -150,7 +150,7 @@ class EditorTests(unittest.TestCase):
         self.assertIn(b"\n42\n", s.plain())
         # Bracketed paste is on while editing and off while a command runs.
         self.assertIn(b"\x1b[?2004l", s.buf)
-        self.assertIn(b"\x1b[?2004h", s.buf)
+        self.assertTrue(s.read_until(b"\x1b[?2004h"), s.buf[-300:])
         self.assertLess(s.buf.index(b"\x1b[?2004l"), s.buf.index(b"42"))
 
     def test_kill_ring_alt_d_and_yank(self):

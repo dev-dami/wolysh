@@ -43,7 +43,6 @@ pub const Job = struct {
 
 pub const Table = struct {
     jobs: std.ArrayList(Job) = .empty,
-    next_id: u32 = 1,
 
     pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
         for (self.jobs.items) |job| {
@@ -69,8 +68,12 @@ pub const Table = struct {
         errdefer allocator.free(owned_pids);
         const owned_command = try allocator.dupe(u8, command);
         errdefer allocator.free(owned_command);
+        // Like bash: one past the highest live job number, so numbers are
+        // reused once earlier jobs finish.
+        var id: u32 = 1;
+        for (self.jobs.items) |job| id = @max(id, job.id + 1);
         try self.jobs.append(allocator, .{
-            .id = self.next_id,
+            .id = id,
             .pgid = pgid,
             .pids = owned_pids,
             .last_pid = if (pids.len != 0) pids[pids.len - 1] else 0,
@@ -78,7 +81,6 @@ pub const Table = struct {
             .command = owned_command,
             .foreground = foreground,
         });
-        self.next_id += 1;
         return &self.jobs.items[self.jobs.items.len - 1];
     }
 

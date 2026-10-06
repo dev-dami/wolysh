@@ -20,7 +20,7 @@ pub const Runtime = struct {
 
 pub fn run(
     sh: *Shell,
-    _: []const u8,
+    name: []const u8,
     source: []const u8,
     argv: []const []const u8,
     runtime: Runtime,
@@ -34,7 +34,8 @@ pub fn run(
     // The body may `unset -f` or redefine this function, freeing `source`
     // while its statements still point into it.
     const owned = arena.dupe(u8, source) catch return 1;
-    var parser = parser_mod.Parser.init(arena, owned);
+    // Numbering from the definition's own line keeps `$LINENO` meaningful.
+    var parser = parser_mod.Parser.initAt(arena, owned, sh.getFuncLine(name));
     const program = parser.parseProgram() catch {
         reportSyntaxError(sh, &parser);
         return 2;
@@ -50,6 +51,7 @@ pub fn run(
     // the function's.
     const saved_return = sh.return_pending;
     const saved_code = sh.return_code;
+    const saved_line = sh.current_line;
     sh.beginScope() catch return 1;
     const saved_positional = sh.pushPositional(if (argv.len > 1) argv[1..] else &.{});
     sh.return_pending = false;
@@ -60,7 +62,10 @@ pub fn run(
         sh.popPositional(saved_positional);
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
+        sh.current_line = saved_line;
     }
+    // A local binding, so the caller's FUNCNAME comes back on return.
+    sh.setLocal("FUNCNAME", .{ .string = name }) catch return 1;
     // Declared after the block above so it runs first: the RETURN trap still
     // sees the function's parameters.
     const saved_traps = strict.enterFunction(sh);

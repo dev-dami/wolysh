@@ -171,6 +171,9 @@ pub fn dispatch(sh: *Shell, argv: []const []const u8, runtime: Runtime) u8 {
     if (argv.len == 0) return 0;
     const name = argv[0];
 
+    // A function shadows a builtin of the same name (`cd() { builtin cd "$@"; }`).
+    if (sh.getFunc(name)) |source| return runtime.run_function(sh, name, source, argv);
+
     if (std.mem.eql(u8, name, "source") or std.mem.eql(u8, name, ".")) return builtinSource(sh, argv, runtime.run_source);
     if (std.mem.eql(u8, name, "eval")) return builtinEval(sh, argv, runtime.run_source);
 
@@ -185,8 +188,6 @@ pub fn dispatch(sh: *Shell, argv: []const []const u8, runtime: Runtime) u8 {
         };
         return builtin.run(ctx);
     }
-
-    if (sh.getFunc(name)) |source| return runtime.run_function(sh, name, source, argv);
 
     reportCommandNotFound(sh, sh.scratch(), name);
     return 127;

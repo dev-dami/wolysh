@@ -11,6 +11,7 @@ const redirect = @import("redirect.zig");
 const procsub = @import("procsub.zig");
 const subshell = @import("subshell.zig");
 const assign = @import("assign.zig");
+const timing = @import("timing.zig");
 const session = @import("../interactive/session.zig");
 const strict = @import("../strict.zig");
 
@@ -22,6 +23,8 @@ pub const ErrorHandler = *const fn (*Shell, anyerror) u8;
 pub const Runtime = struct {
     command: command.Runtime,
     run_statements: subshell.RunStatements,
+    /// Runs an `if`, loop, `case` or `select` in the current shell.
+    run_compound: *const fn (*Shell, *const ast.Compound) u8,
     expression_error: ErrorHandler,
 };
 
@@ -69,16 +72,38 @@ pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
     return status;
 }
 
-/// One pipeline of an `&&`/`||` list. Every part but the last, and any `!`
-/// pipeline, is a condition: its failure does not trip `set -e` or ERR.
+/// One pipeline of an `&&`/`||` list, recording its line and honouring
+/// `time`. Every part but the last, and any `!` pipeline, is a condition: its
+/// failure does not trip `set -e` or ERR.
 fn runLink(sh: *Shell, link: ast.Pipeline, more_follow: bool, runtime: Runtime) u8 {
+    if (link.line != 0) sh.current_line = link.line;
     const condition = more_follow or link.negate;
     if (condition) sh.condition_depth += 1;
     defer if (condition) {
         sh.condition_depth -= 1;
     };
+    const start = if (link.time != .none) timing.Snapshot.take() else null;
     const status = runPipeline(sh, link.commands, link.background, runtime);
+    if (start) |snapshot| timing.report(sh, snapshot, link.time == .posix);
     return if (link.negate) invert(status) else status;
+}
+
+/// A simple command, `(( ))` or `[[ ]]`: what the DEBUG trap runs before.
+fn runsAsCommand(cmd: ast.Command) bool {
+    return cmd.subshell == null and cmd.group == null and cmd.compound == null;
+}
+
+/// The statements a forked stage runs for a subshell, group or compound
+/// command, or null for a simple command.
+fn stageBody(arena: std.mem.Allocator, cmd: ast.Command) Error!?[]ast.Stmt {
+    if (cmd.subshell orelse cmd.group) |statements| return statements;
+    const compound = cmd.compound orelse return null;
+    // Redirections were already applied to the stage itself.
+    const commands = try arena.alloc(ast.Command, 1);
+    commands[0] = .{ .words = &.{}, .redirects = &.{}, .compound = compound };
+    const statements = try arena.alloc(ast.Stmt, 1);
+    statements[0] = .{ .pipeline = .{ .commands = commands } };
+    return statements;
 }
 
 /// `! pipeline`: success and failure trade places, so a signal-killed pipeline
@@ -91,16 +116,16 @@ fn invert(status: u8) u8 {
 const Outcome = struct {
     /// Each stage's status for a multi-command pipeline.
     statuses: []const u8 = &.{},
-    /// The command ran as a `{ ...; }` group in this shell (an alias with
-    /// operators does too).
+    /// The command ran as a `{ ...; }` group or compound command in this
+    /// shell (an alias with operators does too).
     grouped: bool = false,
 };
 
 fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runtime: Runtime) u8 {
     var outcome: Outcome = .{};
     const status = runStages(sh, commands, background, runtime, &outcome);
-    // A group's own status is not a command failure: the commands inside it
-    // were checked as they ran.
+    // A group's or loop's own status is not a command failure: the commands
+    // inside it were checked as they ran.
     if (background or outcome.grouped) return status;
     strict.setPipeStatus(sh, if (outcome.statuses.len != 0) outcome.statuses else &.{status});
     strict.commandDone(sh, status);
@@ -131,7 +156,7 @@ fn runStages(
     for (commands) |original| {
         var cmd = original;
         var resolved: command.Resolved = .{ .words = cmd.words };
-        if (cmd.subshell == null and cmd.group == null) {
+        if (cmd.subshell == null and cmd.group == null and cmd.compound == null) {
             resolved = command.resolveAliases(sh, arena, cmd.words) catch return 1;
             if (resolved.body != null) {
                 cmd.group = (command.aliasStatements(sh, arena, resolved) catch |err| return runtime.expression_error(sh, err)) orelse return 2;
@@ -139,12 +164,13 @@ fn runStages(
                 alias_names.appendSlice(arena, resolved.names) catch return 1;
             }
         }
-        if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
+        if (runsAsCommand(cmd)) strict.beforeCommand(sh);
 
         const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
         defer scope.restore();
 
-        if (cmd.subshell orelse cmd.group) |statements| {
+        const body = stageBody(arena, cmd) catch |err| return runtime.expression_error(sh, err);
+        if (body) |statements| {
             const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
             const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
                 return runtime.expression_error(sh, err);
@@ -226,7 +252,7 @@ fn runSingle(
         defer command.restoreAliases(mark);
         return runSingle(sh, arena, grouped, background, opened, runtime, outcome);
     }
-    if (cmd.subshell == null and cmd.group == null) strict.beforeCommand(sh);
+    if (runsAsCommand(cmd)) strict.beforeCommand(sh);
 
     const substitutions = sh.substitutions;
     var argv: std.ArrayList([]const u8) = .empty;
@@ -241,7 +267,7 @@ fn runSingle(
     }
 
     const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
-    if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null) {
+    if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null and cmd.compound == null) {
         // `NAME=value` on its own outlives the command line.
         assign.persist(sh, arena, cmd.assigns) catch |err| return runtime.expression_error(sh, err);
         // POSIX: the status of the last command substitution performed, else 0.
@@ -251,9 +277,8 @@ fn runSingle(
     const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
     defer scope.restore();
 
-    if (cmd.group != null and !background) {
+    if ((cmd.group != null or cmd.compound != null) and !background) {
         outcome.grouped = true;
-        const statements = cmd.group.?;
         const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
         defer high.restore();
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
@@ -265,10 +290,12 @@ fn runSingle(
             sh.default_out = saved.out;
             sh.default_err = saved.err;
         }
-        return runtime.run_statements(sh, statements);
+        if (cmd.compound) |compound| return runtime.run_compound(sh, compound);
+        return runtime.run_statements(sh, cmd.group.?);
     }
 
-    if (cmd.subshell orelse cmd.group) |statements| {
+    const body = stageBody(arena, cmd) catch |err| return runtime.expression_error(sh, err);
+    if (body) |statements| {
         const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
             return runtime.expression_error(sh, err);
         };
@@ -443,6 +470,7 @@ fn pipelineText(arena: std.mem.Allocator, commands: []const ast.Command) ![]cons
         }
         if (cmd.subshell != null) try out.appendSlice(arena, "(subshell)");
         if (cmd.group != null) try out.appendSlice(arena, "{group}");
+        if (cmd.compound) |compound| try out.appendSlice(arena, compound.text);
         for (cmd.assigns) |assignment| {
             try out.appendSlice(arena, assignment.name);
             try out.append(arena, '=');

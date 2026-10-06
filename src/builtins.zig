@@ -126,40 +126,49 @@ fn builtinEcho(ctx: Ctx) u8 {
         start += 1;
     }
 
+    // One write, so a pipe reader sees whole lines and failures are caught.
+    var out = sys.StringBuilder.init(ctx.sh.gpa);
+    defer out.deinit();
+    var stopped = false;
     var i = start;
     while (i < ctx.argv.len) : (i += 1) {
-        if (i != start) ctx.out(" ");
+        if (i != start) out.append(" ") catch return 1;
         if (escapes) {
-            if (writeEscaped(ctx, ctx.argv[i])) return 0;
+            stopped = appendEscaped(&out, ctx.argv[i]) catch return 1;
+            if (stopped) break;
         } else {
-            ctx.out(ctx.argv[i]);
+            out.append(ctx.argv[i]) catch return 1;
         }
     }
-    if (newline) ctx.out("\n");
+    if (newline and !stopped) out.append("\n") catch return 1;
+    if (sys.writeAll(ctx.stdout, out.items()) != .ok) {
+        ctx.errFmt("wsh: {s}: write error\n", .{ctx.argv[0]});
+        return 1;
+    }
     return 0;
 }
 
-/// Writes `text`, expanding backslash escapes. Returns true when `\c` asked
+/// Appends `text`, expanding backslash escapes. Returns true when `\c` asked
 /// for the rest of the output to be suppressed.
-fn writeEscaped(ctx: Ctx, text: []const u8) bool {
+fn appendEscaped(out: *sys.StringBuilder, text: []const u8) !bool {
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] != '\\' or i + 1 >= text.len) {
-            ctx.out(text[i .. i + 1]);
+            try out.appendByte(text[i]);
             i += 1;
             continue;
         }
         i += 1;
         switch (text[i]) {
-            'a' => ctx.out("\x07"),
-            'b' => ctx.out("\x08"),
-            'e' => ctx.out("\x1b"),
-            'f' => ctx.out("\x0c"),
-            'n' => ctx.out("\n"),
-            'r' => ctx.out("\r"),
-            't' => ctx.out("\t"),
-            'v' => ctx.out("\x0b"),
-            '\\' => ctx.out("\\"),
+            'a' => try out.appendByte(0x07),
+            'b' => try out.appendByte(0x08),
+            'e' => try out.appendByte(0x1b),
+            'f' => try out.appendByte(0x0c),
+            'n' => try out.appendByte('\n'),
+            'r' => try out.appendByte('\r'),
+            't' => try out.appendByte('\t'),
+            'v' => try out.appendByte(0x0b),
+            '\\' => try out.appendByte('\\'),
             '0'...'7' => {
                 var octal: u32 = 0;
                 var digits: usize = 0;
@@ -169,14 +178,13 @@ fn writeEscaped(ctx: Ctx, text: []const u8) bool {
                     i += 1;
                     digits += 1;
                 }
-                var byte: [1]u8 = .{@intCast(octal & 0xff)};
-                ctx.out(&byte);
+                try out.appendByte(@intCast(octal & 0xff));
                 i -= 1;
             },
             'c' => return true,
             else => {
-                ctx.out("\\");
-                ctx.out(text[i .. i + 1]);
+                try out.appendByte('\\');
+                try out.appendByte(text[i]);
             },
         }
         i += 1;
@@ -497,7 +505,8 @@ fn builtinWait(ctx: Ctx) u8 {
                 ctx.sh.jobs.removeAt(ctx.sh.gpa, job_index);
                 return status;
             }
-            if (!running or !ctx.sh.waitJobEvent()) return 127;
+            if (!running) return 127;
+            if (!ctx.sh.waitJobEvent()) return if (ctx.sh.interrupted) 130 else 127;
         }
     }
 
@@ -984,9 +993,15 @@ test "echo joins its arguments" {
     var sh = try Shell.initBare(std.testing.allocator);
     defer sh.deinit();
 
+    const cap = try Capture.open();
     const argv = [_][]const u8{ "echo", "hello", "world" };
-    const ctx = Ctx{ .sh = &sh, .argv = &argv, .stdout = -1 };
-    try std.testing.expectEqual(@as(u8, 0), builtinEcho(ctx));
+    try testing.expectEqual(@as(u8, 0), builtinEcho(Ctx{ .sh = &sh, .argv = &argv, .stdout = cap.write_fd }));
+    const out = try cap.finish(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hello world\n", out);
+
+    // A closed descriptor is a write error, as in bash.
+    try testing.expectEqual(@as(u8, 1), builtinEcho(Ctx{ .sh = &sh, .argv = &argv, .stdout = -1, .stderr = -1 }));
 }
 
 test "echo bundles flags and expands escapes" {

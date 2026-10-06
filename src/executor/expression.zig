@@ -95,6 +95,17 @@ fn reportNotANumber(sh: *Shell, arena: std.mem.Allocator, operand: Value) Error 
     return error.ExecutionFailed;
 }
 
+const builtin_names = [_][]const u8{ "status", "pid", "cwd", "host", "argv", "env" };
+
+/// True when a bare name in an expression refers to something: a built-in
+/// name, a shell variable or an environment variable.
+pub fn isBound(sh: *const Shell, name: []const u8) bool {
+    for (builtin_names) |builtin_name| {
+        if (std.mem.eql(u8, name, builtin_name)) return true;
+    }
+    return sh.getVar(name) != null or sh.getEnv(name) != null;
+}
+
 fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value {
     // The lexer passes `${...}` through as its inner text: `let n = ${#a[@]}`.
     if (!isPlainName(name)) {

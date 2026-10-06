@@ -86,6 +86,9 @@ pub const Shell = struct {
     env: std.StringHashMap([]const u8),
     /// Function name -> source text of its `fn` declaration.
     funcs: std.StringHashMap([]const u8),
+    /// Function name -> line its definition starts on, so a body re-parsed
+    /// from `funcs` reports the original line numbers.
+    func_lines: std.StringHashMap(u32),
     aliases: std.StringHashMap([]const u8),
     /// Names locked by `readonly`; `setVar`/`setEnv` refuse to rebind them.
     readonly: std.StringHashMap(void),
@@ -214,6 +217,7 @@ pub const Shell = struct {
             .vars = std.StringHashMap(value.Value).init(gpa),
             .env = std.StringHashMap([]const u8).init(gpa),
             .funcs = std.StringHashMap([]const u8).init(gpa),
+            .func_lines = std.StringHashMap(u32).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
             .readonly = std.StringHashMap(void).init(gpa),
             .attrs = std.StringHashMap(Attrs).init(gpa),
@@ -296,6 +300,10 @@ pub const Shell = struct {
             self.gpa.free(entry.value_ptr.*);
         }
         self.funcs.deinit();
+
+        var lit = self.func_lines.keyIterator();
+        while (lit.next()) |key| self.gpa.free(key.*);
+        self.func_lines.deinit();
 
         var ait = self.aliases.iterator();
         while (ait.next()) |entry| {
@@ -714,6 +722,23 @@ pub const Shell = struct {
         return self.funcs.get(name);
     }
 
+    pub fn setFuncLine(self: *Shell, name: []const u8, line: u32) !void {
+        const gop = try self.func_lines.getOrPut(name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.func_lines.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = line;
+    }
+
+    /// Line a function's definition starts on; 1 when it is not known.
+    pub fn getFuncLine(self: *const Shell, name: []const u8) u32 {
+        const line = self.func_lines.get(name) orelse 0;
+        return if (line == 0) 1 else line;
+    }
+
     pub fn setAlias(self: *Shell, name: []const u8, val: []const u8) !void {
         const owned = try self.gpa.dupe(u8, val);
         errdefer self.gpa.free(owned);
@@ -864,29 +889,24 @@ pub const Shell = struct {
     /// Name of the current git branch, or null when not inside a repository.
     /// Reads `.git/HEAD` directly so no `git` process is needed.
     pub fn gitBranch(self: *const Shell, arena: std.mem.Allocator) !?[]const u8 {
-        var dir_buf: [linux.PATH_MAX]u8 = undefined;
         var current: []const u8 = self.cwd;
 
         var levels: usize = 0;
         while (levels < 32) : (levels += 1) {
-            const head_path = try std.fmt.allocPrint(arena, "{s}/.git/HEAD", .{current});
-            const z = try arena.dupeZ(u8, head_path);
-            if (try fs.readFileAlloc(arena, z, 4096)) |data| {
-                const trimmed = std.mem.trim(u8, data, " \t\r\n");
-                const prefix = "ref: refs/heads/";
-                if (std.mem.startsWith(u8, trimmed, prefix)) {
-                    return try arena.dupe(u8, trimmed[prefix.len..]);
-                }
-                if (trimmed.len >= 7) return try arena.dupe(u8, trimmed[0..7]);
-                return null;
+            const head = (try readGitHead(arena, current)) orelse {
+                // `dirname` returns a prefix of its argument, so no copy is needed.
+                const parent = std.fs.path.dirname(current) orelse return null;
+                if (parent.len == 0 or std.mem.eql(u8, parent, current)) return null;
+                current = parent;
+                continue;
+            };
+            const trimmed = std.mem.trim(u8, head, " \t\r\n");
+            const prefix = "ref: refs/heads/";
+            if (std.mem.startsWith(u8, trimmed, prefix)) {
+                return try arena.dupe(u8, trimmed[prefix.len..]);
             }
-
-            // Walk up one directory.
-            const parent = std.fs.path.dirname(current) orelse return null;
-            if (parent.len == 0 or std.mem.eql(u8, parent, current)) return null;
-            if (parent.len >= dir_buf.len) return null;
-            @memcpy(dir_buf[0..parent.len], parent);
-            current = dir_buf[0..parent.len];
+            if (trimmed.len >= 7) return try arena.dupe(u8, trimmed[0..7]);
+            return null;
         }
         return null;
     }
@@ -1136,6 +1156,23 @@ fn sameFile(a: [:0]const u8, b: [:0]const u8) bool {
     if (linux.errno(linux.statx(linux.AT.FDCWD, a.ptr, 0, .{ .INO = true }, &sa)) != .SUCCESS) return false;
     if (linux.errno(linux.statx(linux.AT.FDCWD, b.ptr, 0, .{ .INO = true }, &sb)) != .SUCCESS) return false;
     return sa.ino == sb.ino and sa.dev_major == sb.dev_major and sa.dev_minor == sb.dev_minor;
+}
+
+/// The HEAD file of the repository rooted at `dir`, following the `gitdir:`
+/// pointer a worktree or submodule keeps in a `.git` file.
+fn readGitHead(arena: std.mem.Allocator, dir: []const u8) !?[]const u8 {
+    const head_path = try std.fmt.allocPrintSentinel(arena, "{s}/.git/HEAD", .{dir}, 0);
+    if (try fs.readFileAlloc(arena, head_path, 4096)) |data| return data;
+
+    const dot_git = try std.fmt.allocPrintSentinel(arena, "{s}/.git", .{dir}, 0);
+    const pointer = (try fs.readFileAlloc(arena, dot_git, 4096)) orelse return null;
+    const line = std.mem.trim(u8, pointer, " \t\r\n");
+    const marker = "gitdir: ";
+    if (!std.mem.startsWith(u8, line, marker)) return null;
+    const target = line[marker.len..];
+    const git_dir = if (std.fs.path.isAbsolute(target)) target else try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, target });
+    const worktree_head = try std.fmt.allocPrintSentinel(arena, "{s}/HEAD", .{git_dir}, 0);
+    return fs.readFileAlloc(arena, worktree_head, 4096);
 }
 
 pub fn cloneValue(allocator: std.mem.Allocator, v: value.Value) std.mem.Allocator.Error!value.Value {

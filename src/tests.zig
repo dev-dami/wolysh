@@ -43,6 +43,7 @@ test {
     _ = @import("executor/redirect.zig");
     _ = @import("executor/procsub.zig");
     _ = @import("exec.zig");
+    _ = @import("executor/timing.zig");
     _ = @import("executor/assign.zig");
     _ = @import("executor/command.zig");
     _ = @import("executor/operations.zig");
