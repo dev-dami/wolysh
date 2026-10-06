@@ -71,8 +71,8 @@ fn wordExpectsMore(text: []const u8) bool {
 
 fn expectsMore(tag: lexer.Tag) bool {
     return switch (tag) {
-        .pipe, .pipepipe, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .here_doc_strip, .here_string => true,
-        .out, .out_append, .out_both, .out_both_append => true,
+        .pipe, .pipepipe, .pipe_amp, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .here_doc_strip, .here_string => true,
+        .out, .out_append, .out_both, .out_both_append, .out_clobber, .in_out => true,
         .assign, .plus_assign, .minus_assign => true,
         .plus, .minus, .star, .slash, .percent => true,
         .eq, .ne, .lt, .le, .gt, .ge => true,
@@ -98,6 +98,16 @@ fn quotesBalanced(src: []const u8) bool {
         }
         if (c == '\\' and !in_single and i + 1 < src.len) {
             i += 2;
+            continue;
+        }
+        if (c == '$' and !in_single and !in_double and i + 1 < src.len and src[i + 1] == '\'') {
+            // `$'...'`: a backslash escapes the closing quote.
+            i += 2;
+            while (i < src.len and src[i] != '\'') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            if (i >= src.len) return false;
+            i += 1;
             continue;
         }
         if (c == '<' and !in_single and !in_double and i + 1 < src.len and src[i + 1] == '<') {
@@ -244,7 +254,7 @@ fn continuedLine(line: []const u8) bool {
     }
     const token = last orelse return false;
     switch (token.tag) {
-        .pipe, .pipepipe, .ampamp => return true,
+        .pipe, .pipepipe, .pipe_amp, .ampamp => return true,
         else => {},
     }
 

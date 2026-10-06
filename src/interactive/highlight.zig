@@ -24,12 +24,49 @@ pub const magenta = "\x1b[35m";
 pub const cyan = "\x1b[36m";
 pub const gray = "\x1b[90m";
 
+pub const keyword = bold ++ magenta;
+
+/// False when `NO_COLOR` is set to a non-empty value (https://no-color.org).
+pub fn colorEnabled(sh: *const Shell) bool {
+    const value = sh.getEnv("NO_COLOR") orelse return true;
+    return value.len == 0;
+}
+
+const KeywordKind = enum {
+    /// A command follows: `then`, `else`, `do`, `time`, `!`.
+    command,
+    /// An expression or arguments follow: wsh `if`/`while`, `fi`, `return`.
+    argument,
+    /// A name follows, then possibly `in`: `for`, `select`, `case`.
+    name_then_in,
+};
+
+fn keywordKind(word: []const u8) ?KeywordKind {
+    const table = [_]struct { []const u8, KeywordKind }{
+        .{ "then", .command },      .{ "else", .command },        .{ "do", .command },
+        .{ "time", .command },      .{ "!", .command },           .{ "if", .argument },
+        .{ "elif", .argument },     .{ "while", .argument },      .{ "until", .argument },
+        .{ "fi", .argument },       .{ "done", .argument },       .{ "esac", .argument },
+        .{ "function", .argument }, .{ "fn", .argument },         .{ "let", .argument },
+        .{ "return", .argument },   .{ "break", .argument },      .{ "continue", .argument },
+        .{ "for", .name_then_in },  .{ "select", .name_then_in }, .{ "case", .name_then_in },
+    };
+    for (table) |entry| {
+        if (std.mem.eql(u8, entry[0], word)) return entry[1];
+    }
+    return null;
+}
+
 /// Appends `src` with ANSI colours to `out`.
 pub fn render(out: *std.Io.Writer, sh: *Shell, src: []const u8) !void {
+    if (!colorEnabled(sh)) return out.writeAll(src);
+
     var lx = lexer.Lexer.init(src);
     var prev_end: usize = 0;
     var expect_command = true;
     var expect_filename = false;
+    // Counts down the words of `for NAME in`, `case WORD in`.
+    var in_countdown: u8 = 0;
 
     while (true) {
         const tok = lx.next();
@@ -49,10 +86,24 @@ pub fn render(out: *std.Io.Writer, sh: *Shell, src: []const u8) !void {
                     continue;
                 }
                 if (expect_command) {
+                    if (keywordKind(tok.text)) |kind| {
+                        try out.writeAll(keyword);
+                        try out.writeAll(tok.text);
+                        try out.writeAll(reset);
+                        expect_command = kind == .command;
+                        in_countdown = if (kind == .name_then_in) 2 else 0;
+                        continue;
+                    }
                     try writeCommandWord(out, sh, tok.text);
                     expect_command = false;
+                } else if (in_countdown == 1 and std.mem.eql(u8, tok.text, "in")) {
+                    try out.writeAll(keyword);
+                    try out.writeAll(tok.text);
+                    try out.writeAll(reset);
+                    in_countdown = 0;
                 } else {
                     try writeArgument(out, sh, tok.text);
+                    if (in_countdown > 0) in_countdown -= 1;
                 }
             },
             .out, .out_append, .in => {
@@ -66,15 +117,19 @@ pub fn render(out: *std.Io.Writer, sh: *Shell, src: []const u8) !void {
                 try out.writeAll(tok.text);
                 try out.writeAll(reset);
                 expect_command = true;
+                in_countdown = 0;
             },
             .lbrace, .rbrace => {
                 try out.writeAll(magenta);
                 try out.writeAll(tok.text);
                 try out.writeAll(reset);
+                expect_command = true;
+                in_countdown = 0;
             },
             .newline => {
                 try out.writeAll("\n");
                 expect_command = true;
+                in_countdown = 0;
             },
             .invalid => {
                 try out.writeAll(red);
@@ -227,4 +282,30 @@ test "highlighting preserves the source text" {
         i += 1;
     }
     try std.testing.expectEqualStrings(src, plain.items);
+}
+
+test "keywords are highlighted and NO_COLOR disables colour" {
+    var sh = try Shell.initBare(std.testing.allocator);
+    defer sh.deinit();
+
+    var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating.deinit();
+
+    try render(&allocating.writer, &sh, "for x in a b; do echo $x; done");
+    const rendered = allocating.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, keyword ++ "for" ++ reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, keyword ++ "in" ++ reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, keyword ++ "do" ++ reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, keyword ++ "done" ++ reset) != null);
+    // `a` after `in` is an ordinary argument, not a keyword.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, keyword ++ "a") == null);
+
+    allocating.writer.end = 0;
+    try render(&allocating.writer, &sh, "case $x in a) echo;; esac");
+    try std.testing.expect(std.mem.indexOf(u8, allocating.writer.buffered(), keyword ++ "in" ++ reset) != null);
+
+    try sh.setEnv("NO_COLOR", "1");
+    allocating.writer.end = 0;
+    try render(&allocating.writer, &sh, "if true; then echo hi; fi");
+    try std.testing.expectEqualStrings("if true; then echo hi; fi", allocating.writer.buffered());
 }

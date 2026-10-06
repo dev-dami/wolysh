@@ -5,6 +5,7 @@ const parser_mod = @import("../parser.zig");
 const shellmod = @import("../shell.zig");
 const sys = @import("../sys.zig");
 const value = @import("../value.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -30,7 +31,10 @@ pub fn run(
     }
 
     const arena = sh.scratch();
-    var parser = parser_mod.Parser.init(arena, source);
+    // The body may `unset -f` or redefine this function, freeing `source`
+    // while its statements still point into it.
+    const owned = arena.dupe(u8, source) catch return 1;
+    var parser = parser_mod.Parser.init(arena, owned);
     const program = parser.parseProgram() catch {
         reportSyntaxError(sh, &parser);
         return 2;
@@ -44,20 +48,23 @@ pub fn run(
 
     // `$0` keeps naming the shell/script; only the positional parameters are
     // the function's.
-    const saved_positional = sh.positional;
     const saved_return = sh.return_pending;
     const saved_code = sh.return_code;
-    sh.positional = if (argv.len > 1) argv[1..] else &.{};
-    sh.return_pending = false;
     sh.beginScope() catch return 1;
+    const saved_positional = sh.pushPositional(if (argv.len > 1) argv[1..] else &.{});
+    sh.return_pending = false;
     sh.call_depth += 1;
     defer {
         sh.call_depth -= 1;
         sh.endScope();
-        sh.positional = saved_positional;
+        sh.popPositional(saved_positional);
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
     }
+    // Declared after the block above so it runs first: the RETURN trap still
+    // sees the function's parameters.
+    const saved_traps = strict.enterFunction(sh);
+    defer strict.leaveFunction(sh, saved_traps);
 
     for (declaration.params, 0..) |param, index| {
         const arg_index = index + 1;

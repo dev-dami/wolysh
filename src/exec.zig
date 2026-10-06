@@ -7,6 +7,7 @@ const ast = @import("ast.zig");
 const parser_mod = @import("parser.zig");
 const shellmod = @import("shell.zig");
 const expand_mod = @import("expand.zig");
+const arith = @import("arith.zig");
 const proc = @import("proc.zig");
 const value = @import("value.zig");
 const fs = @import("fs.zig");
@@ -16,6 +17,9 @@ const command = @import("executor/command.zig");
 const expression = @import("executor/expression.zig");
 const function = @import("executor/function.zig");
 const pipeline = @import("executor/pipeline.zig");
+const session = @import("interactive/session.zig");
+const strict = @import("strict.zig");
+const procsub = @import("executor/procsub.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -83,10 +87,12 @@ pub const isComplete = completeness.isComplete;
 pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     var status: u8 = 0;
     for (stmts) |stmt| {
+        if (sh.interrupted) return 130;
         sh.runPendingTraps();
         status = runStmt(sh, stmt);
         sh.last_status = status;
-        if (sh.should_exit or sh.return_pending or sh.break_pending or sh.continue_pending) break;
+        session.checkDirectory(sh);
+        if (sh.should_exit or sh.return_pending or sh.break_pending or sh.continue_pending or sh.interrupted) break;
     }
     return status;
 }
@@ -97,16 +103,16 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
         .pipeline => |chain| return runChain(sh, chain),
 
         .var_decl => |decl| {
-            const v = evalExpr(sh, arena, decl.value) catch |err| return exprError(sh, err);
+            const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, exprError(sh, err));
             sh.assignVar(decl.name, v) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
         .env_assign => |assign| {
-            const v = evalExpr(sh, arena, assign.value) catch |err| return exprError(sh, err);
+            const v = evalExpr(sh, arena, assign.value) catch |err| return statementFailed(sh, exprError(sh, err));
             const text = v.renderAlloc(arena) catch return 1;
             const final = switch (assign.op) {
                 .set => text,
@@ -117,13 +123,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
             };
             sh.assignEnv(assign.name, final) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, assign.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
         .if_ => |branch| {
-            const cond = evalExpr(sh, arena, branch.cond) catch |err| return exprError(sh, err);
+            const cond = evalCondition(sh, arena, branch.cond) catch |err| return exprError(sh, err);
             if (cond.truthy()) return runStmts(sh, branch.then.stmts);
             if (branch.else_) |else_block| return runStmts(sh, else_block.stmts);
             return 0;
@@ -167,6 +173,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
     }
 }
 
+/// A failed `let` or `env` statement counts as a failed command for `set -e`
+/// and the ERR trap.
+fn statementFailed(sh: *Shell, status: u8) u8 {
+    strict.commandDone(sh, status);
+    return status;
+}
+
 fn exprError(sh: *Shell, err: anyerror) u8 {
     switch (err) {
         error.CommandNotFound => return 127,
@@ -174,13 +187,13 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             sys.writeStr(sh.default_err, "wsh: out of memory\n");
             return 1;
         },
-        error.InvalidArithmetic => {
-            sys.writeStr(sh.default_err, "wsh: arithmetic syntax error\n");
-            return 2;
-        },
-        error.DivisionByZero => {
-            sys.writeStr(sh.default_err, "wsh: division by zero\n");
-            return 2;
+        error.InvalidArithmetic, error.DivisionByZero => {
+            const detail = arith.takeErrorMessage() orelse
+                if (err == error.DivisionByZero) "division by zero" else "arithmetic syntax error";
+            var buf: [1100]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{detail}) catch "wsh: arithmetic error\n";
+            sys.writeStr(sh.default_err, msg);
+            return 1;
         },
         error.UnterminatedSubstitution => {
             sys.writeStr(sh.default_err, "wsh: unterminated substitution\n");
@@ -194,6 +207,10 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
         error.BadSubstitution, error.UnboundVariable => return expansionFailed(sh),
         error.ReadonlyVariable => {
             sys.writeStr(sh.default_err, "wsh: readonly variable\n");
+            return 1;
+        },
+        error.BraceExpansionTooLarge => {
+            sys.writeStr(sh.default_err, "wsh: brace expansion: too many words\n");
             return 1;
         },
         else => {
@@ -272,6 +289,9 @@ fn takeContinue(sh: *Shell) LoopControl {
 
 fn runFor(sh: *Shell, loop: ast.For) u8 {
     const outer = sh.scratch();
+    // `for f in <(ls)` keeps the substitution open for the whole loop.
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
     // Items are expanded in the enclosing arena so they survive the per
     // iteration resets below.
     var items: std.ArrayList([]const u8) = .empty;
@@ -291,6 +311,7 @@ fn runFor(sh: *Shell, loop: ast.For) u8 {
 
     var status: u8 = 0;
     for (items.items) |item| {
+        if (sh.interrupted) break;
         _ = iter_arena.reset(.retain_capacity);
         sh.setVar(loop.name, .{ .string = item }) catch return 1;
         status = runStmts(sh, loop.body.stmts);
@@ -320,10 +341,10 @@ fn runWhile(sh: *Shell, loop: ast.While) u8 {
     loop_depth += 1;
 
     var status: u8 = 0;
-    while (true) {
+    while (!sh.interrupted) {
         _ = iter_arena.reset(.retain_capacity);
-        const cond = evalExpr(sh, outer, loop.cond) catch |err| return exprError(sh, err);
-        if (!cond.truthy()) break;
+        const cond = evalCondition(sh, outer, loop.cond) catch |err| return exprError(sh, err);
+        if (!cond.truthy() or sh.interrupted) break;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
         const brk = takeBreak(sh);
@@ -343,12 +364,24 @@ fn evalExpr(sh: *Shell, arena: std.mem.Allocator, expr: *const ast.Expr) Error!V
     return expression.evaluate(sh, arena, expr, executeExpressionCall);
 }
 
+/// An `if`/`while` test: commands it runs may fail without `set -e` or the
+/// ERR trap firing.
+fn evalCondition(sh: *Shell, arena: std.mem.Allocator, expr: *const ast.Expr) Error!Value {
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
+    return evalExpr(sh, arena, expr);
+}
+
 fn executeExpressionCall(sh: *Shell, arena: std.mem.Allocator, callee: []const u8, args: []const *ast.Expr) Error!Value {
     const argv = try arena.alloc([]const u8, args.len + 1);
     argv[0] = callee;
     for (args, 0..) |arg, index| {
         argv[index + 1] = try (try evalExpr(sh, arena, arg)).renderAlloc(arena);
     }
+    // A call in an expression is a test whose result becomes a value, so a
+    // failure is not an error.
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
 
     if (command.isInternal(sh, callee)) {
         return Value{ .boolean = command.dispatch(sh, argv, commandRuntime()) == 0 };
@@ -393,6 +426,25 @@ fn runFunction(sh: *Shell, name: []const u8, source: []const u8, argv: []const [
     });
 }
 
+/// Calls the shell function `name` as an interactive hook. It runs apart from
+/// any loop the caller is in, so a stray `break` in it cannot leak out.
+/// Returns null when no such function is defined.
+pub fn callFunction(sh: *Shell, name: []const u8, args: []const []const u8) ?u8 {
+    const source = sh.getFunc(name) orelse return null;
+    const argv = sh.scratch().alloc([]const u8, args.len + 1) catch return 1;
+    argv[0] = name;
+    @memcpy(argv[1..], args);
+
+    const saved = .{ loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending };
+    loop_depth = 0;
+    break_level = 0;
+    continue_level = 0;
+    sh.break_pending = false;
+    sh.continue_pending = false;
+    defer loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending = saved;
+    return runFunction(sh, name, source, argv);
+}
+
 // --- substitution -----------------------------------------------------------
 
 pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator) anyerror![]const u8 {
@@ -403,6 +455,7 @@ pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator)
 pub fn install(sh: *Shell) void {
     sh.subst_runner = substitutionRunner;
     sh.trap_runner = runSource;
+    procsub.run_source = runSource;
 }
 
 // --- tests ------------------------------------------------------------------

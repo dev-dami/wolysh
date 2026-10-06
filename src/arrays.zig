@@ -35,14 +35,14 @@ pub fn persist(sh: *Shell, arena: std.mem.Allocator, a: ast.PrefixAssign) Error!
         return true;
     }
     if (a.index) |subscript| {
-        const text = try expand.expandLiteral(sh, arena, a.value);
+        const text = try expand.expandAssignment(sh, arena, a.value);
         try assignElement(sh, arena, a.name, subscript, text, a.append);
         return true;
     }
     const existing = sh.vars.get(a.name);
     const is_array = if (existing) |v| v == .list or v == .map else false;
     if (!is_array and !a.append) return false;
-    const text = try expand.expandLiteral(sh, arena, a.value);
+    const text = try expand.expandAssignment(sh, arena, a.value);
     // As in bash, a plain assignment to an array sets element 0.
     if (is_array) {
         try assignElement(sh, arena, a.name, "0", text, a.append);
@@ -103,7 +103,7 @@ pub fn assignCompound(
             var add = false;
             if (compound.keyed(words[i])) |k| {
                 key = try expand.expandLiteral(sh, arena, k.key);
-                text = try expand.expandLiteral(sh, arena, k.value);
+                text = try expand.expandAssignment(sh, arena, k.value);
                 add = k.append;
             } else {
                 // bash 5.1: bare words alternate between keys and values.
@@ -139,7 +139,7 @@ pub fn assignCompound(
     for (words) |word| {
         if (compound.keyed(word)) |k| {
             const index = try resolveIndex(sh, arena, name, k.key, items.items.len);
-            const text = try expand.expandLiteral(sh, arena, k.value);
+            const text = try expand.expandAssignment(sh, arena, k.value);
             const old: ?Value = if (index < items.items.len) items.items[index] else null;
             try putItem(arena, &items, index, try combine(sh, arena, attrs, old, text, k.append));
             next = index + 1;
@@ -212,7 +212,7 @@ pub fn assignElement(
 fn resolveIndex(sh: *Shell, arena: std.mem.Allocator, name: []const u8, subscript: []const u8, len: usize) Error!usize {
     const text = try expand.expandLiteral(sh, arena, subscript);
     if (std.mem.trim(u8, text, " \t\n").len == 0) return badSubscript(sh, name, subscript);
-    const n = try arith.evaluate(sh, arena, text);
+    const n = try arith.evaluateExpanded(sh, arena, text);
     const index: i64 = if (n < 0) n + @as(i64, @intCast(len)) else n;
     if (index < 0) return badSubscript(sh, name, subscript);
     if (index >= max_index) return tooLarge(sh, name, @intCast(index));
@@ -220,19 +220,19 @@ fn resolveIndex(sh: *Shell, arena: std.mem.Allocator, name: []const u8, subscrip
 }
 
 fn badSubscript(sh: *Shell, name: []const u8, subscript: []const u8) Error {
-    expand.report(sh, "wsh: {s}[{s}]: bad array subscript\n", .{ name, subscript });
+    expand.printError(sh, "wsh: {s}[{s}]: bad array subscript\n", .{ name, subscript });
     return error.BadSubstitution;
 }
 
 fn tooLarge(sh: *Shell, name: []const u8, index: usize) Error {
-    expand.report(sh, "wsh: {s}[{d}]: index too large for an indexed array (use declare -A)\n", .{ name, index });
+    expand.printError(sh, "wsh: {s}[{d}]: index too large for an indexed array (use declare -A)\n", .{ name, index });
     return error.BadSubstitution;
 }
 
 /// The value an assignment stores, after `+=` and the variable's attributes.
 pub fn combine(sh: *Shell, arena: std.mem.Allocator, attrs: Shell.Attrs, old: ?Value, text: []const u8, append: bool) Error!Value {
     if (attrs.integer) {
-        var n = try arith.evaluate(sh, arena, text);
+        var n = try arith.evaluateExpanded(sh, arena, text);
         if (append) {
             if (old) |v| n +%= try integerOf(sh, arena, v);
         }
@@ -251,7 +251,7 @@ fn integerOf(sh: *Shell, arena: std.mem.Allocator, v: Value) Error!i64 {
     return switch (v) {
         .int => |n| n,
         .none => 0,
-        else => arith.evaluate(sh, arena, try render(arena, v)),
+        else => arith.evaluateExpanded(sh, arena, try render(arena, v)),
     };
 }
 
@@ -397,7 +397,7 @@ pub fn unsetElement(sh: *Shell, spec: []const u8) ?u8 {
         if (!ok) return null;
     }
     if (sh.isReadonly(name)) {
-        expand.report(sh, "wsh: unset: {s}: readonly variable\n", .{name});
+        expand.printError(sh, "wsh: unset: {s}: readonly variable\n", .{name});
         return 1;
     }
     const stored = sh.vars.get(name) orelse return 0;
@@ -428,7 +428,7 @@ pub fn unsetElement(sh: *Shell, spec: []const u8) ?u8 {
         return 0;
     }
     const n = arith.evaluate(sh, sh.scratch(), subscript) catch {
-        expand.report(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
+        expand.printError(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
         return 1;
     };
     // Looked up after the arithmetic, which may have moved the storage.
@@ -441,7 +441,7 @@ pub fn unsetElement(sh: *Shell, spec: []const u8) ?u8 {
     const items = slot.list;
     const index: i64 = if (n < 0) n + @as(i64, @intCast(items.len)) else n;
     if (index < 0) {
-        expand.report(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
+        expand.printError(sh, "wsh: unset: {s}: bad array subscript\n", .{spec});
         return 1;
     }
     if (index >= items.len) return 0;

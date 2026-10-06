@@ -5,6 +5,7 @@ const linux = std.os.linux;
 const parser = @import("parser.zig");
 const proc = @import("proc.zig");
 const Shell = @import("shell.zig").Shell;
+const strict = @import("strict.zig");
 const sys = @import("sys.zig");
 
 const RunSource = *const fn (*Shell, []const u8) u8;
@@ -88,7 +89,8 @@ fn worker(payload: *Payload, index: usize) noreturn {
     sh.return_pending = false;
     sh.break_pending = false;
     sh.continue_pending = false;
-    linux.exit(payload.run_source(sh, payload.options.commands[index]));
+    strict.enterSubshell(sh);
+    strict.exitChild(sh, payload.run_source(sh, payload.options.commands[index]));
 }
 
 fn schedule(ctx: *anyopaque) noreturn {

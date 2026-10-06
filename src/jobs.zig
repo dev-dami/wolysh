@@ -137,6 +137,64 @@ pub const Table = struct {
         return &self.jobs.items[self.jobs.items.len - 1];
     }
 
+    /// The job `fg`/`bg` act on by default (`%+`): the most recent job that
+    /// has not finished.
+    pub fn current(self: *Table) ?*Job {
+        var index = self.jobs.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.jobs.items[index].state != .done) return &self.jobs.items[index];
+        }
+        return null;
+    }
+
+    /// The job before the current one (`%-`).
+    pub fn previous(self: *Table) ?*Job {
+        const top = self.current() orelse return null;
+        var index = self.indexOf(top).?;
+        while (index > 0) {
+            index -= 1;
+            if (self.jobs.items[index].state != .done) return &self.jobs.items[index];
+        }
+        return null;
+    }
+
+    pub const Lookup = union(enum) {
+        found: *Job,
+        none,
+        /// More than one job matches a `%name` or `%?text` spec.
+        ambiguous,
+    };
+
+    /// Resolves a job spec: `%N`, `%+`/`%%`/`%`, `%-`, `%name` (command
+    /// prefix) and `%?text` (command substring). The leading `%` is optional
+    /// for a number or a prefix.
+    pub fn lookup(self: *Table, spec: []const u8) Lookup {
+        if (spec.len == 0 or std.mem.eql(u8, spec, "%") or std.mem.eql(u8, spec, "%%") or std.mem.eql(u8, spec, "%+")) {
+            return if (self.current()) |job| .{ .found = job } else .none;
+        }
+        if (std.mem.eql(u8, spec, "%-")) {
+            return if (self.previous()) |job| .{ .found = job } else .none;
+        }
+        const bare = if (spec[0] == '%') spec[1..] else spec;
+        if (std.fmt.parseInt(u32, bare, 10)) |id| {
+            return if (self.findById(id)) |job| .{ .found = job } else .none;
+        } else |_| {}
+        const substring = bare.len != 0 and bare[0] == '?';
+        const needle = if (substring) bare[1..] else bare;
+        var match: ?*Job = null;
+        for (self.jobs.items) |*job| {
+            const hit = if (substring)
+                std.mem.indexOf(u8, job.command, needle) != null
+            else
+                std.mem.startsWith(u8, job.command, needle);
+            if (!hit) continue;
+            if (match != null) return .ambiguous;
+            match = job;
+        }
+        return if (match) |job| .{ .found = job } else .none;
+    }
+
     pub fn hasRunning(self: *const Table) bool {
         for (self.jobs.items) |job| {
             if (job.state != .done) return true;
@@ -171,4 +229,27 @@ test "table add and lookup" {
     job.notified = true;
     table.sweep(a);
     try std.testing.expectEqual(@as(usize, 0), table.count());
+}
+
+test "job specs resolve current, previous, prefixes and substrings" {
+    const a = std.testing.allocator;
+    var table = Table{};
+    defer table.deinit(a);
+
+    _ = try table.add(a, 10, &.{10}, "sleep 5", false);
+    _ = try table.add(a, 20, &.{20}, "sleep 6 | cat", false);
+    _ = try table.add(a, 30, &.{30}, "vim notes", false);
+
+    try std.testing.expectEqual(@as(u32, 3), table.lookup("%+").found.id);
+    try std.testing.expectEqual(@as(u32, 3), table.lookup("%%").found.id);
+    try std.testing.expectEqual(@as(u32, 2), table.lookup("%-").found.id);
+    try std.testing.expectEqual(@as(u32, 1), table.lookup("%1").found.id);
+    try std.testing.expectEqual(@as(u32, 3), table.lookup("%vim").found.id);
+    try std.testing.expectEqual(@as(u32, 2), table.lookup("%?cat").found.id);
+    try std.testing.expect(table.lookup("%sle") == .ambiguous);
+    try std.testing.expect(table.lookup("%9") == .none);
+
+    table.findById(3).?.state = .done;
+    try std.testing.expectEqual(@as(u32, 2), table.current().?.id);
+    try std.testing.expectEqual(@as(u32, 1), table.previous().?.id);
 }
