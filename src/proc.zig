@@ -364,15 +364,23 @@ pub fn waitAny(flags: u32) ?ChildEvent {
     while (true) {
         const rc = linux.waitpid(-1, &wstatus, flags);
         const err = linux.errno(rc);
-        if (err == .INTR) continue;
+        if (err == .INTR) {
+            // Ctrl-C in an interactive shell ends `wait -n` instead of resuming it.
+            if (interrupt_flag) |flag| {
+                if (flag.*) return null;
+            }
+            continue;
+        }
         if (err != .SUCCESS or rc == 0) return null;
         return .{ .pid = @intCast(rc), .status = decode(wstatus) };
     }
 }
 
-fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, pgid: i32) noreturn {
+/// `group` is the process group to join: 0 makes this child the leader of a
+/// new one, null keeps the shell's.
+fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, group: ?i32) noreturn {
     // Both parent and child call setpgid so neither has to win the race.
-    if (pgid != 0) _ = linux.setpgid(0, pgid);
+    if (group) |pgid| _ = linux.setpgid(0, pgid);
     resetSignals();
 
     const sources = [3]i32{ fd_in, fd_out, stage.stdio.err };
@@ -499,11 +507,7 @@ pub fn launch(arena: std.mem.Allocator, stages: []const Stage, options: LaunchOp
             return error.ForkFailed;
         }
         const pid: i32 = @intCast(rc);
-        if (options.new_group) {
-            if (pid == 0) childRun(stage, fd_in, fd_out, pipes.items, pgid);
-        } else if (pid == 0) {
-            childRun(stage, fd_in, fd_out, pipes.items, 0);
-        }
+        if (pid == 0) childRun(stage, fd_in, fd_out, pipes.items, if (options.new_group) pgid else null);
 
         pids[idx] = pid;
         if (options.new_group) {
