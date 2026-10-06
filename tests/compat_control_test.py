@@ -111,6 +111,8 @@ class ControlFlowTests(unittest.TestCase):
             'case `echo x` in x) echo backquoted;; esac\n'
             'if (test -n "$kind") then echo subshell-then; fi\n'
             'while { false; } do :; done; echo group-do',
+            # As with `bash -c`, the first argument is $0.
+            "wsh",
             "release.tar.gz",
         )
         self.assert_success(result)
@@ -135,7 +137,8 @@ class ControlFlowTests(unittest.TestCase):
             'function greet { echo "hello ${1:-world}"; }\n'
             'greet; greet ada\n'
             'usage(){ echo "usage: $0"; }\n'
-            'usage'
+            'usage',
+            "wsh",
         )
         self.assert_success(result)
         self.assertEqual(

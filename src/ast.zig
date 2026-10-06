@@ -26,10 +26,14 @@ pub const RedirectKind = enum {
     out_dup,
     err_dup,
     in_dup,
+    /// `>|`: truncate even when `noclobber` is set.
+    clobber,
+    /// `<>`: open read-write, creating but never truncating.
+    read_write,
 
     pub fn fd(self: RedirectKind) i32 {
         return switch (self) {
-            .in, .here_doc, .here_string, .in_dup => 0,
+            .in, .here_doc, .here_string, .in_dup, .read_write => 0,
             .err_out, .err_append, .err_dup => 2,
             else => 1,
         };
@@ -58,6 +62,9 @@ pub const Redirect = struct {
     fd: i32 = -1,
     /// `<<-`: strip leading tabs from the body and the delimiter line.
     strip_tabs: bool = false,
+    /// `{name}>file`: the shell picks a free descriptor (10 or above), stores
+    /// its number in `name`, and leaves it open after the command.
+    fd_var: []const u8 = "",
 
     pub fn targetFd(self: Redirect) i32 {
         return if (self.fd >= 0) self.fd else self.kind.fd();

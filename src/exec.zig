@@ -7,6 +7,7 @@ const ast = @import("ast.zig");
 const parser_mod = @import("parser.zig");
 const shellmod = @import("shell.zig");
 const expand_mod = @import("expand.zig");
+const arith = @import("arith.zig");
 const proc = @import("proc.zig");
 const value = @import("value.zig");
 const fs = @import("fs.zig");
@@ -17,6 +18,9 @@ const command = @import("executor/command.zig");
 const expression = @import("executor/expression.zig");
 const function = @import("executor/function.zig");
 const pipeline = @import("executor/pipeline.zig");
+const session = @import("interactive/session.zig");
+const strict = @import("strict.zig");
+const procsub = @import("executor/procsub.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -84,9 +88,11 @@ pub const isComplete = completeness.isComplete;
 pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     var status: u8 = 0;
     for (stmts) |stmt| {
+        if (sh.interrupted) return 130;
         sh.runPendingTraps();
         status = runStmt(sh, stmt);
         sh.last_status = status;
+        session.checkDirectory(sh);
         if (stopRequested(sh) or sh.break_pending or sh.continue_pending) break;
     }
     return status;
@@ -108,17 +114,17 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
 
         .var_decl => |decl| {
             setLine(sh, decl.line);
-            const v = evalExpr(sh, arena, decl.value) catch |err| return exprError(sh, err);
+            const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, exprError(sh, err));
             sh.assignVar(decl.name, v) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
         .env_assign => |assign| {
             setLine(sh, assign.line);
-            const v = evalExpr(sh, arena, assign.value) catch |err| return exprError(sh, err);
+            const v = evalExpr(sh, arena, assign.value) catch |err| return statementFailed(sh, exprError(sh, err));
             const text = v.renderAlloc(arena) catch return 1;
             const final = switch (assign.op) {
                 .set => text,
@@ -129,7 +135,7 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
             };
             sh.assignEnv(assign.name, final) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, assign.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
@@ -171,6 +177,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
     }
 }
 
+/// A failed `let` or `env` statement counts as a failed command for `set -e`
+/// and the ERR trap.
+fn statementFailed(sh: *Shell, status: u8) u8 {
+    strict.commandDone(sh, status);
+    return status;
+}
+
 fn exprError(sh: *Shell, err: anyerror) u8 {
     switch (err) {
         error.CommandNotFound => return 127,
@@ -178,13 +191,13 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             sys.writeStr(sh.default_err, "wsh: out of memory\n");
             return 1;
         },
-        error.InvalidArithmetic => {
-            sys.writeStr(sh.default_err, "wsh: arithmetic syntax error\n");
-            return 2;
-        },
-        error.DivisionByZero => {
-            sys.writeStr(sh.default_err, "wsh: division by zero\n");
-            return 2;
+        error.InvalidArithmetic, error.DivisionByZero => {
+            const detail = arith.takeErrorMessage() orelse
+                if (err == error.DivisionByZero) "division by zero" else "arithmetic syntax error";
+            var buf: [1100]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{detail}) catch "wsh: arithmetic error\n";
+            sys.writeStr(sh.default_err, msg);
+            return 1;
         },
         error.UnterminatedSubstitution => {
             sys.writeStr(sh.default_err, "wsh: unterminated substitution\n");
@@ -197,6 +210,10 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
         error.ExecutionFailed => return 1,
         error.ReadonlyVariable => {
             sys.writeStr(sh.default_err, "wsh: readonly variable\n");
+            return 1;
+        },
+        error.BraceExpansionTooLarge => {
+            sys.writeStr(sh.default_err, "wsh: brace expansion: too many words\n");
             return 1;
         },
         else => {
@@ -315,6 +332,9 @@ fn expandItems(sh: *Shell, words: []const ast.Word) Error![]const []const u8 {
 }
 
 fn runFor(sh: *Shell, loop: ast.For) u8 {
+    // `for f in <(ls)` keeps the substitution open for the whole loop.
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
     const items = expandItems(sh, loop.items) catch |err| return exprError(sh, err);
     var scope = LoopScope.enter(sh);
     defer scope.leave(sh);
@@ -400,6 +420,8 @@ fn namesBound(sh: *Shell, expr: *const ast.Expr) bool {
 }
 
 fn runCase(sh: *Shell, case: ast.Case) u8 {
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
     const arena = sh.scratch();
     const subject = expand_mod.expandLiteral(sh, arena, case.word) catch |err| return exprError(sh, err);
     var status: u8 = 0;
@@ -421,52 +443,20 @@ fn runCase(sh: *Shell, case: ast.Case) u8 {
     return status;
 }
 
-const CaseError = Error || error{CasePatternTooComplex};
-
-fn caseMatches(sh: *Shell, arena: std.mem.Allocator, patterns: []const ast.Word, subject: []const u8) CaseError!bool {
+fn caseMatches(sh: *Shell, arena: std.mem.Allocator, patterns: []const ast.Word, subject: []const u8) Error!bool {
     for (patterns) |word| {
         const pattern = try expand_mod.expandPattern(sh, arena, word);
-        if (try matchCasePattern(arena, pattern, subject, sh.options.nocasematch)) return true;
+        if (glob.matchSegmentWith(pattern, subject, .{ .nocase = sh.options.nocasematch })) return true;
     }
     return false;
-}
-
-/// `glob.matchSegment` treats `/` as a path separator, which a `case`
-/// pattern does not, so both sides swap it for a byte neither contains.
-fn matchCasePattern(arena: std.mem.Allocator, pattern: []const u8, subject: []const u8, fold: bool) CaseError!bool {
-    var pat = pattern;
-    var text = subject;
-    if (fold) {
-        pat = try std.ascii.allocLowerString(arena, pat);
-        text = try std.ascii.allocLowerString(arena, text);
-    }
-    if (std.mem.indexOfScalar(u8, pat, '/') == null and std.mem.indexOfScalar(u8, text, '/') == null) {
-        return glob.matchSegment(pat, text);
-    }
-    const stand_in = unusedByte(pat, text) orelse return error.CasePatternTooComplex;
-    const pat_copy = try arena.dupe(u8, pat);
-    const text_copy = try arena.dupe(u8, text);
-    std.mem.replaceScalar(u8, pat_copy, '/', stand_in);
-    std.mem.replaceScalar(u8, text_copy, '/', stand_in);
-    return glob.matchSegment(pat_copy, text_copy);
-}
-
-fn unusedByte(a: []const u8, b: []const u8) ?u8 {
-    var c: u8 = 1;
-    while (c < 0x20) : (c += 1) {
-        if (std.mem.indexOfScalar(u8, a, c) == null and std.mem.indexOfScalar(u8, b, c) == null) return c;
-    }
-    c = 0x80;
-    while (true) : (c += 1) {
-        if (std.mem.indexOfScalar(u8, a, c) == null and std.mem.indexOfScalar(u8, b, c) == null) return c;
-        if (c == 0xff) return null;
-    }
 }
 
 /// `select NAME in WORDS`: prints a numbered menu on standard error, reads
 /// a choice from standard input into `REPLY` and runs the body with NAME set
 /// to the chosen word (empty for an invalid choice) until `break` or EOF.
 fn runSelect(sh: *Shell, loop: ast.For) u8 {
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
     const items = expandItems(sh, loop.items) catch |err| return exprError(sh, err);
     var scope = LoopScope.enter(sh);
     defer scope.leave(sh);
@@ -561,6 +551,10 @@ fn executeExpressionCall(sh: *Shell, arena: std.mem.Allocator, callee: []const u
     for (args, 0..) |arg, index| {
         argv[index + 1] = try (try evalExpr(sh, arena, arg)).renderAlloc(arena);
     }
+    // A call in an expression is a test whose result becomes a value, so a
+    // failure is not an error.
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
 
     if (command.isInternal(sh, callee)) {
         return Value{ .boolean = command.dispatch(sh, argv, commandRuntime()) == 0 };
@@ -606,6 +600,25 @@ fn runFunction(sh: *Shell, name: []const u8, source: []const u8, argv: []const [
     });
 }
 
+/// Calls the shell function `name` as an interactive hook. It runs apart from
+/// any loop the caller is in, so a stray `break` in it cannot leak out.
+/// Returns null when no such function is defined.
+pub fn callFunction(sh: *Shell, name: []const u8, args: []const []const u8) ?u8 {
+    const source = sh.getFunc(name) orelse return null;
+    const argv = sh.scratch().alloc([]const u8, args.len + 1) catch return 1;
+    argv[0] = name;
+    @memcpy(argv[1..], args);
+
+    const saved = .{ loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending };
+    loop_depth = 0;
+    break_level = 0;
+    continue_level = 0;
+    sh.break_pending = false;
+    sh.continue_pending = false;
+    defer loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending = saved;
+    return runFunction(sh, name, source, argv);
+}
+
 // --- substitution -----------------------------------------------------------
 
 pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator) anyerror![]const u8 {
@@ -616,6 +629,7 @@ pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator)
 pub fn install(sh: *Shell) void {
     sh.subst_runner = substitutionRunner;
     sh.trap_runner = runSource;
+    procsub.run_source = runSource;
 }
 
 // --- tests ------------------------------------------------------------------

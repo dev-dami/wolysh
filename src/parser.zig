@@ -79,22 +79,27 @@ fn isCaseTerminator(tag: lexer.Tag) bool {
     return tag == .dsemi or tag == .semi_amp or tag == .dsemi_amp;
 }
 
-/// A descriptor number small enough to track, e.g. `3` in `3>file`.
-fn parseSmallFd(text: []const u8) ?i32 {
-    if (text.len == 0) return null;
+/// A descriptor number such as `3` in `3>file` or `10` in `10>file`.
+fn parseFdNumber(text: []const u8) ?i32 {
+    if (text.len == 0 or text.len > 9) return null;
     var value: i32 = 0;
     for (text) |c| {
         if (c < '0' or c > '9') return null;
         value = value * 10 + (c - '0');
     }
-    if (value > 31) return null;
     return value;
 }
 
-/// The descriptor written after `>&`/`<&`: a small number, or `-` to close.
-fn isDupTarget(text: []const u8) bool {
-    if (text.len == 1 and text[0] == '-') return true;
-    return parseSmallFd(text) != null;
+/// What may precede a redirect operator: a number, or `{name}` asking the
+/// shell to allocate a descriptor and store it in `name`.
+const RedirectFd = struct { fd: i32 = -1, name: []const u8 = "" };
+
+fn redirectFdWord(text: []const u8) ?RedirectFd {
+    if (text.len > 2 and text[0] == '{' and text[text.len - 1] == '}') {
+        const name = text[1 .. text.len - 1];
+        return if (isIdentifier(name)) .{ .name = name } else null;
+    }
+    return .{ .fd = parseFdNumber(text) orelse return null };
 }
 
 /// Splits `NAME=value` when NAME is a plain identifier. A quoted or otherwise
@@ -926,7 +931,7 @@ pub const Parser = struct {
         }
         var cmds: std.ArrayList(ast.Command) = .empty;
         try cmds.append(self.arena, try self.parseCommand());
-        while (self.tok.tag == .pipe) {
+        while (self.tok.tag == .pipe or self.tok.tag == .pipe_amp) {
             self.advance();
             while (self.tok.tag == .newline) self.advance();
             try cmds.append(self.arena, try self.parseCommand());
@@ -952,18 +957,17 @@ pub const Parser = struct {
         };
     }
 
-    /// The descriptor written directly before a redirect operator, when the
-    /// last command word is a small number. Removes that word from `words`.
-    /// After a group, subshell or compound command the descriptor word was
-    /// never added to `words`, so there is nothing to remove.
-    fn takeRedirectFd(self: *Parser, last_word: ?lexer.Token, words: *std.ArrayList(ast.Word), after_body: bool) ?i32 {
+    /// The descriptor written directly before a redirect operator (`10>`,
+    /// `{fd}>`). Removes that word from `words`; after a group, subshell or
+    /// compound command it was never added there.
+    fn takeRedirectFd(self: *Parser, last_word: ?lexer.Token, words: *std.ArrayList(ast.Word)) ?RedirectFd {
         const word = last_word orelse return null;
-        if (word.text.len == 0 or word.text.len > 2) return null;
-        if (!after_body and words.items.len == 0) return null;
         if (word.start + word.text.len != self.tok.start) return null;
-        const fd = parseSmallFd(word.text) orelse return null;
-        if (!after_body) words.items.len -= 1;
-        return fd;
+        const spec = redirectFdWord(word.text) orelse return null;
+        if (words.items.len > 0 and words.items[words.items.len - 1].ptr == word.text.ptr) {
+            words.items.len -= 1;
+        }
+        return spec;
     }
 
     fn parseCommand(self: *Parser) Error!ast.Command {
@@ -988,9 +992,7 @@ pub const Parser = struct {
                         // other word that may appear is a redirect's explicit
                         // descriptor number, as in `{ ...; } 2>file`.
                         const text = self.tok.text;
-                        if (last_word == null and
-                            text.len > 0 and text.len <= 2 and parseSmallFd(text) != null)
-                        {
+                        if (last_word == null and redirectFdWord(text) != null) {
                             last_word = self.tok;
                             self.advance();
                             continue;
@@ -1041,30 +1043,39 @@ pub const Parser = struct {
                     group = try stmts.toOwnedSlice(self.arena);
                     last_word = null;
                 },
-                .out, .out_append, .in => {
+                .out, .out_append, .in, .out_clobber, .in_out => {
                     const base: ast.RedirectKind = switch (self.tok.tag) {
                         .out => .out,
                         .out_append => .out_append,
+                        .out_clobber => .clobber,
+                        .in_out => .read_write,
                         else => .in,
                     };
-                    const explicit = self.takeRedirectFd(last_word, &words, after_body);
-                    if (after_body and last_word != null and explicit == null) {
+                    const spec = self.takeRedirectFd(last_word, &words);
+                    if (after_body and last_word != null and spec == null) {
                         return self.fail("expected a redirect after the descriptor");
                     }
+                    const fd_var: []const u8 = if (spec) |s| s.name else "";
+                    const explicit: ?i32 = if (spec) |s| (if (s.name.len == 0) s.fd else null) else null;
                     last_word = null;
                     self.advance();
-                    if (self.tok.tag == .amp) {
+                    if (self.tok.tag == .amp and (base == .out or base == .in)) {
+                        // The target (`2`, `-`, `3-`, `$fd`) is checked once it
+                        // has been expanded.
                         self.advance();
-                        if (self.tok.tag != .word or !isDupTarget(self.tok.text)) {
-                            return self.fail("expected a file descriptor after '&'");
-                        }
+                        if (self.tok.tag != .word) return self.fail("expected a file descriptor after '&'");
                         const target_fd = explicit orelse base.fd();
                         const kind: ast.RedirectKind = switch (target_fd) {
                             0 => .in_dup,
                             2 => .err_dup,
                             else => .out_dup,
                         };
-                        try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text, .fd = explicit orelse kind.fd() });
+                        try redirects.append(self.arena, .{
+                            .kind = kind,
+                            .target = self.tok.text,
+                            .fd = explicit orelse kind.fd(),
+                            .fd_var = fd_var,
+                        });
                         self.advance();
                         continue;
                     }
@@ -1075,12 +1086,11 @@ pub const Parser = struct {
                         2 => switch (base) {
                             .out => .err_out,
                             .out_append => .err_append,
-                            .in => .in,
                             else => base,
                         },
                         else => base,
                     } else base;
-                    try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text, .fd = explicit orelse -1 });
+                    try redirects.append(self.arena, .{ .kind = kind, .target = self.tok.text, .fd = explicit orelse -1, .fd_var = fd_var });
                     self.advance();
                     last_word = null;
                 },
@@ -1099,8 +1109,10 @@ pub const Parser = struct {
                     last_word = null;
                 },
                 .here_doc, .here_doc_strip => {
-                    if (after_body and last_word != null) return self.fail("expected a redirect after the descriptor");
                     const strip = self.tok.tag == .here_doc_strip;
+                    const taken = self.takeRedirectFd(last_word, &words);
+                    if (after_body and last_word != null and taken == null) return self.fail("expected a redirect after the descriptor");
+                    const spec = taken orelse RedirectFd{};
                     self.advance();
                     if (self.tok.tag != .word) return self.fail("expected a delimiter after '<<'");
                     const delimiter = parseHereDocDelimiter(self.arena, self.tok.text) catch return self.fail("invalid here-document delimiter");
@@ -1109,15 +1121,19 @@ pub const Parser = struct {
                         .target = delimiter.text,
                         .expand_body = delimiter.expand,
                         .strip_tabs = strip,
+                        .fd = spec.fd,
+                        .fd_var = spec.name,
                     });
                     self.advance();
                     last_word = null;
                 },
                 .here_string => {
-                    if (after_body and last_word != null) return self.fail("expected a redirect after the descriptor");
+                    const taken = self.takeRedirectFd(last_word, &words);
+                    if (after_body and last_word != null and taken == null) return self.fail("expected a redirect after the descriptor");
+                    const spec = taken orelse RedirectFd{};
                     self.advance();
                     if (self.tok.tag != .word) return self.fail("expected a word after '<<<'");
-                    try redirects.append(self.arena, .{ .kind = .here_string, .target = self.tok.text });
+                    try redirects.append(self.arena, .{ .kind = .here_string, .target = self.tok.text, .fd = spec.fd, .fd_var = spec.name });
                     self.advance();
                     last_word = null;
                 },
@@ -1133,6 +1149,8 @@ pub const Parser = struct {
         {
             return self.fail("expected a command");
         }
+        // `a |& b` is `a 2>&1 | b`.
+        if (self.tok.tag == .pipe_amp) try redirects.append(self.arena, .{ .kind = .err_dup, .target = "1", .fd = 2 });
         const command = ast.Command{
             .words = try words.toOwnedSlice(self.arena),
             .redirects = try redirects.toOwnedSlice(self.arena),
@@ -1780,6 +1798,44 @@ test "parse a numbered input redirect" {
     try std.testing.expectEqual(ast.RedirectKind.in, redirect.kind);
     try std.testing.expectEqual(@as(i32, 3), redirect.targetFd());
     try std.testing.expectEqual(@as(usize, 1), prog.stmts[0].pipeline.commands[0].words.len);
+}
+
+test "parse wide, named, clobbering and read-write redirects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "cmd 10>wide {fd}>named >|forced 3<>both 2>&$fd 7>&3- arg");
+    const prog = try p.parseProgram();
+    const command = prog.stmts[0].pipeline.commands[0];
+    try std.testing.expectEqual(@as(usize, 2), command.words.len);
+    try std.testing.expectEqualStrings("arg", command.words[1]);
+    const redirects = command.redirects;
+    try std.testing.expectEqual(@as(usize, 6), redirects.len);
+    try std.testing.expectEqual(@as(i32, 10), redirects[0].targetFd());
+    try std.testing.expectEqualStrings("fd", redirects[1].fd_var);
+    try std.testing.expectEqualStrings("named", redirects[1].target);
+    try std.testing.expectEqual(ast.RedirectKind.clobber, redirects[2].kind);
+    try std.testing.expectEqual(@as(i32, 1), redirects[2].targetFd());
+    try std.testing.expectEqual(ast.RedirectKind.read_write, redirects[3].kind);
+    try std.testing.expectEqual(@as(i32, 3), redirects[3].targetFd());
+    try std.testing.expectEqual(ast.RedirectKind.err_dup, redirects[4].kind);
+    try std.testing.expectEqualStrings("$fd", redirects[4].target);
+    try std.testing.expectEqual(@as(i32, 7), redirects[5].targetFd());
+    try std.testing.expectEqualStrings("3-", redirects[5].target);
+}
+
+test "parse |& and descriptors after a group" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(), "make |& tee log\n{ echo; } >out 2>err\n");
+    const prog = try p.parseProgram();
+    const piped = prog.stmts[0].pipeline;
+    try std.testing.expectEqual(@as(usize, 2), piped.commands.len);
+    try std.testing.expectEqual(ast.RedirectKind.err_dup, piped.commands[0].redirects[0].kind);
+    try std.testing.expectEqualStrings("1", piped.commands[0].redirects[0].target);
+    const group = prog.stmts[1].pipeline.commands[0];
+    try std.testing.expectEqual(@as(usize, 2), group.redirects.len);
+    try std.testing.expectEqual(@as(i32, 1), group.redirects[0].targetFd());
+    try std.testing.expectEqual(@as(i32, 2), group.redirects[1].targetFd());
 }
 
 test "parse tab-stripping here-documents" {
