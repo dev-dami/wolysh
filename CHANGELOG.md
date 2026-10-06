@@ -9,9 +9,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [0.5.0] - 2026-10-06
 
-Most of Bash's scripting language now works in wsh. Each area below is
-compared against Bash 5.3 in the test suite; `docs/language.md` lists the known
-differences.
+Most of Bash's scripting language now works in wsh. The scripting features
+below are compared against Bash 5.3 in the test suite; `docs/language.md` lists
+the known differences.
 
 ### Added
 
