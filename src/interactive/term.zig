@@ -45,8 +45,20 @@ pub fn takeResize() bool {
 
 pub const ReadResult = union(enum) { byte: u8, eof, interrupted };
 
-/// Reads one byte, reporting EINTR instead of retrying it.
+/// Reads one byte, reporting EINTR instead of retrying it. SIGHUP and SIGWINCH
+/// stay blocked until `ppoll` unblocks them atomically, so one that arrived
+/// while the prompt was drawn interrupts the wait instead of being missed.
 pub fn readByteInterruptible(fd: i32) ReadResult {
+    var watched = linux.sigemptyset();
+    linux.sigaddset(&watched, .HUP);
+    linux.sigaddset(&watched, .WINCH);
+    var previous: linux.sigset_t = undefined;
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &watched, &previous);
+    defer _ = linux.sigprocmask(linux.SIG.SETMASK, &previous, null);
+    if (proc.hangupPending() or resized.load(.monotonic)) return .interrupted;
+    var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    if (linux.errno(linux.ppoll(&fds, fds.len, null, &previous)) == .INTR) return .interrupted;
+
     var b: [1]u8 = undefined;
     const rc = linux.read(fd, &b, 1);
     return switch (linux.errno(rc)) {

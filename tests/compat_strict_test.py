@@ -551,6 +551,19 @@ class InteractiveExitTests(unittest.TestCase):
             self.assertEqual(os.WEXITSTATUS(session.status), 129)
             self.assertEqual(marker.read_text(), "bye\n")
 
+    def test_hangup_while_the_prompt_is_drawn_still_exits(self):
+        session = Session()
+        self.addCleanup(session.close)
+        self.assertTrue(session.read_until(PROMPT), session.buf[-200:])
+        # The next prompt takes half a second to draw, so the hangup arrives
+        # before the shell starts waiting for a key.
+        session.send("PS1='$(sleep 0.5)slow> '; echo armed-$((40 + 2))\r")
+        self.assertTrue(session.read_until(b"armed-42"), session.buf[-300:])
+        os.kill(session.pid, signal.SIGHUP)
+        self.assertTrue(session.exited(), session.buf[-300:])
+        self.assertTrue(os.WIFEXITED(session.status))
+        self.assertEqual(os.WEXITSTATUS(session.status), 129)
+
     def test_interactive_exit_runs_the_exit_trap(self):
         session = Session()
         self.addCleanup(session.close)
