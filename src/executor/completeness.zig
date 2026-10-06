@@ -5,6 +5,104 @@ const lexer = @import("../lexer.zig");
 /// leading tabs to be stripped.
 const Delimiter = struct { raw: []const u8, strip: bool };
 
+/// Reserved-word bookkeeping. A header (`if`, `while`, `function`, ...) is
+/// open until its body starts: `then`/`do` open a POSIX block that `fi`,
+/// `done` or `esac` close, while a `{` after a word starts a native body,
+/// which the brace count tracks.
+const Blocks = struct {
+    const Header = enum { if_, elif, loop, function };
+
+    headers: [64]Header = undefined,
+    header_count: usize = 0,
+    /// Open `then`/`do`/`case` blocks.
+    depth: i32 = 0,
+    /// The next word starts a command, so a reserved word is recognised.
+    command_start: bool = true,
+    /// Also inside a `case`, where `pattern)` is followed by a command.
+    case_depth: i32 = 0,
+    /// The input ends right after `name()`, whose body has not started.
+    open_definition: bool = false,
+
+    fn push(self: *Blocks, header: Header) void {
+        if (self.header_count < self.headers.len) {
+            self.headers[self.header_count] = header;
+            self.header_count += 1;
+        }
+    }
+
+    fn top(self: *const Blocks) ?Header {
+        return if (self.header_count == 0) null else self.headers[self.header_count - 1];
+    }
+
+    fn see(self: *Blocks, tok: lexer.Token) void {
+        const at_start = self.command_start;
+        self.open_definition = false;
+        switch (tok.tag) {
+            .word => {
+                self.command_start = false;
+                if (!at_start) {
+                    if (self.case_depth > 0 and tok.text.len > 1 and tok.text[tok.text.len - 1] == ')') self.command_start = true;
+                    return;
+                }
+                const text = tok.text;
+                if (eql(text, "if")) {
+                    self.push(.if_);
+                } else if (eql(text, "elif")) {
+                    self.push(.elif);
+                } else if (eql(text, "while") or eql(text, "until") or eql(text, "for") or eql(text, "select")) {
+                    self.push(.loop);
+                } else if (eql(text, "function")) {
+                    self.push(.function);
+                } else if (eql(text, "then")) {
+                    if (self.top()) |header| {
+                        if (header == .if_ or header == .elif) self.header_count -= 1;
+                        if (header == .if_) self.depth += 1;
+                    }
+                } else if (eql(text, "do")) {
+                    if (self.top() == .loop) {
+                        self.header_count -= 1;
+                        self.depth += 1;
+                    }
+                } else if (eql(text, "case")) {
+                    self.depth += 1;
+                    self.case_depth += 1;
+                } else if (eql(text, "esac")) {
+                    self.depth -= 1;
+                    self.case_depth -= 1;
+                } else if (eql(text, "fi") or eql(text, "done")) {
+                    self.depth -= 1;
+                } else if (std.mem.endsWith(u8, text, "()")) {
+                    self.open_definition = true;
+                }
+                // These keep the next word in command position.
+                self.command_start = eql(text, "if") or eql(text, "elif") or eql(text, "then") or
+                    eql(text, "else") or eql(text, "while") or eql(text, "until") or eql(text, "do") or
+                    eql(text, "!") or eql(text, "time");
+            },
+            .lbrace => {
+                // A `{` after a word opens a native body.
+                if (!at_start and self.top() != null) self.header_count -= 1;
+                self.command_start = true;
+            },
+            .lparen => {
+                if (self.top() == .function) self.header_count -= 1;
+                self.command_start = true;
+            },
+            .rparen => self.command_start = self.case_depth > 0,
+            .newline, .semi, .dsemi, .semi_amp, .dsemi_amp, .pipe, .pipepipe, .amp, .ampamp, .rbrace => self.command_start = true,
+            else => self.command_start = false,
+        }
+    }
+
+    fn open(self: *const Blocks) bool {
+        return self.depth > 0 or self.header_count > 0 or self.open_definition;
+    }
+};
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
 pub fn isComplete(src: []const u8) bool {
     if (!quotesBalanced(src)) return false;
 
@@ -12,12 +110,15 @@ pub fn isComplete(src: []const u8) bool {
     var braces: i32 = 0;
     var parens: i32 = 0;
     var brackets: i32 = 0;
+    // Open `[[ ... ]]` tests, whose `]]` may come on a later line.
+    var conds: i32 = 0;
     var last: lexer.Tag = .eof;
     var last_text: []const u8 = "";
     var heredoc_delimiters: [64]Delimiter = undefined;
     var heredoc_count: usize = 0;
     var needs_heredoc_delimiter = false;
     var heredoc_strip = false;
+    var blocks = Blocks{};
 
     while (true) {
         const tok = lx.next();
@@ -25,6 +126,11 @@ pub fn isComplete(src: []const u8) bool {
             if (heredoc_count != 0 or needs_heredoc_delimiter) return false;
             break;
         }
+        if (tok.tag == .word) {
+            if (blocks.command_start and eql(tok.text, "[[")) conds += 1;
+            if (conds > 0 and eql(tok.text, "]]")) conds -= 1;
+        }
+        blocks.see(tok);
         if (needs_heredoc_delimiter) {
             if (tok.tag != .word or heredoc_count == heredoc_delimiters.len) return false;
             heredoc_delimiters[heredoc_count] = .{ .raw = tok.text, .strip = heredoc_strip };
@@ -54,7 +160,8 @@ pub fn isComplete(src: []const u8) bool {
         }
     }
 
-    if (braces > 0 or parens > 0 or brackets > 0) return false;
+    if (braces > 0 or parens > 0 or brackets > 0 or conds > 0) return false;
+    if (blocks.open()) return false;
     if (expectsMore(last)) return false;
     if (last == .word and wordExpectsMore(last_text)) return false;
 
@@ -71,8 +178,8 @@ fn wordExpectsMore(text: []const u8) bool {
 
 fn expectsMore(tag: lexer.Tag) bool {
     return switch (tag) {
-        .pipe, .pipepipe, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .here_doc_strip, .here_string => true,
-        .out, .out_append, .out_both, .out_both_append => true,
+        .pipe, .pipepipe, .pipe_amp, .ampamp, .lbrace, .lparen, .lbracket, .in, .here_doc, .here_doc_strip, .here_string => true,
+        .out, .out_append, .out_both, .out_both_append, .out_clobber, .in_out => true,
         .assign, .plus_assign, .minus_assign => true,
         .plus, .minus, .star, .slash, .percent => true,
         .eq, .ne, .lt, .le, .gt, .ge => true,
@@ -85,6 +192,7 @@ fn quotesBalanced(src: []const u8) bool {
     var i: usize = 0;
     var in_single = false;
     var in_double = false;
+    var in_backtick = false;
     var line_start: usize = 0;
     var heredoc_delimiters: [64]Delimiter = undefined;
     var heredoc_count: usize = 0;
@@ -98,6 +206,16 @@ fn quotesBalanced(src: []const u8) bool {
         }
         if (c == '\\' and !in_single and i + 1 < src.len) {
             i += 2;
+            continue;
+        }
+        if (c == '$' and !in_single and !in_double and i + 1 < src.len and src[i + 1] == '\'') {
+            // `$'...'`: a backslash escapes the closing quote.
+            i += 2;
+            while (i < src.len and src[i] != '\'') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            if (i >= src.len) return false;
+            i += 1;
             continue;
         }
         if (c == '<' and !in_single and !in_double and i + 1 < src.len and src[i + 1] == '<') {
@@ -117,6 +235,8 @@ fn quotesBalanced(src: []const u8) bool {
             in_single = !in_single;
         } else if (c == '"' and !in_single) {
             in_double = !in_double;
+        } else if (c == '`' and !in_single) {
+            in_backtick = !in_backtick;
         } else if (c == '\n') {
             if (heredoc_count > 0 and !continuedLine(src[line_start..i])) {
                 const skipped = skipHereDocBodies(src, i + 1, heredoc_delimiters[0..heredoc_count]) orelse return false;
@@ -125,13 +245,14 @@ fn quotesBalanced(src: []const u8) bool {
                 line_start = i;
                 in_single = false;
                 in_double = false;
+                in_backtick = false;
                 continue;
             }
             line_start = i + 1;
         }
         i += 1;
     }
-    return !in_single and !in_double and heredoc_count == 0;
+    return !in_single and !in_double and !in_backtick and heredoc_count == 0;
 }
 
 const RawDelimiter = struct { raw: []const u8, end: usize, strip: bool };
@@ -244,7 +365,7 @@ fn continuedLine(line: []const u8) bool {
     }
     const token = last orelse return false;
     switch (token.tag) {
-        .pipe, .pipepipe, .ampamp => return true,
+        .pipe, .pipepipe, .pipe_amp, .ampamp => return true,
         else => {},
     }
 

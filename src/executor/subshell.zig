@@ -5,6 +5,7 @@ const proc = @import("../proc.zig");
 const shellmod = @import("../shell.zig");
 
 const assign = @import("assign.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 
@@ -29,8 +30,9 @@ fn child(ctx_ptr: *anyopaque) noreturn {
     sh.return_pending = false;
     sh.break_pending = false;
     sh.continue_pending = false;
+    strict.enterSubshell(sh);
     payload.scope.apply() catch linux.exit(1);
-    linux.exit(payload.run_statements(sh, payload.statements));
+    strict.exitChild(sh, payload.run_statements(sh, payload.statements));
 }
 
 pub fn makeStage(

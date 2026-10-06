@@ -8,8 +8,12 @@ const sys = @import("../sys.zig");
 const command = @import("command.zig");
 const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
+const procsub = @import("procsub.zig");
 const subshell = @import("subshell.zig");
 const assign = @import("assign.zig");
+const timing = @import("timing.zig");
+const session = @import("../interactive/session.zig");
+const strict = @import("../strict.zig");
 
 const Shell = shellmod.Shell;
 
@@ -19,6 +23,8 @@ pub const ErrorHandler = *const fn (*Shell, anyerror) u8;
 pub const Runtime = struct {
     command: command.Runtime,
     run_statements: subshell.RunStatements,
+    /// Runs an `if`, loop, `case` or `select` in the current shell.
+    run_compound: *const fn (*Shell, *const ast.Compound) u8,
     expression_error: ErrorHandler,
 };
 
@@ -46,24 +52,60 @@ fn childExecute(ctx_ptr: *anyopaque) noreturn {
     sh.job_control = false;
     sh.tty_fd = -1;
     sh.should_exit = false;
+    strict.enterSubshell(sh);
     payload.scope.apply() catch linux.exit(1);
-    linux.exit(command.dispatch(sh, payload.argv, payload.command_runtime));
+    strict.exitChild(sh, command.dispatch(sh, payload.argv, payload.command_runtime));
 }
 
 pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
-    var status = runPipeline(sh, chain.commands, chain.background, runtime);
-    if (chain.negate) status = invert(status);
-    for (chain.links) |link| {
+    var status = runLink(sh, chain, chain.links.len != 0, runtime);
+    for (chain.links, 0..) |link, index| {
+        if (sh.interrupted) break;
+        // `cd dir && make`: chpwd runs before `make`, as it would in zsh.
+        session.checkDirectory(sh);
         const should_run = switch (link.op) {
             .and_ => status == 0,
             .or_ => status != 0,
         };
-        if (should_run) {
-            status = runPipeline(sh, link.pipeline.commands, link.pipeline.background, runtime);
-            if (link.pipeline.negate) status = invert(status);
-        }
+        if (should_run) status = runLink(sh, link.pipeline, index + 1 < chain.links.len, runtime);
     }
     return status;
+}
+
+/// One pipeline of an `&&`/`||` list, recording its line and honouring
+/// `time`. Every part but the last, and any `!` pipeline, is a condition: its
+/// failure does not trip `set -e` or ERR.
+fn runLink(sh: *Shell, link: ast.Pipeline, more_follow: bool, runtime: Runtime) u8 {
+    if (link.line != 0) sh.current_line = link.line;
+    const condition = more_follow or link.negate;
+    if (condition) sh.condition_depth += 1;
+    defer if (condition) {
+        sh.condition_depth -= 1;
+    };
+    const start = if (link.time != .none) timing.Snapshot.take() else null;
+    const status = runPipeline(sh, link.commands, link.background, runtime);
+    if (start) |snapshot| timing.report(sh, snapshot, link.time == .posix);
+    return if (link.negate) invert(status) else status;
+}
+
+/// A simple command, `(( ))` or `[[ ]]`: what the DEBUG trap runs before.
+fn runsAsCommand(cmd: ast.Command) bool {
+    if (cmd.subshell != null or cmd.group != null) return false;
+    const compound = cmd.compound orelse return true;
+    return compound.kind.isTest();
+}
+
+/// The statements a forked stage runs for a subshell, group or compound
+/// command, or null for a simple command.
+fn stageBody(arena: std.mem.Allocator, cmd: ast.Command) Error!?[]ast.Stmt {
+    if (cmd.subshell orelse cmd.group) |statements| return statements;
+    const compound = cmd.compound orelse return null;
+    // Redirections were already applied to the stage itself.
+    const commands = try arena.alloc(ast.Command, 1);
+    commands[0] = .{ .words = &.{}, .redirects = &.{}, .compound = compound };
+    const statements = try arena.alloc(ast.Stmt, 1);
+    statements[0] = .{ .pipeline = .{ .commands = commands } };
+    return statements;
 }
 
 /// `! pipeline`: success and failure trade places, so a signal-killed pipeline
@@ -72,21 +114,65 @@ fn invert(status: u8) u8 {
     return if (status == 0) 1 else 0;
 }
 
+/// What `runStages` learned besides the status.
+const Outcome = struct {
+    /// Each stage's status for a multi-command pipeline.
+    statuses: []const u8 = &.{},
+    /// The command ran as a `{ ...; }` group, loop, `if` or `case` in this
+    /// shell (an alias with operators does too).
+    grouped: bool = false,
+};
+
 fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runtime: Runtime) u8 {
+    var outcome: Outcome = .{};
+    const status = runStages(sh, commands, background, runtime, &outcome);
+    // A group's or loop's own status is not a command failure: the commands
+    // inside it were checked as they ran.
+    if (background or outcome.grouped) return status;
+    strict.setPipeStatus(sh, if (outcome.statuses.len != 0) outcome.statuses else &.{status});
+    strict.commandDone(sh, status);
+    return status;
+}
+
+fn runStages(
+    sh: *Shell,
+    commands: []const ast.Command,
+    background: bool,
+    runtime: Runtime,
+    outcome: *Outcome,
+) u8 {
     const arena = sh.scratch();
     if (commands.len == 0) return 0;
 
     var opened: std.ArrayList(i32) = .empty;
     defer for (opened.items) |fd| sys.closeFd(fd);
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
 
-    if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime);
+    if (commands.len == 1) return runSingle(sh, arena, commands[0], background, &opened, runtime, outcome);
 
+    // Alias names stay suppressed until every stage has forked, so a body that
+    // mentions its own alias does not expand it again in the child.
+    var alias_names: std.ArrayList([]const u8) = .empty;
     var stages: std.ArrayList(proc.Stage) = .empty;
-    for (commands) |cmd| {
+    for (commands) |original| {
+        var cmd = original;
+        var resolved: command.Resolved = .{ .words = cmd.words };
+        if (cmd.subshell == null and cmd.group == null and cmd.compound == null) {
+            resolved = command.resolveAliases(sh, arena, cmd.words) catch return 1;
+            if (resolved.body != null) {
+                cmd.group = (command.aliasStatements(sh, arena, resolved) catch |err| return runtime.expression_error(sh, err)) orelse return 2;
+                cmd.words = &.{};
+                alias_names.appendSlice(arena, resolved.names) catch return 1;
+            }
+        }
+        if (runsAsCommand(cmd)) strict.beforeCommand(sh);
+
         const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
         defer scope.restore();
 
-        if (cmd.subshell orelse cmd.group) |statements| {
+        const body = stageBody(arena, cmd) catch |err| return runtime.expression_error(sh, err);
+        if (body) |statements| {
             const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
             const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
                 return runtime.expression_error(sh, err);
@@ -98,13 +184,13 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
             expression.reportMisuse(sh, name);
             return 2;
         }
-        const words = command.resolveAliases(sh, arena, cmd.words) catch return 1;
         var argv: std.ArrayList([]const u8) = .empty;
-        expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
+        expand_mod.expandCommand(sh, arena, resolved.words, &argv) catch |err| return runtime.expression_error(sh, err);
         if (argv.items.len == 0) continue;
 
         const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
         const call_argv = argv.toOwnedSlice(arena) catch return 1;
+        strict.traceCommand(sh, call_argv);
         const stage = makeStage(sh, arena, call_argv, prepared.redirects, scope, runtime) catch |err| {
             return runtime.expression_error(sh, err);
         };
@@ -113,9 +199,13 @@ fn runPipeline(sh: *Shell, commands: []const ast.Command, background: bool, runt
 
     if (stages.items.len == 0) return 0;
 
+    const mark = command.suppressAliases(alias_names.items) catch return aliasTooDeep(sh);
+    defer command.restoreAliases(mark);
     const text = pipelineText(arena, commands) catch "pipeline";
     if (background) return startBackground(sh, arena, stages.items, text, runtime.expression_error);
-    return runForeground(sh, arena, stages.items, text, runtime.expression_error);
+    const statuses = arena.alloc(u8, stages.items.len) catch return runtime.expression_error(sh, error.OutOfMemory);
+    outcome.statuses = statuses;
+    return waitStages(sh, arena, stages.items, text, runtime.expression_error, statuses);
 }
 
 fn makeStage(
@@ -146,28 +236,53 @@ fn runSingle(
     background: bool,
     opened: *std.ArrayList(i32),
     runtime: Runtime,
+    outcome: *Outcome,
 ) u8 {
     if (expression.misuse(cmd.words)) |name| {
         expression.reportMisuse(sh, name);
         return 2;
     }
 
-    const words = command.resolveAliases(sh, arena, cmd.words) catch return 1;
+    const resolved = command.resolveAliases(sh, arena, cmd.words) catch return 1;
+    if (resolved.body != null) {
+        // An alias with operators runs like `{ body args; }` in this command's
+        // place, so its redirections and assignments cover the whole body.
+        var grouped = cmd;
+        grouped.group = (command.aliasStatements(sh, arena, resolved) catch |err| return runtime.expression_error(sh, err)) orelse return 2;
+        grouped.words = &.{};
+        const mark = command.suppressAliases(resolved.names) catch return aliasTooDeep(sh);
+        defer command.restoreAliases(mark);
+        return runSingle(sh, arena, grouped, background, opened, runtime, outcome);
+    }
+    if (runsAsCommand(cmd)) strict.beforeCommand(sh);
+
+    const substitutions = sh.substitutions;
     var argv: std.ArrayList([]const u8) = .empty;
-    expand_mod.expandCommand(sh, arena, words, &argv) catch |err| return runtime.expression_error(sh, err);
+    expand_mod.expandCommand(sh, arena, resolved.words, &argv) catch |err| return runtime.expression_error(sh, err);
+
+    // `exec`'s redirections change the shell's own descriptors for good.
+    if (!background and argv.items.len > 0 and std.mem.eql(u8, argv.items[0], "exec")) {
+        redirect.applyPersistent(sh, arena, cmd.redirects) catch |err| return runtime.expression_error(sh, err);
+        const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
+        defer scope.restore();
+        return command.dispatch(sh, argv.items, runtime.command);
+    }
 
     const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
-    if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null) {
+    if (argv.items.len == 0 and cmd.subshell == null and cmd.group == null and cmd.compound == null) {
         // `NAME=value` on its own outlives the command line.
         assign.persist(sh, arena, cmd.assigns) catch |err| return runtime.expression_error(sh, err);
-        return 0;
+        // POSIX: the status of the last command substitution performed, else 0.
+        return if (sh.substitutions != substitutions) sh.last_status else 0;
     }
 
     const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
     defer scope.restore();
 
-    if (cmd.group != null and !background) {
-        const statements = cmd.group.?;
+    if ((cmd.group != null or cmd.compound != null) and !background) {
+        outcome.grouped = if (cmd.compound) |compound| !compound.kind.isTest() else true;
+        const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
+        defer high.restore();
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
         sh.default_in = prepared.fds.in;
         sh.default_out = prepared.fds.out;
@@ -177,10 +292,12 @@ fn runSingle(
             sh.default_out = saved.out;
             sh.default_err = saved.err;
         }
-        return runtime.run_statements(sh, statements);
+        if (cmd.compound) |compound| return runtime.run_compound(sh, compound);
+        return runtime.run_statements(sh, cmd.group.?);
     }
 
-    if (cmd.subshell orelse cmd.group) |statements| {
+    const body = stageBody(arena, cmd) catch |err| return runtime.expression_error(sh, err);
+    if (body) |statements| {
         const stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
             return runtime.expression_error(sh, err);
         };
@@ -192,8 +309,11 @@ fn runSingle(
     const call_argv = argv.toOwnedSlice(arena) catch return 1;
     const name = call_argv[0];
     const text = pipelineText(arena, &.{cmd}) catch name;
+    strict.traceCommand(sh, call_argv);
 
     if (command.isInternal(sh, name) and !background) {
+        const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
+        defer high.restore();
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
         sh.default_in = prepared.fds.in;
         sh.default_out = prepared.fds.out;
@@ -219,7 +339,9 @@ pub fn launchStage(
     argv: []const []const u8,
     redirects: []const proc.Redirection,
 ) Error!proc.Stage {
-    const resolved = try proc.resolve(arena, argv[0], sh.pathEnv()) orelse {
+    // Paths and non-executable matches still go to `execve`, whose error the
+    // child reports by name ("Permission denied", "Is a directory", ...).
+    const resolved = try proc.locate(arena, argv[0], sh.pathEnv()) orelse {
         const payload = try arena.create(MissingCommandPayload);
         payload.* = .{ .message = try command.commandNotFoundMessage(sh, arena, argv[0]) };
         return .{
@@ -251,6 +373,11 @@ pub fn launchStage(
     };
 }
 
+fn aliasTooDeep(sh: *Shell) u8 {
+    sys.writeStr(sh.default_err, "wsh: alias expansion nested too deeply\n");
+    return 1;
+}
+
 fn startBackground(
     sh: *Shell,
     arena: std.mem.Allocator,
@@ -263,6 +390,8 @@ fn startBackground(
     sh.last_bg_pid = last_pid;
 
     const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, false) catch return 1;
+    // As in bash, only an interactive shell announces the job.
+    if (!sh.interactive) return 0;
     var buf: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job.id, last_pid }) catch return 0;
     sys.writeStr(sh.default_err, line);
@@ -276,9 +405,29 @@ pub fn runForeground(
     text: []const u8,
     expression_error: ErrorHandler,
 ) u8 {
-    const launched = proc.launch(arena, stages, .{ .new_group = sh.job_control }) catch |err| return expression_error(sh, err);
+    const statuses = arena.alloc(u8, stages.len) catch return expression_error(sh, error.OutOfMemory);
+    return waitStages(sh, arena, stages, text, expression_error, statuses);
+}
+
+/// Runs `stages` as a foreground job, recording each one's status in
+/// `statuses`. With `set -o pipefail` the result is the last non-zero status.
+fn waitStages(
+    sh: *Shell,
+    arena: std.mem.Allocator,
+    stages: []const proc.Stage,
+    text: []const u8,
+    expression_error: ErrorHandler,
+    statuses: []u8,
+) u8 {
+    const interrupted_before = strict.interruptPending();
+    const launched = proc.launch(arena, stages, .{ .new_group = sh.job_control }) catch |err| {
+        const status = expression_error(sh, err);
+        @memset(statuses, status);
+        return status;
+    };
+    @memset(statuses, 0);
     const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, true) catch return 1;
-    const outcome = sh.waitForeground(job);
+    const outcome = sh.waitForegroundStages(job, statuses);
 
     if (outcome.stopped) {
         job.state = .stopped;
@@ -292,7 +441,13 @@ pub fn runForeground(
 
     if (sh.jobs.indexOf(job)) |index| sh.jobs.removeAt(sh.gpa, index);
     if (outcome.signal) |signal| reportSignal(sh, signal);
-    return outcome.status;
+    strict.foregroundDone(outcome.signal, interrupted_before);
+    if (!sh.options.pipefail) return outcome.status;
+    var status: u8 = 0;
+    for (statuses) |stage_status| {
+        if (stage_status != 0) status = stage_status;
+    }
+    return status;
 }
 
 fn reportSignal(sh: *Shell, signal: u32) void {
@@ -319,6 +474,7 @@ fn pipelineText(arena: std.mem.Allocator, commands: []const ast.Command) ![]cons
         }
         if (cmd.subshell != null) try out.appendSlice(arena, "(subshell)");
         if (cmd.group != null) try out.appendSlice(arena, "{group}");
+        if (cmd.compound) |compound| try out.appendSlice(arena, compound.text);
         for (cmd.assigns) |assignment| {
             try out.appendSlice(arena, assignment.name);
             try out.append(arena, '=');
@@ -336,6 +492,8 @@ fn pipelineText(arena: std.mem.Allocator, commands: []const ast.Command) ![]cons
                 .out_dup => " >&",
                 .err_dup => " 2>&",
                 .in_dup => " <&",
+                .clobber => " >| ",
+                .read_write => " <> ",
                 else => " > ",
             };
             try out.appendSlice(arena, operator);

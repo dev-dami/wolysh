@@ -7,15 +7,21 @@ const ast = @import("ast.zig");
 const parser_mod = @import("parser.zig");
 const shellmod = @import("shell.zig");
 const expand_mod = @import("expand.zig");
+const arith = @import("arith.zig");
 const proc = @import("proc.zig");
 const value = @import("value.zig");
 const fs = @import("fs.zig");
+const glob = @import("glob.zig");
 const completeness = @import("executor/completeness.zig");
 const substitution = @import("executor/substitution.zig");
 const command = @import("executor/command.zig");
 const expression = @import("executor/expression.zig");
 const function = @import("executor/function.zig");
 const pipeline = @import("executor/pipeline.zig");
+const session = @import("interactive/session.zig");
+const strict = @import("strict.zig");
+const procsub = @import("executor/procsub.zig");
+const conditional = @import("executor/conditional.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -31,8 +37,13 @@ var continue_level: u32 = 0;
 
 /// Parses and runs `src`, returning the resulting status.
 pub fn runSource(sh: *Shell, src: []const u8) u8 {
+    return runSourceAt(sh, src, 1);
+}
+
+/// `runSource` with `$LINENO` counting from `line`.
+fn runSourceAt(sh: *Shell, src: []const u8, line: u32) u8 {
     const arena = sh.scratch();
-    var p = parser_mod.Parser.init(arena, src);
+    var p = parser_mod.Parser.initAt(arena, src, line);
     const program = p.parseProgram() catch {
         reportSyntaxError(sh, &p);
         sh.last_status = 2;
@@ -83,12 +94,23 @@ pub const isComplete = completeness.isComplete;
 pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     var status: u8 = 0;
     for (stmts) |stmt| {
+        if (sh.interrupted) return 130;
         sh.runPendingTraps();
         status = runStmt(sh, stmt);
         sh.last_status = status;
-        if (sh.should_exit or sh.return_pending or sh.break_pending or sh.continue_pending) break;
+        session.checkDirectory(sh);
+        if (stopRequested(sh) or sh.break_pending or sh.continue_pending) break;
     }
     return status;
+}
+
+/// `exit`, `return` or Ctrl-C: the enclosing lists and loops unwind.
+fn stopRequested(sh: *const Shell) bool {
+    return sh.should_exit or sh.return_pending or sh.interrupted;
+}
+
+fn setLine(sh: *Shell, line: u32) void {
+    if (line != 0) sh.current_line = line;
 }
 
 fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
@@ -97,16 +119,18 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
         .pipeline => |chain| return runChain(sh, chain),
 
         .var_decl => |decl| {
-            const v = evalExpr(sh, arena, decl.value) catch |err| return exprError(sh, err);
+            setLine(sh, decl.line);
+            const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, exprError(sh, err));
             sh.assignVar(decl.name, v) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
         .env_assign => |assign| {
-            const v = evalExpr(sh, arena, assign.value) catch |err| return exprError(sh, err);
+            setLine(sh, assign.line);
+            const v = evalExpr(sh, arena, assign.value) catch |err| return statementFailed(sh, exprError(sh, err));
             const text = v.renderAlloc(arena) catch return 1;
             const final = switch (assign.op) {
                 .set => text,
@@ -117,23 +141,15 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
             };
             sh.assignEnv(assign.name, final) catch |err| {
                 if (err == error.ReadonlyVariable) reportReadonly(sh, assign.name);
-                return 1;
+                return statementFailed(sh, 1);
             };
             return 0;
         },
 
-        .if_ => |branch| {
-            const cond = evalExpr(sh, arena, branch.cond) catch |err| return exprError(sh, err);
-            if (cond.truthy()) return runStmts(sh, branch.then.stmts);
-            if (branch.else_) |else_block| return runStmts(sh, else_block.stmts);
-            return 0;
-        },
-
-        .for_ => |loop| return runFor(sh, loop),
-        .while_ => |loop| return runWhile(sh, loop),
-
         .fn_decl => |decl| {
+            setLine(sh, decl.line);
             sh.defineFunc(decl.name, decl.source) catch return 1;
+            sh.setFuncLine(decl.name, decl.line) catch return 1;
             return 0;
         },
 
@@ -167,6 +183,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
     }
 }
 
+/// A failed `let` or `env` statement counts as a failed command for `set -e`
+/// and the ERR trap.
+fn statementFailed(sh: *Shell, status: u8) u8 {
+    strict.commandDone(sh, status);
+    return status;
+}
+
 fn exprError(sh: *Shell, err: anyerror) u8 {
     switch (err) {
         error.CommandNotFound => return 127,
@@ -174,13 +197,13 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             sys.writeStr(sh.default_err, "wsh: out of memory\n");
             return 1;
         },
-        error.InvalidArithmetic => {
-            sys.writeStr(sh.default_err, "wsh: arithmetic syntax error\n");
-            return 2;
-        },
-        error.DivisionByZero => {
-            sys.writeStr(sh.default_err, "wsh: division by zero\n");
-            return 2;
+        error.InvalidArithmetic, error.DivisionByZero => {
+            const detail = arith.takeErrorMessage() orelse
+                if (err == error.DivisionByZero) "division by zero" else "arithmetic syntax error";
+            var buf: [1100]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{detail}) catch "wsh: arithmetic error\n";
+            sys.writeStr(sh.default_err, msg);
+            return 1;
         },
         error.UnterminatedSubstitution => {
             sys.writeStr(sh.default_err, "wsh: unterminated substitution\n");
@@ -191,8 +214,13 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             return 1;
         },
         error.ExecutionFailed => return 1,
+        error.BadSubstitution, error.UnboundVariable => return expansionFailed(sh),
         error.ReadonlyVariable => {
             sys.writeStr(sh.default_err, "wsh: readonly variable\n");
+            return 1;
+        },
+        error.BraceExpansionTooLarge => {
+            sys.writeStr(sh.default_err, "wsh: brace expansion: too many words\n");
             return 1;
         },
         else => {
@@ -202,6 +230,16 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             return 2;
         },
     }
+}
+
+/// A failed `${...}` (its message already printed) aborts the command, and a
+/// non-interactive shell exits with status 1, as a bash script does.
+fn expansionFailed(sh: *Shell) u8 {
+    if (!sh.interactive) {
+        sh.should_exit = true;
+        sh.exit_code = 1;
+    }
+    return 1;
 }
 
 fn reportReadonly(sh: *Shell, name: []const u8) void {
@@ -259,71 +297,335 @@ fn takeContinue(sh: *Shell) LoopControl {
     return .here;
 }
 
-fn runFor(sh: *Shell, loop: ast.For) u8 {
-    const outer = sh.scratch();
-    // Items are expanded in the enclosing arena so they survive the per
-    // iteration resets below.
-    var items: std.ArrayList([]const u8) = .empty;
-    for (loop.items) |word| {
-        expand_mod.expandWord(sh, outer, word, &items) catch |err| return exprError(sh, err);
+/// What a loop does after its body ran once.
+const AfterBody = enum { next, stop, leave };
+
+/// Applies a pending `break`/`continue` and the stop conditions. `.leave`
+/// means a count reaches an outer loop, which must stop too.
+fn afterBody(sh: *Shell) AfterBody {
+    const brk = takeBreak(sh);
+    if (brk == .here) return .stop;
+    if (brk == .outer) return .leave;
+    const next = takeContinue(sh);
+    if (next == .here) return .next;
+    if (next == .outer) return .leave;
+    if (stopRequested(sh)) return .stop;
+    return .next;
+}
+
+/// A per-iteration arena installed as the shell's scratch allocator while a
+/// loop runs, so long loops do not grow the line arena.
+const LoopScope = struct {
+    arena: std.heap.ArenaAllocator,
+    saved: ?std.mem.Allocator,
+
+    fn enter(sh: *Shell) LoopScope {
+        loop_depth += 1;
+        return .{ .arena = std.heap.ArenaAllocator.init(sh.gpa), .saved = sh.scratch_override };
     }
 
-    var iter_arena = std.heap.ArenaAllocator.init(sh.gpa);
-    defer iter_arena.deinit();
-    const saved = sh.scratch_override;
-    sh.scratch_override = iter_arena.allocator();
-    defer {
-        sh.scratch_override = saved;
+    fn install(self: *LoopScope, sh: *Shell) void {
+        sh.scratch_override = self.arena.allocator();
+    }
+
+    fn nextIteration(self: *LoopScope) void {
+        _ = self.arena.reset(.retain_capacity);
+    }
+
+    fn leave(self: *LoopScope, sh: *Shell) void {
+        sh.scratch_override = self.saved;
+        self.arena.deinit();
         loop_depth -= 1;
     }
-    loop_depth += 1;
+};
+
+/// Expands a `for`/`select` word list in the enclosing arena, so the items
+/// survive the per-iteration resets.
+fn expandItems(sh: *Shell, words: []const ast.Word) Error![]const []const u8 {
+    const outer = sh.scratch();
+    var items: std.ArrayList([]const u8) = .empty;
+    for (words) |word| try expand_mod.expandWord(sh, outer, word, &items);
+    return items.items;
+}
+
+fn runFor(sh: *Shell, loop: ast.For) u8 {
+    // `for f in <(ls)` keeps the substitution open for the whole loop.
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
+    const items = expandItems(sh, loop.items) catch |err| return exprError(sh, err);
+    var scope = LoopScope.enter(sh);
+    defer scope.leave(sh);
+    scope.install(sh);
 
     var status: u8 = 0;
-    for (items.items) |item| {
-        _ = iter_arena.reset(.retain_capacity);
+    for (items) |item| {
+        if (sh.interrupted) break;
+        scope.nextIteration();
         sh.setVar(loop.name, .{ .string = item }) catch return 1;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
-        const brk = takeBreak(sh);
-        if (brk == .here) break;
-        if (brk == .outer) return status;
-        const next = takeContinue(sh);
-        if (next == .here) continue;
-        if (next == .outer) return status;
-        if (sh.should_exit or sh.return_pending) break;
+        switch (afterBody(sh)) {
+            .next => {},
+            .stop, .leave => break,
+        }
     }
     return status;
 }
 
 fn runWhile(sh: *Shell, loop: ast.While) u8 {
-    const outer = sh.scratch();
-
-    var iter_arena = std.heap.ArenaAllocator.init(sh.gpa);
-    defer iter_arena.deinit();
-    const saved = sh.scratch_override;
-    sh.scratch_override = iter_arena.allocator();
-    defer {
-        sh.scratch_override = saved;
-        loop_depth -= 1;
-    }
-    loop_depth += 1;
+    var scope = LoopScope.enter(sh);
+    defer scope.leave(sh);
+    scope.install(sh);
 
     var status: u8 = 0;
-    while (true) {
-        _ = iter_arena.reset(.retain_capacity);
-        const cond = evalExpr(sh, outer, loop.cond) catch |err| return exprError(sh, err);
-        if (!cond.truthy()) break;
+    while (!sh.interrupted) {
+        scope.nextIteration();
+        const passed = switch (testCondition(sh, loop.cond)) {
+            .failed => |code| return code,
+            .passed => |passed| passed,
+        };
+        if (afterBody(sh) != .next or passed == loop.until) break;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
-        const brk = takeBreak(sh);
-        if (brk == .here) break;
-        if (brk == .outer) return status;
-        const next = takeContinue(sh);
-        if (next == .here) continue;
-        if (next == .outer) return status;
-        if (sh.should_exit or sh.return_pending) break;
+        switch (afterBody(sh)) {
+            .next => {},
+            .stop, .leave => break,
+        }
     }
     return status;
+}
+
+fn runIf(sh: *Shell, branch: ast.If) u8 {
+    const passed = switch (testCondition(sh, branch.cond)) {
+        .failed => |code| return code,
+        .passed => |passed| passed,
+    };
+    if (stopRequested(sh) or sh.break_pending or sh.continue_pending) return sh.last_status;
+    if (passed) return runStmts(sh, branch.then.stmts);
+    if (branch.else_) |else_block| return runStmts(sh, else_block.stmts);
+    return 0;
+}
+
+const TestResult = union(enum) {
+    passed: bool,
+    /// The expression could not be evaluated; this is the status.
+    failed: u8,
+};
+
+/// Runs an `if`/`while`/`until` test where `set -e` does not apply.
+fn testCondition(sh: *Shell, cond: ast.Condition) TestResult {
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
+    if (cond.expr) |expr| {
+        if (cond.list == null or namesBound(sh, expr)) {
+            const result = evalExpr(sh, sh.scratch(), expr) catch |err| return .{ .failed = exprError(sh, err) };
+            return .{ .passed = result.truthy() };
+        }
+    }
+    return .{ .passed = runStmts(sh, cond.list orelse &.{}) == 0 };
+}
+
+/// For a condition that is only bare names (`if ! ready {`): true when every
+/// name is a variable, so it reads as an expression rather than commands.
+fn namesBound(sh: *Shell, expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .ident => |name| expression.isBound(sh, name),
+        .un => |unary| namesBound(sh, unary.operand),
+        .logic => |logic| namesBound(sh, logic.lhs) and namesBound(sh, logic.rhs),
+        else => true,
+    };
+}
+
+fn runCase(sh: *Shell, case: ast.Case) u8 {
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
+    const arena = sh.scratch();
+    const subject = expand_mod.expandLiteral(sh, arena, case.word) catch |err| return exprError(sh, err);
+    var status: u8 = 0;
+    // Set by `;&`: the next body runs without testing its patterns.
+    var fall_through = false;
+    for (case.items) |item| {
+        if (!fall_through) {
+            const matched = caseMatches(sh, arena, item.patterns, subject) catch |err| return exprError(sh, err);
+            if (!matched) continue;
+        }
+        status = runStmts(sh, item.body);
+        if (stopRequested(sh) or sh.break_pending or sh.continue_pending) return status;
+        switch (item.next) {
+            .stop => return status,
+            .fallthrough => fall_through = true,
+            .test_next => fall_through = false,
+        }
+    }
+    return status;
+}
+
+fn caseMatches(sh: *Shell, arena: std.mem.Allocator, patterns: []const ast.Word, subject: []const u8) Error!bool {
+    for (patterns) |word| {
+        const pattern = try expand_mod.expandPattern(sh, arena, word);
+        if (glob.matchSegmentWith(pattern, subject, .{ .nocase = sh.options.nocasematch })) return true;
+    }
+    return false;
+}
+
+/// `select NAME in WORDS`: prints a numbered menu on standard error, reads
+/// a choice from standard input into `REPLY` and runs the body with NAME set
+/// to the chosen word (empty for an invalid choice) until `break` or EOF.
+fn runSelect(sh: *Shell, loop: ast.For) u8 {
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
+    const items = expandItems(sh, loop.items) catch |err| return exprError(sh, err);
+    var scope = LoopScope.enter(sh);
+    defer scope.leave(sh);
+    scope.install(sh);
+
+    var status: u8 = 0;
+    var show_menu = true;
+    while (!sh.interrupted) {
+        scope.nextIteration();
+        const arena = sh.scratch();
+        if (show_menu) printMenu(sh, arena, items);
+        show_menu = false;
+        const prompt = if (sh.getVar("PS3")) |v| (v.renderAlloc(arena) catch "#? ") else sh.getEnv("PS3") orelse "#? ";
+        sys.writeStr(sh.default_err, prompt);
+
+        const line = readLine(sh, arena) orelse {
+            sys.writeStr(sh.default_err, "\n");
+            status = 1;
+            break;
+        };
+        // An empty answer shows the menu again.
+        if (line.len == 0) {
+            show_menu = true;
+            continue;
+        }
+        sh.setVar("REPLY", .{ .string = line }) catch return 1;
+        const trimmed = std.mem.trim(u8, line, " \t");
+        const choice = std.fmt.parseInt(usize, trimmed, 10) catch 0;
+        const picked = if (choice >= 1 and choice <= items.len) items[choice - 1] else "";
+        sh.setVar(loop.name, .{ .string = picked }) catch return 1;
+        status = runStmts(sh, loop.body.stmts);
+        sh.last_status = status;
+        switch (afterBody(sh)) {
+            .next => {},
+            .stop, .leave => break,
+        }
+    }
+    return status;
+}
+
+fn printMenu(sh: *Shell, arena: std.mem.Allocator, items: []const []const u8) void {
+    // Numbers are right-aligned to the widest one, like bash.
+    const width = digitCount(items.len);
+    var out: std.ArrayList(u8) = .empty;
+    for (items, 1..) |item, index| {
+        out.appendNTimes(arena, ' ', width - digitCount(index)) catch return;
+        out.print(arena, "{d}) {s}\n", .{ index, item }) catch return;
+    }
+    sys.writeStr(sh.default_err, out.items);
+}
+
+fn digitCount(n: usize) usize {
+    var count: usize = 1;
+    var rest = n;
+    while (rest >= 10) : (rest /= 10) count += 1;
+    return count;
+}
+
+/// One line from the shell's standard input without its newline, or null at
+/// end of input.
+fn readLine(sh: *Shell, arena: std.mem.Allocator) ?[]const u8 {
+    var line: std.ArrayList(u8) = .empty;
+    var got_any = false;
+    while (sys.readByte(sh.default_in)) |c| {
+        got_any = true;
+        if (c == '\n') return line.items;
+        line.append(arena, c) catch return null;
+    }
+    return if (got_any) line.items else null;
+}
+
+fn runCompound(sh: *Shell, compound: *const ast.Compound) u8 {
+    return switch (compound.kind) {
+        .if_ => |branch| runIf(sh, branch),
+        .for_ => |loop| runFor(sh, loop),
+        .while_ => |loop| runWhile(sh, loop),
+        .case_ => |case| runCase(sh, case),
+        .select_ => |loop| runSelect(sh, loop),
+        .statement => |stmt| runStmt(sh, stmt),
+        .cond => |cond| runCond(sh, cond),
+        .arith => |text| runArith(sh, text),
+        .arith_for => |loop| runArithFor(sh, loop),
+    };
+}
+
+fn runCond(sh: *Shell, cond: *const ast.Cond) u8 {
+    // `[[ -s <(cmd) ]]` keeps the substitution open while the test runs.
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
+    const passed = conditional.evaluate(sh, sh.scratch(), cond) catch |err| return switch (err) {
+        error.BadRegex => 2,
+        else => arithFailed(sh, "[[", err),
+    };
+    return if (passed) 0 else 1;
+}
+
+/// `(( expression ))`: 0 when the expression is non-zero.
+fn runArith(sh: *Shell, text: []const u8) u8 {
+    const n = arithmetic(sh, text) catch |err| return arithFailed(sh, "((", err);
+    return if (n != 0) 0 else 1;
+}
+
+fn runArithFor(sh: *Shell, loop: ast.ArithFor) u8 {
+    if (!isBlank(loop.init)) _ = arithmetic(sh, loop.init) catch |err| return arithFailed(sh, "((", err);
+    var scope = LoopScope.enter(sh);
+    defer scope.leave(sh);
+    scope.install(sh);
+
+    var status: u8 = 0;
+    while (!sh.interrupted) {
+        scope.nextIteration();
+        if (!isBlank(loop.cond)) {
+            const n = arithmetic(sh, loop.cond) catch |err| return arithFailed(sh, "((", err);
+            if (n == 0) break;
+        }
+        status = runStmts(sh, loop.body.stmts);
+        sh.last_status = status;
+        switch (afterBody(sh)) {
+            .next => {},
+            .stop, .leave => break,
+        }
+        if (!isBlank(loop.step)) _ = arithmetic(sh, loop.step) catch |err| return arithFailed(sh, "((", err);
+    }
+    return status;
+}
+
+fn isBlank(text: []const u8) bool {
+    return std.mem.trim(u8, text, " \t\r\n").len == 0;
+}
+
+/// Expands and evaluates the text of `(( ))` or one part of `for (( ))`,
+/// which `set -x` shows the way bash does.
+fn arithmetic(sh: *Shell, text: []const u8) arith.Error!i64 {
+    const arena = sh.scratch();
+    const expanded = try arith.expandText(sh, arena, text);
+    if (sh.options.xtrace) strict.traceText(sh, try std.fmt.allocPrint(arena, "(( {s} ))", .{expanded}));
+    return arith.evaluateExpanded(sh, arena, expanded);
+}
+
+/// A failed `((` or `[[` evaluation, worded like bash:
+/// `((: 1/0 : division by 0 (error token is "0 ")`.
+fn arithFailed(sh: *Shell, name: []const u8, err: anyerror) u8 {
+    switch (err) {
+        error.InvalidArithmetic, error.DivisionByZero => {
+            const detail = arith.takeErrorMessage() orelse "arithmetic syntax error";
+            var buf: [1100]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}: {s}\n", .{ name, detail }) catch "wsh: arithmetic error\n";
+            sys.writeStr(sh.default_err, msg);
+            return 1;
+        },
+        else => return exprError(sh, err),
+    }
 }
 
 // --- expression evaluation --------------------------------------------------
@@ -338,6 +640,10 @@ fn executeExpressionCall(sh: *Shell, arena: std.mem.Allocator, callee: []const u
     for (args, 0..) |arg, index| {
         argv[index + 1] = try (try evalExpr(sh, arena, arg)).renderAlloc(arena);
     }
+    // A call in an expression is a test whose result becomes a value, so a
+    // failure is not an error.
+    sh.condition_depth += 1;
+    defer sh.condition_depth -= 1;
 
     if (command.isInternal(sh, callee)) {
         return Value{ .boolean = command.dispatch(sh, argv, commandRuntime()) == 0 };
@@ -370,6 +676,7 @@ fn pipelineRuntime() pipeline.Runtime {
     return .{
         .command = commandRuntime(),
         .run_statements = runStmts,
+        .run_compound = runCompound,
         .expression_error = exprError,
     };
 }
@@ -382,6 +689,25 @@ fn runFunction(sh: *Shell, name: []const u8, source: []const u8, argv: []const [
     });
 }
 
+/// Calls the shell function `name` as an interactive hook. It runs apart from
+/// any loop the caller is in, so a stray `break` in it cannot leak out.
+/// Returns null when no such function is defined.
+pub fn callFunction(sh: *Shell, name: []const u8, args: []const []const u8) ?u8 {
+    const source = sh.getFunc(name) orelse return null;
+    const argv = sh.scratch().alloc([]const u8, args.len + 1) catch return 1;
+    argv[0] = name;
+    @memcpy(argv[1..], args);
+
+    const saved = .{ loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending };
+    loop_depth = 0;
+    break_level = 0;
+    continue_level = 0;
+    sh.break_pending = false;
+    sh.continue_pending = false;
+    defer loop_depth, break_level, continue_level, sh.break_pending, sh.continue_pending = saved;
+    return runFunction(sh, name, source, argv);
+}
+
 // --- substitution -----------------------------------------------------------
 
 pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator) anyerror![]const u8 {
@@ -391,7 +717,8 @@ pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator)
 /// Called once at startup to wire command substitution into expansion.
 pub fn install(sh: *Shell) void {
     sh.subst_runner = substitutionRunner;
-    sh.trap_runner = runSource;
+    sh.trap_runner = runSourceAt;
+    procsub.run_source = runSource;
 }
 
 // --- tests ------------------------------------------------------------------
@@ -749,12 +1076,21 @@ test "isComplete distinguishes open constructs from real errors" {
     try testing.expect(!isComplete("fn f() {"));
     try testing.expect(!isComplete("while true {"));
 
-    // Real errors are reported straight away.
-    try testing.expect(isComplete("if { }"));
+    // Real errors are reported straight away. (`if { }` is now an unfinished
+    // POSIX `if` whose condition is an empty group.)
+    try testing.expect(isComplete("fi"));
     try testing.expect(isComplete("echo hi"));
 
     // And a closed block is complete.
     try testing.expect(isComplete("if true {\n echo hi\n}"));
+
+    // `[[` waits for its `]]`, and `for ((...))` for its body.
+    try testing.expect(!isComplete("[[ -n $x &&"));
+    try testing.expect(!isComplete("[[ a == b"));
+    try testing.expect(isComplete("[[ a < b ]] && echo yes"));
+    try testing.expect(isComplete("echo [["));
+    try testing.expect(!isComplete("for ((i = 0; i < 3; i++))"));
+    try testing.expect(isComplete("(( i > 2 ))"));
 }
 
 test "isComplete knows about groups, here-strings and tab-stripping here-documents" {
@@ -1145,4 +1481,191 @@ test "braces that belong to a word are left alone" {
     const out = try collectOutput(&sh, "let x = \"v\"\necho ${x}-suffix\n");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("v-suffix\n", out);
+}
+
+test "POSIX if, loops and case" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const source =
+        \\if false; then echo no; elif true; then echo elif; else echo else; fi
+        \\i=0
+        \\while [ $i -lt 2 ]; do i=$((i+1)); echo w$i; done
+        \\until [ $i -eq 0 ]; do i=$((i-1)); done; echo u$i
+        \\for x in a b; do for y in 1 2; do [ $y = 2 ] && continue 2; echo $x$y; done; done
+        \\case abc in a*) echo one;& z*) echo two;; *) echo three;; esac
+        \\case abc in a*) echo first;;& *c) echo second;;& z*) echo third;; esac
+        \\case "a*" in "a*") echo quoted;; esac
+        \\case /usr/bin in */bin) echo slash;; esac
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("elif\nw1\nw2\nu0\na1\nb1\none\ntwo\nfirst\nsecond\nquoted\nslash\n", out);
+
+    // No branch taken and no match both succeed.
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, "false; if false; then :; fi\n"));
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, "false; case x in y) ;; esac\n"));
+    try testing.expectEqual(@as(u8, 1), runSource(&sh, "case x in x) false;; esac\n"));
+}
+
+test "case honours nocasematch" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    try testing.expectEqual(@as(u8, 1), runSource(&sh, "case ABC in abc) true;; *) false;; esac\n"));
+    sh.options.nocasematch = true;
+    try testing.expectEqual(@as(u8, 0), runSource(&sh, "case ABC in abc) true;; *) false;; esac\n"));
+}
+
+test "POSIX functions take arguments, locals, return and redirections" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-function-redirect-test.txt";
+    var buf: [512]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf,
+        \\count() {{ local n=$#; echo "$FUNCNAME:$n:$1"; return $n; }}
+        \\count a b; echo "status $? [$FUNCNAME]"
+        \\logged() {{ echo "$1"; }} > {s}
+        \\logged hidden
+        \\function twice {{ echo "$@" "$@"; }}
+        \\twice x
+    , .{path});
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("count:2:a\nstatus 2 []\nx x\n", out);
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    const data = (try fs.readFileAlloc(testing.allocator, z, 1024)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("hidden\n", data);
+    _ = fs.removeFile(z);
+}
+
+test "native conditions run commands when they are not expressions" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const source =
+        \\if /bin/sh -c 'exit 0' { echo ran }
+        \\if ! /bin/sh -c 'exit 3' { echo negated }
+        \\false
+        \\if $? == 1 { echo status }
+        \\let ready = true
+        \\if ready { echo variable }
+        \\if ! ready { echo wrong } else { echo not-negated }
+        \\let n = 0
+        \\until n == 2 { let n = n + 1 }
+        \\echo $n
+    ;
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("ran\nnegated\nstatus\nvariable\nnot-negated\n2\n", out);
+}
+
+test "compound commands are redirected and piped" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    const path = "zig-cache-compound-redirect-test.txt";
+    var buf: [512]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buf,
+        \\for i in a b {{ echo $i }} > {s}
+        \\while read -r line; do echo "got $line"; done < {s}
+        \\for i in 1 2; do echo $i; done | /bin/cat
+    , .{ path, path });
+    const out = try collectOutput(&sh, source);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("got a\ngot b\n1\n2\n", out);
+
+    const z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(z);
+    _ = fs.removeFile(z);
+}
+
+test "an interrupt stops loops and statement lists" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    sh.interrupted = true;
+    const out = try collectOutput(&sh, "for i in a b; do echo $i; done\nwhile true { echo spin }\necho after\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("", out);
+}
+
+var recorded_line: u32 = 0;
+
+/// Stands in for command substitution so a test can see `current_line` at
+/// the moment a word is expanded.
+fn recordLine(sh: *Shell, _: []const u8, _: std.mem.Allocator) anyerror![]const u8 {
+    recorded_line = sh.current_line;
+    return "";
+}
+
+test "statements set the current line, and function bodies keep theirs" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+    sh.subst_runner = recordLine;
+
+    _ = runSource(&sh, "true\n\nif true; then\n  : $(x)\nfi\n");
+    try testing.expectEqual(@as(u32, 4), recorded_line);
+
+    _ = runSource(&sh, "true\nwhile true {\n  : $(x)\n  break\n}\n");
+    try testing.expectEqual(@as(u32, 3), recorded_line);
+
+    _ = runSource(&sh, "\n\nshow() {\n  : $(x)\n}\n\nshow\n");
+    try testing.expectEqual(@as(u32, 4), recorded_line);
+    try testing.expectEqual(@as(u32, 7), sh.current_line);
+}
+
+test "isComplete waits for POSIX blocks and function bodies" {
+    try testing.expect(!isComplete("if true; then"));
+    try testing.expect(!isComplete("if true; then\n echo hi"));
+    try testing.expect(isComplete("if true; then\n echo hi\nfi"));
+    try testing.expect(!isComplete("if true; then echo; elif false; then echo; else"));
+    try testing.expect(isComplete("if true; then echo; elif false; then echo; else echo; fi"));
+    try testing.expect(!isComplete("if true"));
+    try testing.expect(!isComplete("for i in 1 2; do"));
+    try testing.expect(isComplete("for i in 1 2; do echo $i; done"));
+    try testing.expect(!isComplete("while read -r l; do\n  case $l in"));
+    try testing.expect(!isComplete("case $1 in\n  a) echo a;;"));
+    try testing.expect(isComplete("case $1 in\n  a) if true; then echo; fi;;\nesac"));
+    try testing.expect(!isComplete("f() {"));
+    try testing.expect(!isComplete("f()"));
+    try testing.expect(isComplete("f() { echo; }"));
+    try testing.expect(!isComplete("function f"));
+    try testing.expect(isComplete("echo if then do case"));
+    try testing.expect(!isComplete("while true; do cat <<EOF\nbody"));
+    try testing.expect(isComplete("while read l; do echo $l; done <<EOF\na\nEOF\n"));
+    // Native blocks still close with a brace.
+    try testing.expect(!isComplete("while x == 1 {"));
+    try testing.expect(isComplete("if grep -q x f { echo }"));
+    try testing.expect(isComplete("for f in a b { echo $f }"));
+}
+
+test "time reports on standard error" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    install(&sh);
+
+    var fds: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    const saved = sh.default_err;
+    sh.default_err = fds[1];
+    const status = runSource(&sh, "time -p true\nTIMEFORMAT='took %0R'\ntime { false; }\n");
+    sh.default_err = saved;
+    _ = linux.close(fds[1]);
+    var buf: [256]u8 = undefined;
+    const n = sys.readAll(fds[0], &buf);
+    _ = linux.close(fds[0]);
+    try testing.expectEqual(@as(u8, 1), status);
+    try testing.expectEqualStrings("real 0.00\nuser 0.00\nsys 0.00\ntook 0\n", buf[0..n]);
 }

@@ -315,7 +315,8 @@ class ShellCompatibilityTests(unittest.TestCase):
             )
             self.assert_success(result)
             self.assertEqual(result.stdout, b"after\nready\nparent\n")
-            self.assertRegex(result.stderr, rb"\[1\] [0-9]+\n")
+            # A non-interactive shell does not announce the job, as in bash.
+            self.assertEqual(result.stderr, b"")
 
     def assert_success(self, result):
         self.assertEqual(

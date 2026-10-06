@@ -68,11 +68,51 @@ fn setHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
     _ = linux.sigaction(sig, &act, null);
 }
 
-/// Installs a disposition for one signal. Used by `trap`; `null` restores the
-/// default action.
+/// Dispositions in force before `trap` first changed each signal, so `trap -
+/// SIG` puts back what the shell itself had (an interactive shell ignores
+/// SIGINT, for instance).
+var original_actions: [linux.NSIG]?linux.Sigaction = [_]?linux.Sigaction{null} ** linux.NSIG;
+/// Signals a `trap '' SIG` ignores. Children keep ignoring them.
+var trap_ignored: u64 = 0;
+
+fn signalBit(sig: linux.SIG) u64 {
+    return @as(u64, 1) << @intCast(@intFromEnum(sig) - 1);
+}
+
+/// Installs a disposition for one signal. Used by `trap`.
 pub fn installHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
     if (sig == .KILL or sig == .STOP) return;
-    setHandler(sig, handler);
+    var act = std.mem.zeroes(linux.Sigaction);
+    act.handler = .{ .handler = handler };
+    var old: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(sig, &act, &old)) != .SUCCESS) return;
+    const index = @intFromEnum(sig);
+    if (original_actions[index] == null) original_actions[index] = old;
+    const ignoring = if (handler) |h| @intFromPtr(h) == @intFromPtr(linux.SIG.IGN.?) else false;
+    if (ignoring) trap_ignored |= signalBit(sig) else trap_ignored &= ~signalBit(sig);
+}
+
+/// `trap - SIG`: puts back the disposition the shell had before any trap. In
+/// the interactive shell that is its own handling, so `trap - INT` does not
+/// let Ctrl-C kill the shell.
+pub fn restoreHandler(sig: linux.SIG) void {
+    if (sig == .KILL or sig == .STOP) return;
+    trap_ignored &= ~signalBit(sig);
+    if (interrupt_flag != null) {
+        if (interactiveDisposition(sig)) |own| return setHandler(sig, own);
+    }
+    const original = original_actions[@intFromEnum(sig)] orelse return setHandler(sig, linux.SIG.DFL);
+    _ = linux.sigaction(sig, &original, null);
+}
+
+/// True when the shell started with `sig` at its default action, so catching
+/// it changes nothing but the chance to run cleanup first.
+pub fn startedDefault(sig: linux.SIG) bool {
+    // SIG_DFL is the null handler.
+    if (original_actions[@intFromEnum(sig)]) |original| return original.handler.handler == null;
+    var current: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(sig, null, &current)) != .SUCCESS) return false;
+    return current.handler.handler == null;
 }
 
 /// Signals that can never be caught or ignored.
@@ -150,9 +190,48 @@ pub fn signalName(sig: u32) []const u8 {
     };
 }
 
-/// Signals the shell itself ignores while it waits for children.
-pub fn shellSignals() void {
-    setHandler(.INT, linux.SIG.IGN);
+/// The interactive shell's `Shell.interrupted`, raised by the SIGINT and SIGHUP
+/// handlers. Volatile because a handler writes it behind the compiler's back.
+var interrupt_flag: ?*volatile bool = null;
+var hangup_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn onInterrupt(_: linux.SIG) callconv(.c) void {
+    if (interrupt_flag) |flag| flag.* = true;
+}
+
+fn onHangup(_: linux.SIG) callconv(.c) void {
+    hangup_received.store(true, .monotonic);
+    if (interrupt_flag) |flag| flag.* = true;
+    // The shell may be blocked waiting for a foreground job; hang that up too,
+    // as a real terminal hangup does, so the shell gets to act on it.
+    var foreground: linux.pid_t = 0;
+    if (linux.errno(linux.tcgetpgrp(0, &foreground)) != .SUCCESS or foreground <= 0) return;
+    if (foreground != @as(linux.pid_t, @intCast(linux.getpgid(0)))) _ = linux.kill(-foreground, .HUP);
+}
+
+/// What the interactive shell does with `sig` when no trap is set.
+fn interactiveDisposition(sig: linux.SIG) ?linux.Sigaction.handler_fn {
+    return switch (sig) {
+        .INT => onInterrupt,
+        .HUP => onHangup,
+        .TERM, .QUIT, .TSTP, .TTIN, .TTOU, .PIPE => linux.SIG.IGN,
+        else => null,
+    };
+}
+
+/// True once SIGHUP reached the interactive shell; the REPL then hangs up.
+pub fn hangupPending() bool {
+    return hangup_received.load(.monotonic);
+}
+
+/// Dispositions for the interactive shell. SIGINT and SIGHUP are caught
+/// without `SA_RESTART`, so a blocking read or wait returns EINTR instead of
+/// resuming and the command line can stop; SIGTERM is ignored, as in bash.
+pub fn shellSignals(interrupted: *bool) void {
+    interrupt_flag = interrupted;
+    setHandler(.INT, onInterrupt);
+    setHandler(.HUP, onHangup);
+    setHandler(.TERM, linux.SIG.IGN);
     setHandler(.QUIT, linux.SIG.IGN);
     setHandler(.TSTP, linux.SIG.IGN);
     setHandler(.TTIN, linux.SIG.IGN);
@@ -161,15 +240,14 @@ pub fn shellSignals() void {
 }
 
 /// Children must get the default dispositions back, otherwise Ctrl-C would be
-/// ignored by everything the shell starts.
+/// ignored by everything the shell starts. Ignored signals survive `execve`,
+/// and caught ones would run the shell's handler in a forked builtin. Signals
+/// `trap ''` ignores stay ignored, as in other shells.
 pub fn resetSignals() void {
-    setHandler(.INT, linux.SIG.DFL);
-    setHandler(.QUIT, linux.SIG.DFL);
-    setHandler(.TSTP, linux.SIG.DFL);
-    setHandler(.TTIN, linux.SIG.DFL);
-    setHandler(.TTOU, linux.SIG.DFL);
-    setHandler(.PIPE, linux.SIG.DFL);
-    setHandler(.CHLD, linux.SIG.DFL);
+    interrupt_flag = null;
+    for ([_]linux.SIG{ .INT, .HUP, .TERM, .QUIT, .TSTP, .TTIN, .TTOU, .PIPE, .CHLD }) |sig| {
+        if (trap_ignored & signalBit(sig) == 0) setHandler(sig, linux.SIG.DFL);
+    }
 }
 
 /// Builds a null-terminated argument vector in `arena`.
@@ -180,6 +258,48 @@ pub fn buildArgv(arena: std.mem.Allocator, items: []const []const u8) ![*:null]c
     }
     arr[items.len] = null;
     return @ptrCast(arr.ptr);
+}
+
+/// Finds the file to `execve` for `name`. A name with a `/` is used as it is,
+/// so `execve` reports why it cannot run. Otherwise the first executable on
+/// `PATH` wins; failing that, the first other non-directory match, which
+/// `execve` then refuses with `Permission denied`, as in bash. Null when
+/// nothing on `PATH` matches.
+pub fn locate(arena: std.mem.Allocator, name: []const u8, path_env: []const u8) !?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return name;
+    var fallback: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
+        const z = try arena.dupeZ(u8, full);
+        const found = fs.kind(z) orelse continue;
+        if (found == .dir) continue;
+        if (fs.isExecutable(z)) return full;
+        if (fallback == null) fallback = full;
+    }
+    return fallback;
+}
+
+/// The C library's message for the errors the shell reports.
+pub fn errorText(err: linux.E) []const u8 {
+    return switch (err) {
+        .PERM => "Operation not permitted",
+        .NOENT => "No such file or directory",
+        .SRCH => "No such process",
+        .@"2BIG" => "Argument list too long",
+        .NOEXEC => "Exec format error",
+        .NOMEM => "Cannot allocate memory",
+        .ACCES => "Permission denied",
+        .NOTDIR => "Not a directory",
+        .ISDIR => "Is a directory",
+        .INVAL => "Invalid argument",
+        .TXTBSY => "Text file busy",
+        .NAMETOOLONG => "File name too long",
+        .LOOP => "Too many levels of symbolic links",
+        .IO => "Input/output error",
+        else => std.enums.tagName(linux.E, err) orelse "Unknown error",
+    };
 }
 
 /// Locates `name` on `PATH`. Returns null when it is not an executable file.
@@ -244,15 +364,23 @@ pub fn waitAny(flags: u32) ?ChildEvent {
     while (true) {
         const rc = linux.waitpid(-1, &wstatus, flags);
         const err = linux.errno(rc);
-        if (err == .INTR) continue;
+        if (err == .INTR) {
+            // Ctrl-C in an interactive shell ends `wait -n` instead of resuming it.
+            if (interrupt_flag) |flag| {
+                if (flag.*) return null;
+            }
+            continue;
+        }
         if (err != .SUCCESS or rc == 0) return null;
         return .{ .pid = @intCast(rc), .status = decode(wstatus) };
     }
 }
 
-fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, pgid: i32) noreturn {
+/// `group` is the process group to join: 0 makes this child the leader of a
+/// new one, null keeps the shell's.
+fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, group: ?i32) noreturn {
     // Both parent and child call setpgid so neither has to win the race.
-    if (pgid != 0) _ = linux.setpgid(0, pgid);
+    if (group) |pgid| _ = linux.setpgid(0, pgid);
     resetSignals();
 
     const sources = [3]i32{ fd_in, fd_out, stage.stdio.err };
@@ -287,20 +415,61 @@ fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, pgid: 
 
     if (stage.child_fn) |f| f(stage.child_ctx.?);
 
-    if (stage.exec) |e| {
-        const rc = linux.execve(e.path, e.argv, e.envp);
-        if (linux.errno(rc) == .NOEXEC) {
-            if (e.shell_path) |sh| {
-                if (e.shell_argv) |argv| {
-                    _ = linux.execve(sh, argv, e.envp);
-                }
-            }
+    const e = stage.exec orelse {
+        const msg = "wsh: internal error: a stage has nothing to run\n";
+        _ = linux.write(2, msg.ptr, msg.len);
+        linux.exit(127);
+    };
+    const err = linux.errno(linux.execve(e.path, e.argv, e.envp));
+    if (err == .NOEXEC) {
+        if (e.shell_path) |sh| {
+            if (e.shell_argv) |argv| _ = linux.execve(sh, argv, e.envp);
         }
     }
+    var buf: [linux.PATH_MAX + 512]u8 = undefined;
+    const failure = describeExecFailure(&buf, std.mem.span(e.path), err);
+    _ = linux.write(2, failure.text.ptr, failure.text.len);
+    linux.exit(failure.status);
+}
 
-    const msg = "wsh: could not execute command\n";
-    _ = linux.write(2, msg.ptr, msg.len);
-    linux.exit(127);
+pub const ExecFailure = struct {
+    /// A whole `wsh: ...` line.
+    text: []const u8,
+    status: u8,
+};
+
+/// Explains a failed `execve` of `path` the way bash does: status 127 when
+/// the command does not exist, 126 when it exists but cannot run. Uses only
+/// `buf` and the stack, so a forked child can call it.
+pub fn describeExecFailure(buf: []u8, path: [:0]const u8, err: linux.E) ExecFailure {
+    var head: [256]u8 = undefined;
+    var status: u8 = 126;
+    const text = switch (err) {
+        .NOENT => if (interpreterOf(path, &head)) |interpreter|
+            std.fmt.bufPrint(buf, "wsh: {s}: {s}: bad interpreter: No such file or directory\n", .{ path, interpreter })
+        else blk: {
+            status = 127;
+            break :blk std.fmt.bufPrint(buf, "wsh: {s}: No such file or directory\n", .{path});
+        },
+        .ACCES => std.fmt.bufPrint(buf, "wsh: {s}: {s}\n", .{ path, if (fs.isDir(path)) "Is a directory" else "Permission denied" }),
+        else => std.fmt.bufPrint(buf, "wsh: {s}: {s}\n", .{ path, errorText(err) }),
+    } catch "wsh: cannot execute command: name too long\n";
+    return .{ .text = text, .status = status };
+}
+
+/// The interpreter named by a `#!` line, or null when `path` cannot be read
+/// or does not start with one.
+fn interpreterOf(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const fd = sys.openRead(path.ptr) orelse return null;
+    defer sys.closeFd(fd);
+    const n = sys.readAll(fd, buf);
+    const head = buf[0..n];
+    if (!std.mem.startsWith(u8, head, "#!")) return null;
+    const line = head[2 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    const end = std.mem.indexOfAny(u8, trimmed, " \t\r") orelse trimmed.len;
+    if (end == 0) return null;
+    return trimmed[0..end];
 }
 
 /// Forks every stage, wiring the pipes between them, and returns the pids.
@@ -338,11 +507,7 @@ pub fn launch(arena: std.mem.Allocator, stages: []const Stage, options: LaunchOp
             return error.ForkFailed;
         }
         const pid: i32 = @intCast(rc);
-        if (options.new_group) {
-            if (pid == 0) childRun(stage, fd_in, fd_out, pipes.items, pgid);
-        } else if (pid == 0) {
-            childRun(stage, fd_in, fd_out, pipes.items, 0);
-        }
+        if (pid == 0) childRun(stage, fd_in, fd_out, pipes.items, if (options.new_group) pgid else null);
 
         pids[idx] = pid;
         if (options.new_group) {
@@ -371,6 +536,12 @@ pub fn launch(arena: std.mem.Allocator, stages: []const Stage, options: LaunchOp
 
 pub fn signalProcess(pid: i32, sig: linux.SIG) void {
     _ = linux.kill(pid, sig);
+}
+
+/// `kill(2)` with any signal number, real-time ones included, returning the
+/// errno so the caller can say why it failed. A negative `pid` names a group.
+pub fn sendSignal(pid: i32, sig: u32) linux.E {
+    return linux.errno(linux.syscall2(.kill, @bitCast(@as(isize, pid)), sig));
 }
 
 pub fn signalGroup(pgid: i32, sig: linux.SIG) void {

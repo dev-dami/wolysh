@@ -16,6 +16,9 @@ const history = @import("history.zig");
 const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const command_cache = @import("command_cache.zig");
+const special_vars = @import("special_vars.zig");
+const arrays = @import("arrays.zig");
+const strict = @import("strict.zig");
 
 /// Runs `$(...)` and returns its stdout. Installed by `exec.zig`, which breaks
 /// the otherwise circular dependency between expansion and execution.
@@ -31,6 +34,29 @@ pub const Config = struct {
     history_limit: usize = 5000,
 };
 
+/// Behaviour switches set by `set` and `shopt`; the executor and expander read
+/// them.
+pub const Options = struct {
+    errexit: bool = false, // set -e
+    nounset: bool = false, // set -u
+    xtrace: bool = false, // set -x
+    pipefail: bool = false, // set -o pipefail
+    noglob: bool = false, // set -f
+    noclobber: bool = false, // set -C
+    allexport: bool = false, // set -a
+    vi: bool = false, // set -o vi
+    nullglob: bool = false, // shopt -s nullglob
+    failglob: bool = false, // shopt -s failglob
+    dotglob: bool = false, // shopt -s dotglob
+    nocaseglob: bool = false, // shopt -s nocaseglob
+    nocasematch: bool = false, // shopt -s nocasematch
+    globstar: bool = true, // shopt -s globstar
+    extglob: bool = true, // shopt -s extglob
+    histexpand: bool = true, // set -H
+    ignoreeof: bool = false, // set -o ignoreeof
+    errtrace: bool = false, // set -E
+};
+
 /// Bit `N` is set when signal `N + 1` arrives. Written only from a signal
 /// handler, which is why it is a lock-free atomic rather than shell state.
 var trap_pending: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -44,6 +70,15 @@ pub fn trapHandler(sig: linux.SIG) callconv(.c) void {
     }
 }
 
+pub fn signalPending(sig: u32) bool {
+    return trap_pending.load(.monotonic) & (@as(u64, 1) << @intCast(sig - 1)) != 0;
+}
+
+/// Forgets a caught signal that has not been handled yet.
+pub fn discardPendingSignal(sig: u32) void {
+    _ = trap_pending.fetchAnd(~(@as(u64, 1) << @intCast(sig - 1)), .monotonic);
+}
+
 pub const Shell = struct {
     gpa: std.mem.Allocator,
 
@@ -51,15 +86,22 @@ pub const Shell = struct {
     env: std.StringHashMap([]const u8),
     /// Function name -> source text of its `fn` declaration.
     funcs: std.StringHashMap([]const u8),
+    /// Function name -> line its definition starts on, so a body re-parsed
+    /// from `funcs` reports the original line numbers.
+    func_lines: std.StringHashMap(u32),
     aliases: std.StringHashMap([]const u8),
     /// Names locked by `readonly`; `setVar`/`setEnv` refuse to rebind them.
     readonly: std.StringHashMap(void),
+    /// `declare -i/-l/-u` attributes, applied by `setVar` on every assignment.
+    attrs: std.StringHashMap(Attrs),
     /// Saved bindings for nested `local` scopes, outermost frame first.
     scopes: std.ArrayList(Scope) = .empty,
-    /// Trap handler source per signal number, indexed by `sig - 1`.
-    traps: [max_signal]?[]const u8 = [_]?[]const u8{null} ** max_signal,
-    /// Runs a trap handler's source; installed by `exec.zig` (see `install`).
-    trap_runner: ?*const fn (*Shell, []const u8) u8 = null,
+    /// Trap handler source per trap id: `exit_trap`, the signal numbers, then
+    /// the DEBUG, ERR and RETURN pseudo-signals. An empty handler ignores.
+    traps: [trap_count]?[]const u8 = [_]?[]const u8{null} ** trap_count,
+    /// Runs a trap handler's source, numbering its lines from the given one;
+    /// installed by `exec.zig` (see `install`).
+    trap_runner: ?*const fn (*Shell, []const u8, u32) u8 = null,
     /// Directories saved by `pushd`; index 0 is the most recent.
     dir_stack: std.ArrayList([]const u8) = .empty,
 
@@ -70,11 +112,17 @@ pub const Shell = struct {
     cwd: []u8,
     last_status: u8 = 0,
     last_bg_pid: i32 = 0,
+    /// Command substitutions run so far (wrapping). A command without a
+    /// command word compares it to know whether its status comes from one.
+    substitutions: u32 = 0,
 
     interactive: bool = false,
     login: bool = false,
     should_exit: bool = false,
     exit_code: u8 = 0,
+    /// Set when an interactive `exit` was refused because jobs are stopped;
+    /// an immediately repeated `exit` or Ctrl-D then leaves anyway.
+    exit_warned: bool = false,
 
     pid: i32 = 0,
     shell_pgid: i32 = 0,
@@ -107,12 +155,25 @@ pub const Shell = struct {
     /// Positional parameters (`$1`, `$2`, ...) for the current function or
     /// script. Owned by the caller's arena and saved/restored around calls.
     positional: []const []const u8 = &.{},
+    /// The allocation behind `positional` when `set --` created it; each
+    /// function call or `source` saves and restores its own.
+    positional_owned: ?[]const []const u8 = null,
     /// `$0`.
     script_name: []const u8 = "",
 
     line_arena: std.heap.ArenaAllocator,
 
     config: Config = .{},
+    options: Options = .{},
+    /// Source line of the statement being executed, for `$LINENO`.
+    current_line: u32 = 0,
+    /// Non-zero while running a condition: an `if`/`while`/`until` test, a
+    /// non-final part of an `&&`/`||` list, or a `!` pipeline. `set -e` and the
+    /// ERR trap do not fire there.
+    condition_depth: u32 = 0,
+    /// Set when Ctrl-C interrupts the running command line. Statement lists and
+    /// loops stop while it is set; the REPL clears it before the next prompt.
+    interrupted: bool = false,
     hostname: []const u8 = "",
     history_path: []const u8 = "",
     config_path: []const u8 = "",
@@ -121,6 +182,11 @@ pub const Shell = struct {
 
     pub const max_call_depth = 256;
     pub const max_signal = 64;
+    pub const exit_trap: u32 = 0;
+    pub const debug_trap: u32 = max_signal + 1;
+    pub const err_trap: u32 = max_signal + 2;
+    pub const return_trap: u32 = max_signal + 3;
+    pub const trap_count = max_signal + 4;
     pub const max_dirs = 32;
 
     /// One `local` scope: the bindings it shadowed, innermost last.
@@ -132,6 +198,18 @@ pub const Shell = struct {
         name: []const u8,
         was_set: bool,
         previous: value.Value = .none,
+        attrs: Attrs = .{},
+    };
+
+    pub const Attrs = packed struct(u8) {
+        integer: bool = false,
+        lower: bool = false,
+        upper: bool = false,
+        _pad: u5 = 0,
+
+        pub fn any(self: Attrs) bool {
+            return self.integer or self.lower or self.upper;
+        }
     };
 
     fn blank(gpa: std.mem.Allocator) Shell {
@@ -140,8 +218,10 @@ pub const Shell = struct {
             .vars = std.StringHashMap(value.Value).init(gpa),
             .env = std.StringHashMap([]const u8).init(gpa),
             .funcs = std.StringHashMap([]const u8).init(gpa),
+            .func_lines = std.StringHashMap(u32).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
             .readonly = std.StringHashMap(void).init(gpa),
+            .attrs = std.StringHashMap(Attrs).init(gpa),
             .jobs = .{},
             .hist = .{},
             .cwd = &.{},
@@ -162,6 +242,7 @@ pub const Shell = struct {
     pub fn init(gpa: std.mem.Allocator, init_args: std.process.Init.Minimal) !Shell {
         var sh = blank(gpa);
         errdefer sh.deinit();
+        special_vars.start();
 
         sh.cwd = (try fs.getCwd(gpa)) orelse (try gpa.dupe(u8, "/"));
         sh.shell_pgid = sys.getpgid(0) orelse sh.pid;
@@ -174,8 +255,20 @@ pub const Shell = struct {
         }
 
         if (sh.env.get("PATH") == null) try sh.setEnv("PATH", "/usr/local/bin:/usr/bin:/bin");
+        if (sh.env.get("PWD")) |pwd| {
+            if (inheritedPwd(pwd)) {
+                const owned = try gpa.dupe(u8, pwd);
+                gpa.free(sh.cwd);
+                sh.cwd = owned;
+            }
+        }
         try sh.setEnv("PWD", sh.cwd);
-        if (sh.env.get("SHELL") == null) try sh.setEnv("SHELL", "/usr/local/bin/wsh");
+        if (sh.env.get("SHELL") == null) {
+            if (try fs.readLink(gpa, "/proc/self/exe")) |exe| {
+                defer gpa.free(exe);
+                try sh.setEnv("SHELL", exe);
+            }
+        }
 
         var host_buf: [linux.HOST_NAME_MAX]u8 = undefined;
         if (std.posix.gethostname(&host_buf) catch null) |name| {
@@ -209,6 +302,10 @@ pub const Shell = struct {
         }
         self.funcs.deinit();
 
+        var lit = self.func_lines.keyIterator();
+        while (lit.next()) |key| self.gpa.free(key.*);
+        self.func_lines.deinit();
+
         var ait = self.aliases.iterator();
         while (ait.next()) |entry| {
             self.gpa.free(entry.key_ptr.*);
@@ -219,6 +316,10 @@ pub const Shell = struct {
         var rit = self.readonly.iterator();
         while (rit.next()) |entry| self.gpa.free(entry.key_ptr.*);
         self.readonly.deinit();
+
+        var attr_it = self.attrs.iterator();
+        while (attr_it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.attrs.deinit();
 
         for (self.scopes.items) |*scope| {
             for (scope.saved.items) |saved| {
@@ -232,6 +333,7 @@ pub const Shell = struct {
         for (self.traps) |maybe| {
             if (maybe) |text| self.gpa.free(text);
         }
+        self.freeOwnedPositional();
 
         for (self.dir_stack.items) |dir| self.gpa.free(dir);
         self.dir_stack.deinit(self.gpa);
@@ -258,17 +360,21 @@ pub const Shell = struct {
 
     // --- variables ----------------------------------------------------------
 
+    /// A stored variable, else a computed one such as `RANDOM` or `UID`.
     pub fn getVar(self: *const Shell, name: []const u8) ?value.Value {
-        return self.vars.get(name);
+        return self.vars.get(name) orelse special_vars.get(self, name);
     }
 
     pub fn hasVar(self: *const Shell, name: []const u8) bool {
         return self.vars.contains(name);
     }
 
-    /// Stores `val`, deep-copying it so the caller's arena can be reset.
+    /// Stores `val`, deep-copying it so the caller's arena can be reset. The
+    /// variable's `declare` attributes apply first; `RANDOM` and `SECONDS`
+    /// take the assignment without storing it.
     pub fn setVar(self: *Shell, name: []const u8, val: value.Value) !void {
-        const owned = try cloneValue(self.gpa, val);
+        if (special_vars.assign(self, name, val)) return;
+        const owned = try cloneValue(self.gpa, try arrays.applyAttrs(self, name, val));
         errdefer freeValue(self.gpa, owned);
         const gop = try self.vars.getOrPut(name);
         if (gop.found_existing) {
@@ -281,12 +387,32 @@ pub const Shell = struct {
 
     pub fn unsetVar(self: *Shell, name: []const u8) bool {
         if (self.isReadonly(name)) return false;
+        if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
         if (self.vars.fetchRemove(name)) |kv| {
             self.gpa.free(kv.key);
             freeValue(self.gpa, kv.value);
             return true;
         }
         return false;
+    }
+
+    pub fn getAttrs(self: *const Shell, name: []const u8) Attrs {
+        return self.attrs.get(name) orelse .{};
+    }
+
+    pub fn setAttrs(self: *Shell, name: []const u8, attrs: Attrs) !void {
+        if (!attrs.any()) {
+            if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
+            return;
+        }
+        const gop = try self.attrs.getOrPut(name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.attrs.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = attrs;
     }
 
     // --- readonly -----------------------------------------------------------
@@ -329,12 +455,15 @@ pub const Shell = struct {
         if (self.scopes.items.len == 0) return;
         var scope = self.scopes.pop().?;
         while (scope.saved.pop()) |saved| {
+            // The saved value is restored as it was, then its attributes.
+            self.setAttrs(saved.name, .{}) catch {};
             if (saved.was_set) {
                 self.setVar(saved.name, saved.previous) catch {};
             } else if (self.vars.fetchRemove(saved.name)) |kv| {
                 self.gpa.free(kv.key);
                 freeValue(self.gpa, kv.value);
             }
+            self.setAttrs(saved.name, saved.attrs) catch {};
             self.gpa.free(saved.name);
             freeValue(self.gpa, saved.previous);
         }
@@ -354,62 +483,118 @@ pub const Shell = struct {
         }
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
-        const previous = self.getVar(name);
+        const previous = self.vars.get(name);
         const copy = if (previous) |v| try cloneValue(self.gpa, v) else value.Value.none;
         errdefer if (previous != null) freeValue(self.gpa, copy);
         try scope.saved.append(self.gpa, .{
             .name = owned,
             .was_set = previous != null,
             .previous = copy,
+            .attrs = self.getAttrs(name),
         });
+        // A local starts without the attributes of the binding it shadows.
+        try self.setAttrs(name, .{});
     }
 
     // --- traps --------------------------------------------------------------
 
-    pub fn setTrap(self: *Shell, sig: u32, handler: []const u8) !void {
-        if (sig == 0 or sig > max_signal) return error.InvalidSignal;
-        const owned = try self.gpa.dupe(u8, handler);
-        errdefer self.gpa.free(owned);
-        if (self.traps[sig - 1]) |old| self.gpa.free(old);
-        self.traps[sig - 1] = owned;
+    /// `id` is a signal number or one of `exit_trap`, `debug_trap`,
+    /// `err_trap` and `return_trap`.
+    pub fn setTrap(self: *Shell, id: u32, handler: []const u8) !void {
+        if (id >= trap_count) return error.InvalidSignal;
+        self.putTrap(id, try self.gpa.dupe(u8, handler));
     }
 
-    pub fn getTrap(self: *const Shell, sig: u32) ?[]const u8 {
-        if (sig == 0 or sig > max_signal) return null;
-        return self.traps[sig - 1];
+    pub fn getTrap(self: *const Shell, id: u32) ?[]const u8 {
+        if (id >= trap_count) return null;
+        return self.traps[id];
     }
 
-    pub fn clearTrap(self: *Shell, sig: u32) bool {
-        if (sig == 0 or sig > max_signal) return false;
-        if (self.traps[sig - 1]) |old| {
-            self.gpa.free(old);
-            self.traps[sig - 1] = null;
-            return true;
-        }
-        return false;
+    pub fn clearTrap(self: *Shell, id: u32) bool {
+        const old = self.takeTrap(id) orelse return false;
+        self.gpa.free(old);
+        return true;
+    }
+
+    /// Removes a handler and hands its ownership to the caller.
+    pub fn takeTrap(self: *Shell, id: u32) ?[]const u8 {
+        if (id >= trap_count) return null;
+        const old = self.traps[id];
+        self.traps[id] = null;
+        return old;
+    }
+
+    /// Installs a handler the shell's allocator already owns.
+    pub fn putTrap(self: *Shell, id: u32, owned: []const u8) void {
+        std.debug.assert(id < trap_count);
+        if (self.traps[id]) |old| self.gpa.free(old);
+        self.traps[id] = owned;
     }
 
     /// Runs handlers for signals caught since the last call. Safe to call
-    /// between statements; a no-op until `exec.zig` installs `trap_runner`.
+    /// between statements.
     pub fn runPendingTraps(self: *Shell) void {
-        const runner = self.trap_runner orelse return;
         const bits = trap_pending.swap(0, .monotonic);
         if (bits == 0) return;
         var sig: u32 = 1;
         while (sig <= max_signal) : (sig += 1) {
             const bit: u6 = @intCast(sig - 1);
             if ((bits >> bit) & 1 == 0) continue;
-            const handler = self.getTrap(sig) orelse continue;
-            if (handler.len == 0) continue;
-            self.last_status = runner(self, handler);
+            strict.signalArrived(self, sig);
         }
+    }
+
+    // --- positional parameters ----------------------------------------------
+
+    /// `set -- args`: replaces the positional parameters with copies the
+    /// shell owns, so they outlive the command line that set them.
+    pub fn setPositional(self: *Shell, args: []const []const u8) !void {
+        const items = try self.gpa.alloc([]const u8, args.len);
+        var copied: usize = 0;
+        errdefer {
+            for (items[0..copied]) |item| self.gpa.free(item);
+            self.gpa.free(items);
+        }
+        for (args, 0..) |arg, index| {
+            items[index] = try self.gpa.dupe(u8, arg);
+            copied = index + 1;
+        }
+        self.freeOwnedPositional();
+        self.positional_owned = items;
+        self.positional = items;
+    }
+
+    pub const SavedPositional = struct {
+        positional: []const []const u8,
+        owned: ?[]const []const u8,
+    };
+
+    /// Gives a function call or `source` its own positional parameters.
+    pub fn pushPositional(self: *Shell, args: []const []const u8) SavedPositional {
+        const saved = SavedPositional{ .positional = self.positional, .owned = self.positional_owned };
+        self.positional = args;
+        self.positional_owned = null;
+        return saved;
+    }
+
+    pub fn popPositional(self: *Shell, saved: SavedPositional) void {
+        self.freeOwnedPositional();
+        self.positional = saved.positional;
+        self.positional_owned = saved.owned;
+    }
+
+    fn freeOwnedPositional(self: *Shell) void {
+        const items = self.positional_owned orelse return;
+        for (items) |item| self.gpa.free(item);
+        self.gpa.free(items);
+        self.positional_owned = null;
     }
 
     // --- directory stack ----------------------------------------------------
 
     /// `pushd <dir>`: remembers the current directory, then changes to `dir`.
     pub fn pushDir(self: *Shell, path: [:0]const u8) !bool {
-        const previous = (try fs.getCwd(self.gpa)) orelse (try self.gpa.dupe(u8, self.cwd));
+        const previous = try self.currentDir(self.gpa);
         errdefer self.gpa.free(previous);
         if (!try self.setCwd(path)) {
             self.gpa.free(previous);
@@ -429,7 +614,7 @@ pub const Shell = struct {
         const top = self.dir_stack.items[0];
         const z = try self.gpa.dupeZ(u8, top);
         defer self.gpa.free(z);
-        const previous = (try fs.getCwd(self.gpa)) orelse (try self.gpa.dupe(u8, self.cwd));
+        const previous = try self.currentDir(self.gpa);
         errdefer self.gpa.free(previous);
         if (!try self.setCwd(z)) {
             self.gpa.free(previous);
@@ -538,6 +723,23 @@ pub const Shell = struct {
         return self.funcs.get(name);
     }
 
+    pub fn setFuncLine(self: *Shell, name: []const u8, line: u32) !void {
+        const gop = try self.func_lines.getOrPut(name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.func_lines.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = line;
+    }
+
+    /// Line a function's definition starts on; 1 when it is not known.
+    pub fn getFuncLine(self: *const Shell, name: []const u8) u32 {
+        const line = self.func_lines.get(name) orelse 0;
+        return if (line == 0) 1 else line;
+    }
+
     pub fn setAlias(self: *Shell, name: []const u8, val: []const u8) !void {
         const owned = try self.gpa.dupe(u8, val);
         errdefer self.gpa.free(owned);
@@ -555,6 +757,9 @@ pub const Shell = struct {
     }
 
     // --- working directory --------------------------------------------------
+    //
+    // `cwd` (and `PWD`) is the logical working directory: like bash, it keeps
+    // the symlinks a path came through, so it can differ from `getcwd`.
 
     /// Re-reads the process working directory and keeps `PWD` in sync.
     pub fn updateCwd(self: *Shell) !void {
@@ -564,10 +769,78 @@ pub const Shell = struct {
         try self.setEnv("PWD", cwd);
     }
 
-    pub fn setCwd(self: *Shell, path: [:0]const u8) !bool {
-        if (!fs.chdir(path)) return false;
+    /// Changes directory the way `cd` does and returns the `chdir` error.
+    /// Logical by default: `path` is resolved against `cwd` as text, so `..`
+    /// drops the last component even after following a symlink. `physical`
+    /// (`cd -P`) resolves symlinks and takes `PWD` from `getcwd`. On success
+    /// `OLDPWD` holds the previous directory.
+    pub fn changeDir(self: *Shell, path: []const u8, physical: bool) !linux.E {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const previous = try self.currentDir(arena);
+
+        if (!physical) {
+            if (try self.logicalPath(arena, path)) |logical| {
+                if (chdirError(try arena.dupeZ(u8, logical)) == .SUCCESS) {
+                    try self.setLogicalCwd(logical);
+                    try self.setEnv("OLDPWD", previous);
+                    return .SUCCESS;
+                }
+            }
+        }
+        // `-P`, or the logical path did not work out: bash then tries the
+        // path as given.
+        const err = chdirError(try arena.dupeZ(u8, path));
+        if (err != .SUCCESS) return err;
         try self.updateCwd();
-        return true;
+        try self.setEnv("OLDPWD", previous);
+        return .SUCCESS;
+    }
+
+    pub fn setCwd(self: *Shell, path: [:0]const u8) !bool {
+        return try self.changeDir(path, false) == .SUCCESS;
+    }
+
+    /// The logical working directory, or `getcwd` when `cwd` is not absolute
+    /// (a bare test shell).
+    fn currentDir(self: *const Shell, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.cwd.len != 0 and self.cwd[0] == '/') return allocator.dupe(u8, self.cwd);
+        return (try fs.getCwd(allocator)) orelse try allocator.dupe(u8, self.cwd);
+    }
+
+    fn setLogicalCwd(self: *Shell, path: []const u8) !void {
+        const owned = try self.gpa.dupe(u8, path);
+        self.gpa.free(self.cwd);
+        self.cwd = owned;
+        try self.setEnv("PWD", owned);
+    }
+
+    /// `path` resolved against the logical working directory without reading
+    /// symlinks: empty and `.` components drop and `..` removes the component
+    /// before it. Null when that component is not a directory, where bash
+    /// refuses the logical path (`cd missing/..` fails).
+    pub fn logicalPath(self: *const Shell, arena: std.mem.Allocator, path: []const u8) !?[]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        if (path.len == 0 or path[0] != '/') {
+            const base = try self.currentDir(arena);
+            if (base.len == 0 or base[0] != '/') return null;
+            try out.appendSlice(arena, std.mem.trimEnd(u8, base, "/"));
+        }
+        var it = std.mem.splitScalar(u8, path, '/');
+        while (it.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+            if (std.mem.eql(u8, part, "..")) {
+                const here = if (out.items.len == 0) "/" else out.items;
+                if (!fs.isDir(try arena.dupeZ(u8, here))) return null;
+                out.shrinkRetainingCapacity(std.mem.lastIndexOfScalar(u8, out.items, '/') orelse 0);
+                continue;
+            }
+            try out.append(arena, '/');
+            try out.appendSlice(arena, part);
+        }
+        if (out.items.len == 0) return "/";
+        return out.items;
     }
 
     /// `~/src` -> `<HOME>/src`, leaving other paths untouched.
@@ -617,29 +890,24 @@ pub const Shell = struct {
     /// Name of the current git branch, or null when not inside a repository.
     /// Reads `.git/HEAD` directly so no `git` process is needed.
     pub fn gitBranch(self: *const Shell, arena: std.mem.Allocator) !?[]const u8 {
-        var dir_buf: [linux.PATH_MAX]u8 = undefined;
         var current: []const u8 = self.cwd;
 
         var levels: usize = 0;
         while (levels < 32) : (levels += 1) {
-            const head_path = try std.fmt.allocPrint(arena, "{s}/.git/HEAD", .{current});
-            const z = try arena.dupeZ(u8, head_path);
-            if (try fs.readFileAlloc(arena, z, 4096)) |data| {
-                const trimmed = std.mem.trim(u8, data, " \t\r\n");
-                const prefix = "ref: refs/heads/";
-                if (std.mem.startsWith(u8, trimmed, prefix)) {
-                    return try arena.dupe(u8, trimmed[prefix.len..]);
-                }
-                if (trimmed.len >= 7) return try arena.dupe(u8, trimmed[0..7]);
-                return null;
+            const head = (try readGitHead(arena, current)) orelse {
+                // `dirname` returns a prefix of its argument, so no copy is needed.
+                const parent = std.fs.path.dirname(current) orelse return null;
+                if (parent.len == 0 or std.mem.eql(u8, parent, current)) return null;
+                current = parent;
+                continue;
+            };
+            const trimmed = std.mem.trim(u8, head, " \t\r\n");
+            const prefix = "ref: refs/heads/";
+            if (std.mem.startsWith(u8, trimmed, prefix)) {
+                return try arena.dupe(u8, trimmed[prefix.len..]);
             }
-
-            // Walk up one directory.
-            const parent = std.fs.path.dirname(current) orelse return null;
-            if (parent.len == 0 or std.mem.eql(u8, parent, current)) return null;
-            if (parent.len >= dir_buf.len) return null;
-            @memcpy(dir_buf[0..parent.len], parent);
-            current = dir_buf[0..parent.len];
+            if (trimmed.len >= 7) return try arena.dupe(u8, trimmed[0..7]);
+            return null;
         }
         return null;
     }
@@ -681,6 +949,12 @@ pub const Shell = struct {
     /// first. Pids are zeroed as they are reaped, so a stopped job can be
     /// resumed without losing track of the survivors.
     pub fn waitForeground(self: *Shell, job: *jobs.Job) WaitOutcome {
+        return self.waitForegroundStages(job, null);
+    }
+
+    /// `waitForeground` that also records each process's status, in pipeline
+    /// order, for PIPESTATUS and `set -o pipefail`.
+    pub fn waitForegroundStages(self: *Shell, job: *jobs.Job, statuses: ?[]u8) WaitOutcome {
         self.giveTerminal(job.pgid);
 
         var last_status: u8 = job.status;
@@ -699,6 +973,9 @@ pub const Shell = struct {
                             last_status = st.exitCode();
                             last_signal = if (st.kind == .signaled) st.sig else null;
                         }
+                        if (statuses) |out| {
+                            if (idx < out.len) out[idx] = st.exitCode();
+                        }
                         job.pids[idx] = 0;
                     },
                     .stopped => {
@@ -713,8 +990,14 @@ pub const Shell = struct {
                 // Stop the rest of the pipeline too, so the job is coherent.
                 proc.signalGroup(job.pgid, .STOP);
                 self.takeTerminal();
+                const status = 128 +% @as(u8, @intCast(@min(sig, 127)));
+                if (statuses) |out| {
+                    for (job.pids, 0..) |pid, idx| {
+                        if (pid != 0 and idx < out.len) out[idx] = status;
+                    }
+                }
                 return .{
-                    .status = 128 +% @as(u8, @intCast(@min(sig, 127))),
+                    .status = status,
                     .stopped = true,
                     .stopped_signal = sig,
                 };
@@ -733,6 +1016,11 @@ pub const Shell = struct {
         }
 
         self.takeTerminal();
+        // Ctrl-C reached the job, not the shell; stop the command line too,
+        // unless the user trapped SIGINT.
+        if (self.interactive and last_signal == @intFromEnum(linux.SIG.INT) and self.getTrap(@intFromEnum(linux.SIG.INT)) == null) {
+            self.interrupted = true;
+        }
         return .{ .status = last_status, .signal = last_signal };
     }
 
@@ -842,16 +1130,88 @@ pub const Shell = struct {
     }
 };
 
-pub fn cloneValue(allocator: std.mem.Allocator, v: value.Value) !value.Value {
+fn chdirError(path: [:0]const u8) linux.E {
+    return linux.errno(linux.chdir(path.ptr));
+}
+
+/// An inherited `PWD` is kept when it is absolute, has no `.` or `..`
+/// components and still names the current directory, as in bash; that keeps
+/// a symlinked path across `wsh` invocations.
+fn inheritedPwd(pwd: []const u8) bool {
+    if (pwd.len == 0 or pwd[0] != '/') return false;
+    if (std.mem.indexOf(u8, pwd, "//") != null or (pwd.len > 1 and pwd[pwd.len - 1] == '/')) return false;
+    var it = std.mem.splitScalar(u8, pwd, '/');
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    if (pwd.len >= buf.len) return false;
+    @memcpy(buf[0..pwd.len], pwd);
+    buf[pwd.len] = 0;
+    return sameFile(buf[0..pwd.len :0], ".");
+}
+
+fn sameFile(a: [:0]const u8, b: [:0]const u8) bool {
+    var sa: linux.Statx = undefined;
+    var sb: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, a.ptr, 0, .{ .INO = true }, &sa)) != .SUCCESS) return false;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, b.ptr, 0, .{ .INO = true }, &sb)) != .SUCCESS) return false;
+    return sa.ino == sb.ino and sa.dev_major == sb.dev_major and sa.dev_minor == sb.dev_minor;
+}
+
+/// The HEAD file of the repository rooted at `dir`, following the `gitdir:`
+/// pointer a worktree or submodule keeps in a `.git` file.
+fn readGitHead(arena: std.mem.Allocator, dir: []const u8) !?[]const u8 {
+    const head_path = try std.fmt.allocPrintSentinel(arena, "{s}/.git/HEAD", .{dir}, 0);
+    if (try fs.readFileAlloc(arena, head_path, 4096)) |data| return data;
+
+    const dot_git = try std.fmt.allocPrintSentinel(arena, "{s}/.git", .{dir}, 0);
+    const pointer = (try fs.readFileAlloc(arena, dot_git, 4096)) orelse return null;
+    const line = std.mem.trim(u8, pointer, " \t\r\n");
+    const marker = "gitdir: ";
+    if (!std.mem.startsWith(u8, line, marker)) return null;
+    const target = line[marker.len..];
+    const git_dir = if (std.fs.path.isAbsolute(target)) target else try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, target });
+    const worktree_head = try std.fmt.allocPrintSentinel(arena, "{s}/HEAD", .{git_dir}, 0);
+    return fs.readFileAlloc(arena, worktree_head, 4096);
+}
+
+pub fn cloneValue(allocator: std.mem.Allocator, v: value.Value) std.mem.Allocator.Error!value.Value {
     return switch (v) {
         .string => |s| value.Value{ .string = try allocator.dupe(u8, s) },
         .list => |items| blk: {
             const out = try allocator.alloc(value.Value, items.len);
-            for (items, 0..) |item, i| out[i] = try cloneValue(allocator, item);
+            var done: usize = 0;
+            errdefer {
+                for (out[0..done]) |item| freeValue(allocator, item);
+                allocator.free(out);
+            }
+            while (done < items.len) : (done += 1) out[done] = try cloneValue(allocator, items[done]);
             break :blk value.Value{ .list = out };
+        },
+        .map => |entries| blk: {
+            const out = try allocator.alloc(value.Entry, entries.len);
+            var done: usize = 0;
+            errdefer {
+                for (out[0..done]) |entry| freeEntry(allocator, entry);
+                allocator.free(out);
+            }
+            while (done < entries.len) : (done += 1) out[done] = try cloneEntry(allocator, entries[done]);
+            break :blk value.Value{ .map = out };
         },
         else => v,
     };
+}
+
+pub fn cloneEntry(allocator: std.mem.Allocator, entry: value.Entry) std.mem.Allocator.Error!value.Entry {
+    const key = try allocator.dupe(u8, entry.key);
+    errdefer allocator.free(key);
+    return .{ .key = key, .value = try cloneValue(allocator, entry.value) };
+}
+
+pub fn freeEntry(allocator: std.mem.Allocator, entry: value.Entry) void {
+    allocator.free(entry.key);
+    freeValue(allocator, entry.value);
 }
 
 pub fn freeValue(allocator: std.mem.Allocator, v: value.Value) void {
@@ -861,6 +1221,11 @@ pub fn freeValue(allocator: std.mem.Allocator, v: value.Value) void {
             if (items.len == 0) return;
             for (items) |item| freeValue(allocator, item);
             allocator.free(items);
+        },
+        .map => |entries| {
+            if (entries.len == 0) return;
+            for (entries) |entry| freeEntry(allocator, entry);
+            allocator.free(entries);
         },
         else => {},
     }
@@ -925,7 +1290,28 @@ test "traps are stored and cleared by signal number" {
     try std.testing.expectEqualStrings("echo interrupted", sh.getTrap(2).?);
     try std.testing.expect(sh.clearTrap(2));
     try std.testing.expect(sh.getTrap(2) == null);
-    try std.testing.expectError(error.InvalidSignal, sh.setTrap(0, "x"));
+    try sh.setTrap(Shell.exit_trap, "echo bye");
+    const taken = sh.takeTrap(Shell.exit_trap).?;
+    defer a.free(taken);
+    try std.testing.expectEqualStrings("echo bye", taken);
+    try std.testing.expect(sh.getTrap(Shell.exit_trap) == null);
+    try std.testing.expectError(error.InvalidSignal, sh.setTrap(Shell.trap_count, "x"));
+}
+
+test "set -- positional parameters are owned and restored around calls" {
+    const a = std.testing.allocator;
+    var sh = try Shell.initBare(a);
+    defer sh.deinit();
+
+    try sh.setPositional(&.{ "a", "b" });
+    const saved = sh.pushPositional(&.{"call"});
+    try sh.setPositional(&.{"inner"});
+    try std.testing.expectEqualStrings("inner", sh.positional[0]);
+    sh.popPositional(saved);
+    try std.testing.expectEqual(@as(usize, 2), sh.positional.len);
+    try std.testing.expectEqualStrings("b", sh.positional[1]);
+    try sh.setPositional(&.{});
+    try std.testing.expectEqual(@as(usize, 0), sh.positional.len);
 }
 
 test "shortenHome collapses the home prefix" {

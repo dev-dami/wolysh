@@ -59,17 +59,19 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
             const operand = try evaluateInner(context, sh, arena, unary.operand);
             return switch (unary.op) {
                 .not => Value{ .boolean = !operand.truthy() },
-                .neg => switch (operand) {
-                    .int => |integer| Value{ .int = -integer },
-                    .float => |float| Value{ .float = -float },
-                    else => Value{ .int = -(operand.asInt() orelse 0) },
+                .neg => operations.negate(operand) catch |err| switch (err) {
+                    error.NotANumber => reportNotANumber(sh, arena, operand),
+                    else => |other| other,
                 },
             };
         },
         .bin => |binary| {
             const lhs = try evaluateInner(context, sh, arena, binary.lhs);
             const rhs = try evaluateInner(context, sh, arena, binary.rhs);
-            return try operations.binary(arena, binary.op, lhs, rhs);
+            return operations.binary(arena, binary.op, lhs, rhs) catch |err| switch (err) {
+                error.NotANumber => reportNotANumber(sh, arena, operations.nonNumber(lhs, rhs)),
+                else => |other| other,
+            };
         },
         .call => |call| {
             if (try expression_functions.evaluate(sh, arena, call.callee, call.args, context, &evaluateCallback)) |result| {
@@ -77,10 +79,39 @@ fn evaluateInner(context: *EvalContext, sh: *Shell, arena: std.mem.Allocator, ex
             }
             return context.execute_call(sh, arena, call.callee, call.args);
         },
+        .index => |indexing| {
+            const target = try evaluateInner(context, sh, arena, indexing.target);
+            const key = try evaluateInner(context, sh, arena, indexing.index);
+            return expression_functions.indexValue(sh, arena, target, key);
+        },
     }
 }
 
+fn reportNotANumber(sh: *Shell, arena: std.mem.Allocator, operand: Value) Error {
+    const text = operand.renderAlloc(arena) catch |err| return err;
+    sys.writeStr(sh.default_err, "wsh: not a number: '");
+    sys.writeStr(sh.default_err, text);
+    sys.writeStr(sh.default_err, "'\n");
+    return error.ExecutionFailed;
+}
+
+const builtin_names = [_][]const u8{ "status", "pid", "cwd", "host", "argv", "env" };
+
+/// True when a bare name in an expression refers to something: a built-in
+/// name, a shell variable or an environment variable.
+pub fn isBound(sh: *const Shell, name: []const u8) bool {
+    for (builtin_names) |builtin_name| {
+        if (std.mem.eql(u8, name, builtin_name)) return true;
+    }
+    return sh.getVar(name) != null or sh.getEnv(name) != null;
+}
+
 fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value {
+    // The lexer passes `${...}` through as its inner text: `let n = ${#a[@]}`.
+    if (!isPlainName(name)) {
+        const braced = try std.mem.concat(arena, u8, &.{ "${", name, "}" });
+        return Value{ .string = try expand_mod.expandLiteral(sh, arena, braced) };
+    }
     if (std.mem.eql(u8, name, "status")) return Value{ .int = sh.last_status };
     if (std.mem.eql(u8, name, "pid")) return Value{ .int = sh.pid };
     if (std.mem.eql(u8, name, "cwd")) return Value{ .string = try arena.dupe(u8, sh.cwd) };
@@ -103,6 +134,14 @@ fn evalIdent(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error!Value
     if (sh.getVar(name)) |result| return result;
     if (sh.getEnv(name)) |environment| return Value{ .string = try arena.dupe(u8, environment) };
     return .none;
+}
+
+fn isPlainName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+    return true;
 }
 
 pub fn isFunction(name: []const u8) bool {

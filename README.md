@@ -99,13 +99,12 @@ Add `$HOME/.local/bin` to your existing shell's `PATH` if it is not already ther
 
 ## Project status
 
-Early stage and not a Bash or POSIX drop-in. Arithmetic expansion `$((...))`,
-brace expansion, `<<-`/`<<<` inputs, and the common builtins are in place;
-missing pieces include POSIX control flow (`if cmd; then`, `case`, `until`),
-process substitution `<( )`, the `${name:=}` / `${name:?}` / pattern-removal
-parameter operators, and extended globbing. See the
-[language guide](docs/language.md) for features, configuration, key bindings,
-and the current limitations.
+Early stage and not yet a Bash drop-in. POSIX and Bash control flow (`case`,
+`until`, `[[ ]]`, `(( ))`, C-style `for`), functions, indexed and associative
+arrays, Bash parameter expansion, process substitution, extended globbing,
+`set -euo pipefail` and traps are implemented and compared against Bash in the
+test suite. See the [language guide](docs/language.md) for features,
+configuration, key bindings, and the remaining differences.
 
 Recent changes are recorded in the [changelog](CHANGELOG.md).
 
