@@ -88,6 +88,11 @@ EXPRESSIONS = [
     ("0 ? 1 / 0 : 2", "2"),
 ]
 
+# `test` rows recorded from bash 5.3; bash 5.2 returns 1 for `-t abc`.
+TEST_CASES_BASH_5_3 = [
+    ("-t abc", 2),
+]
+
 # Rows recorded from bash 5.3, whose handling differs in some older releases.
 EXPRESSIONS_BASH_5_3 = [
     ("0 && 2 ** -1", "0"),
@@ -277,7 +282,6 @@ TEST_CASES = [
     ("a == a", 0),
     ("a != a", 1),
     ("-t 99", 1),
-    ("-t abc", 2),
     ("-v never_set_name", 1),
     ("-v HOME", 0),
     ("-o errexit", 1),
@@ -308,7 +312,7 @@ FILE_CASES = [
 
 
 class TestBuiltinTests(unittest.TestCase):
-    def check(self, args, want, cwd=ROOT):
+    def check(self, args, want, cwd=ROOT, compare_bash=True):
         for name, command in (("test", f"test {args}"), ("[", f"[ {args} ]")):
             with self.subTest(command=command):
                 result = run_shell(command, cwd)
@@ -316,12 +320,16 @@ class TestBuiltinTests(unittest.TestCase):
                 self.assertEqual(result.stdout, b"")
                 if want == 2:
                     self.assertTrue(result.stderr.startswith(f"wsh: {name}: ".encode()), result.stderr)
-                if BASH:
+                if compare_bash and BASH:
                     self.assertEqual(run_bash(command, cwd).returncode, want, f"bash: {command!r}")
 
     def test_argument_rules_and_operators_match_bash(self):
         for args, want in TEST_CASES:
             self.check(args, want)
+
+    def test_argument_rules_match_bash_5_3(self):
+        for args, want in TEST_CASES_BASH_5_3:
+            self.check(args, want, compare_bash=False)
 
     def test_file_operators_match_bash(self):
         if not BASH:

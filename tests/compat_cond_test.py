@@ -172,17 +172,21 @@ class ConditionalTests(unittest.TestCase):
     def test_xtrace_shows_tests_like_bash(self):
         command = (
             "set -x; x=1; [[ $x == 1 && a < b ]]; (( x + $x )); for ((i=0;i<1;i++)); do :; done\n"
-            "[[ abc == \"a*\" ]]; [[ x ]]; [[ ! a == b ]]"
+            "[[ x ]]; [[ ! a == b ]]"
         )
         want = (
             "+ x=1\n+ [[ 1 == 1 ]]\n+ [[ a < b ]]\n+ ((  x + 1  ))\n"
             "+ (( i=0 ))\n+ (( i<1 ))\n+ :\n+ (( i++ ))\n+ (( i<1 ))\n"
-            "+ [[ abc == a\\* ]]\n+ [[ -n x ]]\n+ [[ ! a == b ]]\n"
+            "+ [[ -n x ]]\n+ [[ ! a == b ]]\n"
         )
         result = run_shell(command)
         self.assertEqual(result.stderr.decode(), want)
         if BASH:
             self.assertEqual(run_bash(command).stderr.decode(), want)
+        # Recorded from bash 5.3, which escapes only the glob characters of a
+        # quoted pattern; bash 5.2 escapes every quoted character.
+        quoted = run_shell('set -x; [[ abc == "a*" ]]')
+        self.assertEqual(quoted.stderr.decode(), "+ [[ abc == a\\* ]]\n")
 
 
 if __name__ == "__main__":

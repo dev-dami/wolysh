@@ -109,7 +109,6 @@ PRINTF_CASES = [
     ["%d %d %d\\n", "'A", '"B', "0x1f"],
     ["%d\\n", "abc"],
     ["%d\\n", "12abc"],
-    ["%d\\n", "99999999999999999999"],
     ["%x %o\\n", "08", "0x"],
     ["%s %s\\n", "a", "b", "c"],
     ["%s\\n"],
@@ -141,6 +140,13 @@ class PrintfTests(unittest.TestCase):
                 self.assertEqual(ours.stdout, theirs.stdout)
                 self.assertEqual(ours.returncode, theirs.returncode)
                 self.assertEqual(bool(ours.stderr), bool(theirs.stderr))
+
+    def test_out_of_range_number_matches_bash_5_3(self):
+        # Recorded from bash 5.3; bash 5.2 prints the same value but exits 0.
+        result = run_shell("printf '%d\\n' 99999999999999999999")
+        self.assertEqual(result.stdout, b"9223372036854775807\n")
+        self.assertEqual(result.stderr, b"wsh: printf: 99999999999999999999: Numerical result out of range\n")
+        self.assertEqual(result.returncode, 1)
 
     def test_invalid_number_is_reported(self):
         result = run_shell("printf '%d\\n' abc")
