@@ -19,6 +19,7 @@ const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const compound_assign = @import("compound.zig");
+const test_ops = @import("builtins/test.zig");
 
 pub const Error = error{ SyntaxError, OutOfMemory } || std.mem.Allocator.Error;
 
@@ -415,7 +416,7 @@ pub const Parser = struct {
         else if (isKeyword(t, "until"))
             .{ .while_ = try self.parseWhileClause(true) }
         else if (isKeyword(t, "for"))
-            .{ .for_ = try self.parseForClause(false) }
+            (try self.parseArithFor()) orelse .{ .for_ = try self.parseForClause(false) }
         else if (isKeyword(t, "select"))
             .{ .select_ = try self.parseForClause(true) }
         else if (isKeyword(t, "case"))
@@ -426,9 +427,161 @@ pub const Parser = struct {
             .{ .statement = try self.parseLoopControl(true) }
         else if (isKeyword(t, "continue"))
             .{ .statement = try self.parseLoopControl(false) }
+        else if (t.tag == .word and eql(t.text, "[["))
+            .{ .cond = try self.parseCondCommand() }
         else
             return null;
         return try self.newCompound(kind, start);
+    }
+
+    /// `(( expression ))`, or null when the parentheses do not close with
+    /// `))`, which makes them nested subshells.
+    fn parseArithCommand(self: *Parser) Error!?*ast.Compound {
+        const start = self.tok.start;
+        const parens = self.doubleParen() orelse return null;
+        self.skipPast(parens.close + 2);
+        return try self.newCompound(.{ .arith = parens.text }, start);
+    }
+
+    const DoubleParen = struct {
+        /// The text between `((` and `))`.
+        text: []const u8,
+        /// Index of the first `)` of the closing `))`.
+        close: usize,
+    };
+
+    /// The `((` at the current token and its contents, when `))` closes it.
+    fn doubleParen(self: *const Parser) ?DoubleParen {
+        if (self.tok.tag != .lparen) return null;
+        const src = self.lex.src;
+        const open = self.tok.start;
+        if (open + 1 >= src.len or src[open + 1] != '(') return null;
+        const close = lexer.arithmeticClose(src, open) orelse return null;
+        return .{ .text = src[open + 2 .. close], .close = close };
+    }
+
+    /// Moves on to the token at `pos`, past source the parser has read itself.
+    fn skipPast(self: *Parser, pos: usize) void {
+        const start_line = self.tok.line - std.mem.count(u8, self.tok.text, "\n");
+        self.lex.line = start_line + std.mem.count(u8, self.lex.src[self.tok.start..pos], "\n");
+        self.lex.pos = pos;
+        self.lex.depth = self.tok.depth_before;
+        self.lex.group_depth = self.tok.group_depth_before;
+        self.tok = self.lex.next();
+    }
+
+    /// `for (( init; test; step ))` with a `do ... done` or `{ }` body, or
+    /// null, consuming nothing, for a `for NAME` loop.
+    fn parseArithFor(self: *Parser) Error!?ast.Compound.Kind {
+        const saved = self.save();
+        self.advance(); // `for`
+        self.setMode(.word);
+        const parens = self.doubleParen() orelse {
+            self.restore(saved);
+            return null;
+        };
+        const parts = splitArithFor(parens.text) orelse return self.fail("expected 'for (( init; test; step ))'");
+        self.skipPast(parens.close + 2);
+        self.skipSeparators();
+        const body = if (self.tok.tag == .lbrace) try self.parseBlock() else try self.parseDoBody();
+        return .{ .arith_for = .{ .init = parts[0], .cond = parts[1], .step = parts[2], .body = body } };
+    }
+
+    // --- [[ ]] ------------------------------------------------------------------
+
+    /// `[[ expression ]]`, with bash's precedence: `!` binds tightest, then
+    /// `&&`, then `||`. The current token is `[[`.
+    fn parseCondCommand(self: *Parser) Error!*ast.Cond {
+        self.advance();
+        if (self.atCondEnd()) return self.fail("expected an expression after '[['");
+        const cond = try self.parseCondOr();
+        if (!self.atCondEnd()) return self.fail("expected ']]' to close the conditional expression");
+        self.advance();
+        return cond;
+    }
+
+    fn atCondEnd(self: *const Parser) bool {
+        return self.tok.tag == .word and eql(self.tok.text, "]]");
+    }
+
+    fn newCond(self: *Parser, cond: ast.Cond) Error!*ast.Cond {
+        const node = try self.arena.create(ast.Cond);
+        node.* = cond;
+        return node;
+    }
+
+    fn parseCondOr(self: *Parser) Error!*ast.Cond {
+        var lhs = try self.parseCondAnd();
+        while (self.tok.tag == .pipepipe) {
+            self.advance();
+            const rhs = try self.parseCondAnd();
+            lhs = try self.newCond(.{ .or_ = .{ .lhs = lhs, .rhs = rhs } });
+        }
+        return lhs;
+    }
+
+    fn parseCondAnd(self: *Parser) Error!*ast.Cond {
+        var lhs = try self.parseCondTerm();
+        while (self.tok.tag == .ampamp) {
+            self.advance();
+            const rhs = try self.parseCondTerm();
+            lhs = try self.newCond(.{ .and_ = .{ .lhs = lhs, .rhs = rhs } });
+        }
+        return lhs;
+    }
+
+    /// One operand of `&&` or `||`. Newlines may surround it, but not split
+    /// a test from its operator.
+    fn parseCondTerm(self: *Parser) Error!*ast.Cond {
+        self.skipNewlines();
+        const term = try self.parseCondPrimary();
+        self.skipNewlines();
+        return term;
+    }
+
+    fn parseCondPrimary(self: *Parser) Error!*ast.Cond {
+        switch (self.tok.tag) {
+            .lparen => {
+                self.advance();
+                const inner = try self.parseCondOr();
+                if (self.tok.tag != .rparen) return self.fail("expected ')' in the conditional expression");
+                self.advance();
+                return inner;
+            },
+            .word => if (self.atCondEnd()) return self.fail("expected an operand in the conditional expression"),
+            else => return self.fail("unexpected token in the conditional expression"),
+        }
+        const first = self.tok.text;
+        self.advance();
+        if (eql(first, "!")) return self.newCond(.{ .not = try self.parseCondTerm() });
+        if (test_ops.isUnaryOp(first)) {
+            if (self.tok.tag != .word or self.atCondEnd()) return self.fail("expected an argument to the conditional unary operator");
+            const operand = self.tok.text;
+            self.advance();
+            return self.newCond(.{ .unary = .{ .op = first, .operand = operand } });
+        }
+        const op: []const u8 = switch (self.tok.tag) {
+            .in => "<",
+            .out => ">",
+            .word => if (eql(self.tok.text, "=~") or test_ops.isBinaryOp(self.tok.text))
+                self.tok.text
+            else if (self.atCondEnd())
+                return self.lone(first)
+            else
+                return self.fail("expected a conditional binary operator"),
+            // `[[ x ]]` is `[[ -n x ]]`, as with `test`.
+            .ampamp, .pipepipe, .rparen => return self.lone(first),
+            else => return self.fail("expected a conditional binary operator"),
+        };
+        if (eql(op, "=~")) self.tok = self.lex.nextRegexWord() else self.advance();
+        if (self.tok.tag != .word or self.atCondEnd()) return self.fail("expected an argument to the conditional binary operator");
+        const rhs = self.tok.text;
+        self.advance();
+        return self.newCond(.{ .binary = .{ .op = op, .lhs = first, .rhs = rhs } });
+    }
+
+    fn lone(self: *Parser, word: ast.Word) Error!*ast.Cond {
+        return self.newCond(.{ .unary = .{ .op = "-n", .operand = word } });
     }
 
     /// `kind` as a node whose text runs from `start` to the current token.
@@ -998,7 +1151,11 @@ pub const Parser = struct {
         var last_word: ?lexer.Token = null;
         var subshell: ?[]ast.Stmt = null;
         var group: ?[]ast.Stmt = null;
-        const compound: ?*ast.Compound = if (self.tok.tag == .word) try self.parseCompound() else null;
+        const compound: ?*ast.Compound = switch (self.tok.tag) {
+            .word => try self.parseCompound(),
+            .lparen => try self.parseArithCommand(),
+            else => null,
+        };
 
         while (true) {
             const after_body = subshell != null or group != null or compound != null;
@@ -1531,6 +1688,31 @@ pub const Parser = struct {
 };
 
 /// The compound command a statement consists of, for tests.
+/// The init, test and step of `for (( init; test; step ))`, split at the two
+/// semicolons outside parentheses; null when there are not exactly two.
+fn splitArithFor(text: []const u8) ?[3][]const u8 {
+    var parts: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var depth: usize = 0;
+    var start: usize = 0;
+    for (text, 0..) |c, i| {
+        switch (c) {
+            '(' => depth += 1,
+            ')' => depth -|= 1,
+            ';' => if (depth == 0) {
+                if (count == 2) return null;
+                parts[count] = text[start..i];
+                count += 1;
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    if (count != 2) return null;
+    parts[2] = text[start..];
+    return parts;
+}
+
 fn compoundOf(stmt: ast.Stmt) ast.Compound.Kind {
     return stmt.pipeline.commands[0].compound.?.kind;
 }
@@ -2054,6 +2236,66 @@ test "compound commands take redirections, pipes and lists" {
 
     try std.testing.expect(prog.stmts[2].pipeline.background);
     try std.testing.expectEqual(ast.RedirectKind.in, prog.stmts[2].pipeline.commands[0].redirects[0].kind);
+}
+
+test "parse [[ ]] with bash precedence and operand words" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\[[ -f $f && ! $a == "x y"* || b < c ]] > out
+        \\[[ $x =~ ^(a| b)c$ ]]
+        \\[[ word ]]
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 3), prog.stmts.len);
+
+    const first = prog.stmts[0].pipeline.commands[0];
+    try std.testing.expectEqual(ast.RedirectKind.out, first.redirects[0].kind);
+    const either = first.compound.?.kind.cond.or_;
+    const both = either.lhs.and_;
+    try std.testing.expectEqualStrings("-f", both.lhs.unary.op);
+    try std.testing.expectEqualStrings("$f", both.lhs.unary.operand);
+    try std.testing.expectEqualStrings("\"x y\"*", both.rhs.not.binary.rhs);
+    try std.testing.expectEqualStrings("<", either.rhs.binary.op);
+
+    // The regular expression is one word, spaces inside its group included.
+    const re = compoundOf(prog.stmts[1]).cond.binary;
+    try std.testing.expectEqualStrings("=~", re.op);
+    try std.testing.expectEqualStrings("^(a| b)c$", re.rhs);
+
+    try std.testing.expectEqualStrings("-n", compoundOf(prog.stmts[2]).cond.unary.op);
+}
+
+test "parse (( )), nested subshells and for (( ))" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\(( i < (n + 1) ))
+        \\((echo nested) )
+        \\for ((i = 0; i < 3; i++)); do echo $i; done
+        \\for (( ; ; )) { break; }
+        \\echo after
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 5), prog.stmts.len);
+    try std.testing.expectEqualStrings(" i < (n + 1) ", compoundOf(prog.stmts[0]).arith);
+    try std.testing.expect(prog.stmts[1].pipeline.commands[0].subshell != null);
+    const loop = compoundOf(prog.stmts[2]).arith_for;
+    try std.testing.expectEqualStrings("i = 0", loop.init);
+    try std.testing.expectEqualStrings(" i < 3", loop.cond);
+    try std.testing.expectEqualStrings(" i++", loop.step);
+    try std.testing.expectEqualStrings(" ", compoundOf(prog.stmts[3]).arith_for.cond);
+    try std.testing.expectEqual(@as(u32, 5), prog.stmts[4].pipeline.line);
+}
+
+test "malformed [[ ]] and for (( )) are syntax errors" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "[[ ]]", "[[ a == ]]", "[[ -f ]]", "[[ a\n== a ]]", "[[ a == b", "for ((i=0; i<3)); do :; done" }) |src| {
+        var p = Parser.init(arena, src);
+        try std.testing.expectError(error.SyntaxError, p.parseProgram());
+    }
 }
 
 test "native conditions are expressions first, then commands" {

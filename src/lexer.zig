@@ -231,6 +231,34 @@ pub fn closingParen(src: []const u8, open_index: usize) ?usize {
     return if (lx.skipExpansion()) lx.pos - 1 else null;
 }
 
+/// Index of the first `)` of the `))` closing the `((` whose first `(` is at
+/// `open`, or null when the parentheses close some other way, as in
+/// `((cd /tmp; ls) )`, which is a subshell inside a subshell.
+pub fn arithmeticClose(src: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var i = open + 2;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '\\' => i += 1,
+            '\'' => i = std.mem.indexOfScalarPos(u8, src, i + 1, '\'') orelse return null,
+            '"' => {
+                i += 1;
+                while (i < src.len and src[i] != '"') : (i += 1) {
+                    if (src[i] == '\\') i += 1;
+                }
+                if (i >= src.len) return null;
+            },
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return if (i + 1 < src.len and src[i + 1] == ')') i else null;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// Characters that always end a command word, in both modes.
 fn isStructural(c: u8) bool {
     return switch (c) {
@@ -800,6 +828,53 @@ pub const Lexer = struct {
             self.pos += 1;
         }
         // An unquoted `{`/`}` that is not standalone still belongs to the word.
+        return self.tok(.word, start, depth_before);
+    }
+
+    /// The word after `=~` in `[[ ]]`, read the way bash reads a regular
+    /// expression: `|` and parentheses belong to it, and so does whitespace
+    /// inside parentheses.
+    pub fn nextRegexWord(self: *Lexer) Token {
+        self.skipTrivia();
+        const start = self.pos;
+        const depth_before = self.depth;
+        var parens: usize = 0;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '\n') break;
+            if (parens == 0 and (isSpace(c) or c == ';' or c == '&' or c == '<' or c == '>' or c == ')')) break;
+            switch (c) {
+                '(' => parens += 1,
+                ')' => parens -= 1,
+                '\\' => {
+                    self.pos = @min(self.pos + 2, self.src.len);
+                    continue;
+                },
+                '\'', '"' => {
+                    _ = self.scanQuoted(self.pos, depth_before, if (c == '"') .dquote else .squote);
+                    continue;
+                },
+                '`' => {
+                    self.skipBackticks();
+                    continue;
+                },
+                '$' => if (self.pos + 1 < self.src.len) switch (self.src[self.pos + 1]) {
+                    '(', '{' => {
+                        _ = self.skipExpansion();
+                        continue;
+                    },
+                    '\'' => {
+                        self.skipAnsiC();
+                        continue;
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+            self.pos += 1;
+        }
+        // Nothing to read: the parser reports whatever comes instead.
+        if (self.pos == start) return self.next();
         return self.tok(.word, start, depth_before);
     }
 };

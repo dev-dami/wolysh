@@ -90,7 +90,9 @@ fn runLink(sh: *Shell, link: ast.Pipeline, more_follow: bool, runtime: Runtime) 
 
 /// A simple command, `(( ))` or `[[ ]]`: what the DEBUG trap runs before.
 fn runsAsCommand(cmd: ast.Command) bool {
-    return cmd.subshell == null and cmd.group == null and cmd.compound == null;
+    if (cmd.subshell != null or cmd.group != null) return false;
+    const compound = cmd.compound orelse return true;
+    return compound.kind.isTest();
 }
 
 /// The statements a forked stage runs for a subshell, group or compound
@@ -116,7 +118,7 @@ fn invert(status: u8) u8 {
 const Outcome = struct {
     /// Each stage's status for a multi-command pipeline.
     statuses: []const u8 = &.{},
-    /// The command ran as a `{ ...; }` group or compound command in this
+    /// The command ran as a `{ ...; }` group, loop, `if` or `case` in this
     /// shell (an alias with operators does too).
     grouped: bool = false,
 };
@@ -278,7 +280,7 @@ fn runSingle(
     defer scope.restore();
 
     if ((cmd.group != null or cmd.compound != null) and !background) {
-        outcome.grouped = true;
+        outcome.grouped = if (cmd.compound) |compound| !compound.kind.isTest() else true;
         const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
         defer high.restore();
         const saved = redirect.Fds{ .in = sh.default_in, .out = sh.default_out, .err = sh.default_err };
@@ -388,6 +390,8 @@ fn startBackground(
     sh.last_bg_pid = last_pid;
 
     const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, false) catch return 1;
+    // As in bash, only an interactive shell announces the job.
+    if (!sh.interactive) return 0;
     var buf: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job.id, last_pid }) catch return 0;
     sys.writeStr(sh.default_err, line);

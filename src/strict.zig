@@ -302,6 +302,18 @@ pub fn traceCommand(sh: *Shell, words: []const []const u8) void {
 }
 
 /// `eval` and `source` trace their commands one level deeper, as in bash.
+/// `set -x` for `[[ ]]` and `(( ))`, which bash shows as written after
+/// expansion rather than as quoted words.
+pub fn traceText(sh: *Shell, text: []const u8) void {
+    if (!sh.options.xtrace or expanding_ps4) return;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(sh.gpa);
+    appendPrefix(sh, &line) catch return outOfMemory(sh);
+    line.appendSlice(sh.gpa, text) catch return outOfMemory(sh);
+    line.append(sh.gpa, '\n') catch return outOfMemory(sh);
+    sys.writeStr(sh.default_err, line.items);
+}
+
 pub fn traceDeeper() void {
     trace_level += 1;
 }

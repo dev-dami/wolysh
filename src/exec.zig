@@ -21,6 +21,7 @@ const pipeline = @import("executor/pipeline.zig");
 const session = @import("interactive/session.zig");
 const strict = @import("strict.zig");
 const procsub = @import("executor/procsub.zig");
+const conditional = @import("executor/conditional.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -547,7 +548,79 @@ fn runCompound(sh: *Shell, compound: *const ast.Compound) u8 {
         .case_ => |case| runCase(sh, case),
         .select_ => |loop| runSelect(sh, loop),
         .statement => |stmt| runStmt(sh, stmt),
+        .cond => |cond| runCond(sh, cond),
+        .arith => |text| runArith(sh, text),
+        .arith_for => |loop| runArithFor(sh, loop),
     };
+}
+
+fn runCond(sh: *Shell, cond: *const ast.Cond) u8 {
+    // `[[ -s <(cmd) ]]` keeps the substitution open while the test runs.
+    const substitutions = procsub.mark();
+    defer procsub.release(substitutions);
+    const passed = conditional.evaluate(sh, sh.scratch(), cond) catch |err| return switch (err) {
+        error.BadRegex => 2,
+        else => arithFailed(sh, "[[", err),
+    };
+    return if (passed) 0 else 1;
+}
+
+/// `(( expression ))`: 0 when the expression is non-zero.
+fn runArith(sh: *Shell, text: []const u8) u8 {
+    const n = arithmetic(sh, text) catch |err| return arithFailed(sh, "((", err);
+    return if (n != 0) 0 else 1;
+}
+
+fn runArithFor(sh: *Shell, loop: ast.ArithFor) u8 {
+    if (!isBlank(loop.init)) _ = arithmetic(sh, loop.init) catch |err| return arithFailed(sh, "((", err);
+    var scope = LoopScope.enter(sh);
+    defer scope.leave(sh);
+    scope.install(sh);
+
+    var status: u8 = 0;
+    while (!sh.interrupted) {
+        scope.nextIteration();
+        if (!isBlank(loop.cond)) {
+            const n = arithmetic(sh, loop.cond) catch |err| return arithFailed(sh, "((", err);
+            if (n == 0) break;
+        }
+        status = runStmts(sh, loop.body.stmts);
+        sh.last_status = status;
+        switch (afterBody(sh)) {
+            .next => {},
+            .stop, .leave => break,
+        }
+        if (!isBlank(loop.step)) _ = arithmetic(sh, loop.step) catch |err| return arithFailed(sh, "((", err);
+    }
+    return status;
+}
+
+fn isBlank(text: []const u8) bool {
+    return std.mem.trim(u8, text, " \t\r\n").len == 0;
+}
+
+/// Expands and evaluates the text of `(( ))` or one part of `for (( ))`,
+/// which `set -x` shows the way bash does.
+fn arithmetic(sh: *Shell, text: []const u8) arith.Error!i64 {
+    const arena = sh.scratch();
+    const expanded = try arith.expandText(sh, arena, text);
+    if (sh.options.xtrace) strict.traceText(sh, try std.fmt.allocPrint(arena, "(( {s} ))", .{expanded}));
+    return arith.evaluateExpanded(sh, arena, expanded);
+}
+
+/// A failed `((` or `[[` evaluation, worded like bash:
+/// `((: 1/0 : division by 0 (error token is "0 ")`.
+fn arithFailed(sh: *Shell, name: []const u8, err: anyerror) u8 {
+    switch (err) {
+        error.InvalidArithmetic, error.DivisionByZero => {
+            const detail = arith.takeErrorMessage() orelse "arithmetic syntax error";
+            var buf: [1100]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}: {s}\n", .{ name, detail }) catch "wsh: arithmetic error\n";
+            sys.writeStr(sh.default_err, msg);
+            return 1;
+        },
+        else => return exprError(sh, err),
+    }
 }
 
 // --- expression evaluation --------------------------------------------------
@@ -1005,6 +1078,14 @@ test "isComplete distinguishes open constructs from real errors" {
 
     // And a closed block is complete.
     try testing.expect(isComplete("if true {\n echo hi\n}"));
+
+    // `[[` waits for its `]]`, and `for ((...))` for its body.
+    try testing.expect(!isComplete("[[ -n $x &&"));
+    try testing.expect(!isComplete("[[ a == b"));
+    try testing.expect(isComplete("[[ a < b ]] && echo yes"));
+    try testing.expect(isComplete("echo [["));
+    try testing.expect(!isComplete("for ((i = 0; i < 3; i++))"));
+    try testing.expect(isComplete("(( i > 2 ))"));
 }
 
 test "isComplete knows about groups, here-strings and tab-stripping here-documents" {

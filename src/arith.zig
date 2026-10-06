@@ -76,7 +76,7 @@ fn isIdentChar(c: u8) bool {
 
 /// Replaces `$` expansions and command substitutions with their values and
 /// drops double quotes, leaving everything else for the evaluator.
-fn expandText(sh: *shell.Shell, arena: std.mem.Allocator, src: []const u8) Error![]const u8 {
+pub fn expandText(sh: *shell.Shell, arena: std.mem.Allocator, src: []const u8) Error![]const u8 {
     if (std.mem.indexOfAny(u8, src, "$`\"\\") == null) return src;
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;

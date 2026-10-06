@@ -199,22 +199,13 @@ See [`examples/config`](../examples/config) for a working example.
 
 ## Known limitations
 
-- No POSIX control flow: `if cmd; then ... fi`, `case`, and `until` are not
-  implemented; use `if expr { ... }`, `while`, and `for`.
-- No process substitution (`<( )`, `>( )`).
-- Parameter expansion stops at `$var`, `${var}`, `${#var}`, `${var:-fallback}`,
-  and `${var:+alt}`: `${name:=}`, `${name:?}`, and the pattern-removal operators
-  (`${var#pat}`, `${var%pat}`) are not implemented.
-- Globbing covers `*`, `?`, and `[abc]` classes only; extended globbing
-  (`+( )`, `@( )`, `!( )`) is not implemented.
-- Arithmetic expansion implements the common integer operators, not the full
-  POSIX arithmetic grammar.
-- A bare name in argument position that matches a variable expands to its
-  value (this is what makes `for file in ... { print file }` work). Quote a
-  literal name when it collides, e.g. `unset "PATH"`.
-- Aliases expand words only; use a function for pipelines or redirects.
-- The editor counts each Unicode code point as one column, so wide or combining
-  characters may render imperfectly.
+- `$name` on an indexed array expands to every element, as it does for wsh
+  lists; Bash gives element 0. Write `${name[0]}` in scripts meant for both
+  shells, including for `$BASH_REMATCH`.
+- `BASH_COMMAND` is not set, so a DEBUG trap cannot see the command about to
+  run.
+- `<` and `>` in `[[ ]]` compare bytes; Bash orders them by the current
+  locale's collation.
 
 See the [PTY tests](../tests/pty_test.py) and [contributor guide](../CONTRIBUTING.md)
 for verification instructions.

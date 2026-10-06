@@ -110,6 +110,8 @@ pub fn isComplete(src: []const u8) bool {
     var braces: i32 = 0;
     var parens: i32 = 0;
     var brackets: i32 = 0;
+    // Open `[[ ... ]]` tests, whose `]]` may come on a later line.
+    var conds: i32 = 0;
     var last: lexer.Tag = .eof;
     var last_text: []const u8 = "";
     var heredoc_delimiters: [64]Delimiter = undefined;
@@ -123,6 +125,10 @@ pub fn isComplete(src: []const u8) bool {
         if (tok.tag == .eof) {
             if (heredoc_count != 0 or needs_heredoc_delimiter) return false;
             break;
+        }
+        if (tok.tag == .word) {
+            if (blocks.command_start and eql(tok.text, "[[")) conds += 1;
+            if (conds > 0 and eql(tok.text, "]]")) conds -= 1;
         }
         blocks.see(tok);
         if (needs_heredoc_delimiter) {
@@ -154,7 +160,7 @@ pub fn isComplete(src: []const u8) bool {
         }
     }
 
-    if (braces > 0 or parens > 0 or brackets > 0) return false;
+    if (braces > 0 or parens > 0 or brackets > 0 or conds > 0) return false;
     if (blocks.open()) return false;
     if (expectsMore(last)) return false;
     if (last == .word and wordExpectsMore(last_text)) return false;
