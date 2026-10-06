@@ -718,16 +718,20 @@ const Arith = struct {
     fn lookup(self: *Arith, name: []const u8) Error!i64 {
         if (self.noeval != 0) return 0;
         if (std.mem.indexOfScalar(u8, name, '[')) |open| {
-            return self.lookupElement(name[0..open], name[open + 1 .. name.len - 1], name);
+            return self.lookupElement(name[0..open], name[open + 1 .. name.len - 1]);
         }
         // `getVar` also computes RANDOM, SECONDS and the other dynamic names.
         if (self.sh.getVar(name)) |v| return self.valueOf(v);
         if (self.sh.getEnv(name)) |s| return self.nested(s);
-        if (self.sh.options.nounset) {
-            setMessage("{s}: unbound variable", .{name});
-            return error.InvalidArithmetic;
-        }
+        if (self.sh.options.nounset) return self.unbound(name);
         return 0;
+    }
+
+    /// `set -u` met an unset name. As in bash this is an expansion error,
+    /// which ends a script, rather than an arithmetic one.
+    fn unbound(self: *Arith, name: []const u8) Error {
+        expand.printError(self.sh, "wsh: {s}: unbound variable\n", .{name});
+        return error.UnboundVariable;
     }
 
     /// A stored value: numbers as they are, text evaluated in turn, and an
@@ -748,8 +752,9 @@ const Arith = struct {
     }
 
     /// `a[i]` and `m[key]`: an indexed subscript is itself arithmetic, and a
-    /// negative one counts from the end.
-    fn lookupElement(self: *Arith, base: []const u8, subscript: []const u8, whole: []const u8) Error!i64 {
+    /// negative one counts from the end. A missing element of an existing
+    /// array is 0 even under `set -u`, as in bash.
+    fn lookupElement(self: *Arith, base: []const u8, subscript: []const u8) Error!i64 {
         const stored = self.sh.getVar(base) orelse if (self.sh.getEnv(base)) |s| value.Value{ .string = s } else null;
         const found: ?value.Value = if (stored) |v| switch (v) {
             .map => |entries| for (entries) |entry| {
@@ -766,10 +771,7 @@ const Arith = struct {
         if (found) |v| {
             if (v != .none) return self.valueOf(v);
         }
-        if (self.sh.options.nounset) {
-            setMessage("{s}: unbound variable", .{whole});
-            return error.InvalidArithmetic;
-        }
+        if (stored == null and self.sh.options.nounset) return self.unbound(base);
         return 0;
     }
 

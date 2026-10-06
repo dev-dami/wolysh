@@ -286,7 +286,7 @@ test "trap stores, prints and resets handlers" {
 
 var trap_hits: usize = 0;
 
-fn countingRunner(_: *Shell, _: []const u8) u8 {
+fn countingRunner(_: *Shell, _: []const u8, _: u32) u8 {
     trap_hits += 1;
     return 0;
 }

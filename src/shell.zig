@@ -99,8 +99,9 @@ pub const Shell = struct {
     /// Trap handler source per trap id: `exit_trap`, the signal numbers, then
     /// the DEBUG, ERR and RETURN pseudo-signals. An empty handler ignores.
     traps: [trap_count]?[]const u8 = [_]?[]const u8{null} ** trap_count,
-    /// Runs a trap handler's source; installed by `exec.zig` (see `install`).
-    trap_runner: ?*const fn (*Shell, []const u8) u8 = null,
+    /// Runs a trap handler's source, numbering its lines from the given one;
+    /// installed by `exec.zig` (see `install`).
+    trap_runner: ?*const fn (*Shell, []const u8, u32) u8 = null,
     /// Directories saved by `pushd`; index 0 is the most recent.
     dir_stack: std.ArrayList([]const u8) = .empty,
 

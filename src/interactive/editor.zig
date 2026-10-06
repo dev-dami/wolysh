@@ -1158,7 +1158,7 @@ pub const Editor = struct {
         self.write(term.paste_off);
         if (self.raw) |raw| raw.disable();
         const saved_status = self.sh.last_status;
-        const status = runner(self.sh, source);
+        const status = runner(self.sh, source, 1);
         self.sh.last_status = saved_status;
         if (self.raw) |raw| {
             if (term.RawMode.enable(self.in_fd)) |again| raw.* = again;

@@ -116,6 +116,20 @@ class SetBuiltinTests(BashComparison):
         self.assertEqual(result.stdout, b"eux\nfuC\n")
 
 
+class NounsetArithmeticTests(BashComparison):
+    def test_missing_array_elements_are_zero(self):
+        self.assert_like_bash("set -u; a=(); (( a[2] += 1 )); echo ${a[2]}")
+        self.assert_like_bash("set -u; declare -A m=(); (( m[k] += 2 )); echo ${m[k]}")
+        self.assert_like_bash("set -u; a=(1); echo $(( a[5] + 1 ))")
+
+    def test_unset_variables_end_the_shell(self):
+        for body in ["echo $(( n + 1 ))", "(( n += 1 ))", "[[ n -eq 0 ]]", "(( a[0] ))"]:
+            with self.subTest(body=body):
+                result = self.assert_like_bash(f"(set -u; {body}; echo unreached); echo after")
+                self.assertEqual(result.stdout, b"after\n")
+                self.assertRegex(result.stderr, rb"^wsh: [an]: unbound variable\n$")
+
+
 class ErrexitTests(BashComparison):
     def test_a_failing_command_stops_the_script(self):
         self.assert_like_bash("set -e; echo before; false; echo after")
@@ -350,6 +364,13 @@ class TrapTests(BashComparison):
         self.assert_like_bash("trap 'echo ERR' ERR; x=$(false); echo after")
         self.assert_like_bash("set -e; trap 'echo ERR' ERR; false; echo after")
         self.assert_like_bash("trap 'echo ERR $?' ERR; false | true; set -o pipefail; false | true; echo end")
+
+    def test_lineno_in_traps_is_the_triggering_line(self):
+        self.assert_like_bash(
+            "trap 'echo err $LINENO' ERR\ntrue\nfalse\nf() {\n  false\n}\nf\n(( 0 ))\n"
+            "[[ a == b ]]\necho now $LINENO\ntrap 'echo debug $LINENO' DEBUG\n:"
+        )
+        self.assert_like_bash("trap 'echo exit $LINENO' EXIT\ntrue\n\nexit 2")
 
     def test_err_trap_and_functions(self):
         self.assert_like_bash(

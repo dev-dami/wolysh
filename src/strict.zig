@@ -70,9 +70,12 @@ fn runHandler(sh: *Shell, handler: []const u8) void {
     const saved_status = sh.last_status;
     const saved_return = sh.return_pending;
     const saved_code = sh.return_code;
+    // `$LINENO` in a handler is the line of the command that set it off.
+    const saved_line = sh.current_line;
+    defer sh.current_line = saved_line;
     sh.return_pending = false;
     running_traps += 1;
-    _ = runner(sh, text);
+    _ = runner(sh, text, @max(saved_line, 1));
     running_traps -= 1;
     sh.return_pending = saved_return;
     sh.return_code = saved_code;
@@ -135,7 +138,8 @@ pub fn runExitTrap(sh: *Shell) void {
     sh.continue_pending = false;
     running_traps += 1;
     defer running_traps -= 1;
-    _ = runner(sh, handler);
+    // Bash numbers the EXIT trap's lines from 1, wherever the shell ended.
+    _ = runner(sh, handler, 1);
 }
 
 /// The shell's last act: runs pending signal traps and the EXIT trap and

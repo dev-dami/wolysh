@@ -37,8 +37,13 @@ var continue_level: u32 = 0;
 
 /// Parses and runs `src`, returning the resulting status.
 pub fn runSource(sh: *Shell, src: []const u8) u8 {
+    return runSourceAt(sh, src, 1);
+}
+
+/// `runSource` with `$LINENO` counting from `line`.
+fn runSourceAt(sh: *Shell, src: []const u8, line: u32) u8 {
     const arena = sh.scratch();
-    var p = parser_mod.Parser.init(arena, src);
+    var p = parser_mod.Parser.initAt(arena, src, line);
     const program = p.parseProgram() catch {
         reportSyntaxError(sh, &p);
         sh.last_status = 2;
@@ -712,7 +717,7 @@ pub fn substitutionRunner(sh: *Shell, src: []const u8, arena: std.mem.Allocator)
 /// Called once at startup to wire command substitution into expansion.
 pub fn install(sh: *Shell) void {
     sh.subst_runner = substitutionRunner;
-    sh.trap_runner = runSource;
+    sh.trap_runner = runSourceAt;
     procsub.run_source = runSource;
 }
 

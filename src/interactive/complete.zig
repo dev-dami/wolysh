@@ -839,7 +839,7 @@ fn callFunction(sh: *Shell, arena: Allocator, function: []const u8, request: Req
         try shellQuote(arena, request.previous),
     });
     const saved_status = sh.last_status;
-    _ = run(sh, source);
+    _ = run(sh, source, 1);
     sh.last_status = saved_status;
 
     const reply = sh.getVar("COMPREPLY") orelse return;
