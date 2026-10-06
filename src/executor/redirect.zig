@@ -571,6 +571,8 @@ test "noclobber refuses to truncate an existing regular file" {
     try expectFile(path, "four\n");
 }
 
+// The children write through /dev/fd because dash, Ubuntu's /bin/sh, only
+// accepts descriptors 0-9 in a redirection.
 test "exec redirections persist for builtins and children" {
     var sh = try quietShell();
     defer sh.deinit();
@@ -579,7 +581,7 @@ test "exec redirections persist for builtins and children" {
     defer _ = fs.removeFile(path);
 
     try testing.expectEqual(@as(u8, 0), exec.runSource(&sh, "exec 47>zig-cache-exec-redirect-test.txt\n"));
-    try testing.expectEqual(@as(u8, 0), exec.runSource(&sh, "echo builtin >&47\n/bin/sh -c 'echo child >&47'\n"));
+    try testing.expectEqual(@as(u8, 0), exec.runSource(&sh, "echo builtin >&47\n/bin/sh -c 'echo child >>/dev/fd/47'\n"));
     try testing.expectEqual(@as(u8, 0), exec.runSource(&sh, "exec 47>&-\n"));
     try expectFile(path, "builtin\nchild\n");
     try testing.expectEqual(@as(u8, 1), exec.runSource(&sh, "echo gone >&47\n"));
@@ -608,7 +610,7 @@ test "a group's numbered descriptor reaches the commands inside it" {
     const path = "zig-cache-group-fd-test.txt";
     defer _ = fs.removeFile(path);
 
-    const status = exec.runSource(&sh, "{ echo inner >&48; /bin/sh -c 'echo child >&48'; } 48>zig-cache-group-fd-test.txt\n");
+    const status = exec.runSource(&sh, "{ echo inner >&48; /bin/sh -c 'echo child >>/dev/fd/48'; } 48>zig-cache-group-fd-test.txt\n");
     try testing.expectEqual(@as(u8, 0), status);
     try expectFile(path, "inner\nchild\n");
     // The descriptor does not outlive the group.
