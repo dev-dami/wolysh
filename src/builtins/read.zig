@@ -13,6 +13,7 @@ const printf = @import("printf.zig");
 const shellmod = @import("../shell.zig");
 const value = @import("../value.zig");
 const sys = @import("../sys.zig");
+const arith = @import("../arith.zig");
 
 const Ctx = builtins.Ctx;
 const Shell = shellmod.Shell;
@@ -480,6 +481,13 @@ fn assign(ctx: Ctx, name: []const u8, val: value.Value) Allocator.Error!bool {
             return false;
         },
         error.OutOfMemory => return error.OutOfMemory,
+        // A `declare -i` variable's arithmetic failed.
+        error.InvalidArithmetic, error.DivisionByZero => {
+            ctx.errFmt("wsh: {s}\n", .{arith.errorMessage()});
+            return false;
+        },
+        // Already reported by the expansion that failed.
+        else => return false,
     };
     return true;
 }

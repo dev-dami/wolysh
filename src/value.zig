@@ -2,6 +2,12 @@
 
 const std = @import("std");
 
+/// One key/value pair of an associative array.
+pub const Entry = struct {
+    key: []const u8,
+    value: Value,
+};
+
 pub const Value = union(enum) {
     none,
     boolean: bool,
@@ -9,7 +15,11 @@ pub const Value = union(enum) {
     float: f64,
     /// Owned by the value arena that produced it.
     string: []const u8,
+    /// An indexed array. A `none` item is an unset element, which is how
+    /// `a=([0]=x [3]=y)` keeps bash's element count.
     list: []const Value,
+    /// An associative array, in insertion order.
+    map: []const Entry,
 
     pub fn isNull(self: Value) bool {
         return switch (self) {
@@ -20,7 +30,7 @@ pub const Value = union(enum) {
     }
 
     /// Truthiness: bool as-is, numbers non-zero, strings non-empty,
-    /// lists non-empty, null always false.
+    /// lists and maps non-empty, null always false.
     pub fn truthy(self: Value) bool {
         return switch (self) {
             .none => false,
@@ -29,6 +39,7 @@ pub const Value = union(enum) {
             .float => |f| f != 0,
             .string => |s| s.len != 0,
             .list => |l| l.len != 0,
+            .map => |m| m.len != 0,
         };
     }
 
@@ -40,6 +51,7 @@ pub const Value = union(enum) {
             .float => "float",
             .string => "string",
             .list => "list",
+            .map => "map",
         };
     }
 
@@ -52,9 +64,18 @@ pub const Value = union(enum) {
             .float => |f| try w.print("{d}", .{f}),
             .string => |s| try w.writeAll(s),
             .list => |items| {
-                for (items, 0..) |item, i| {
-                    if (i != 0) try w.writeByte(' ');
+                var first = true;
+                for (items) |item| {
+                    if (item == .none) continue;
+                    if (!first) try w.writeByte(' ');
+                    first = false;
                     try item.render(w);
+                }
+            },
+            .map => |entries| {
+                for (entries, 0..) |entry, i| {
+                    if (i != 0) try w.writeByte(' ');
+                    try entry.value.render(w);
                 }
             },
         }
@@ -176,4 +197,15 @@ test "render" {
     const s = try v.renderAlloc(a);
     defer a.free(s);
     try std.testing.expectEqualStrings("1 two", s);
+
+    const sparse = Value{ .list = &.{ Value{ .string = "x" }, .none, Value{ .string = "y" } } };
+    const t = try sparse.renderAlloc(a);
+    defer a.free(t);
+    try std.testing.expectEqualStrings("x y", t);
+
+    const m = Value{ .map = &.{ .{ .key = "k", .value = .{ .string = "v" } }, .{ .key = "j", .value = .{ .int = 2 } } } };
+    const u = try m.renderAlloc(a);
+    defer a.free(u);
+    try std.testing.expectEqualStrings("v 2", u);
+    try std.testing.expect(m.truthy());
 }

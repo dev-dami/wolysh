@@ -5,6 +5,7 @@ const std = @import("std");
 const ast = @import("../ast.zig");
 const expand_mod = @import("../expand.zig");
 const shellmod = @import("../shell.zig");
+const arrays = @import("../arrays.zig");
 const value_mod = @import("../value.zig");
 const strict = @import("../strict.zig");
 
@@ -71,9 +72,17 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
     }
     for (cmd.assigns) |assignment| {
         if (sh.isReadonly(assignment.name)) return error.ReadonlyVariable;
+        if (assignment.compound or assignment.index != null) {
+            expand_mod.printError(sh, "wsh: {s}: an array assignment cannot prefix a command\n", .{assignment.name});
+            return error.BadSubstitution;
+        }
         const previous = if (sh.getEnv(assignment.name)) |old| try arena.dupe(u8, old) else null;
-        const assigned = try expand_mod.expandAssignment(sh, arena, assignment.value);
+        var assigned = try expand_mod.expandAssignment(sh, arena, assignment.value);
         const variable = if (sh.getVar(assignment.name)) |v| try shellmod.cloneValue(arena, v) else null;
+        if (assignment.append) {
+            const base = previous orelse if (variable) |v| try v.renderAlloc(arena) else "";
+            assigned = try std.mem.concat(arena, u8, &.{ base, assigned });
+        }
         strict.traceAssignment(sh, assignment.name, assigned);
         try saved.append(arena, .{ .name = assignment.name, .value = previous, .assigned = assigned, .variable = variable });
         try sh.setEnv(assignment.name, assigned);
@@ -87,6 +96,7 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
 /// already exported or `set -a` is on.
 pub fn persist(sh: *Shell, arena: std.mem.Allocator, assigns: []const ast.PrefixAssign) Error!void {
     for (assigns) |assignment| {
+        if (try arrays.persist(sh, arena, assignment)) continue;
         const text = try expand_mod.expandAssignment(sh, arena, assignment.value);
         strict.traceAssignment(sh, assignment.name, text);
         const exported = sh.options.allexport or sh.getEnv(assignment.name) != null;

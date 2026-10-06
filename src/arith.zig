@@ -6,6 +6,8 @@
 const std = @import("std");
 const shell = @import("shell.zig");
 const expand = @import("expand.zig");
+const value = @import("value.zig");
+const arrays = @import("arrays.zig");
 
 pub const Error = error{
     InvalidArithmetic,
@@ -340,6 +342,11 @@ const Arith = struct {
         if (isIdentStart(c)) {
             var j = i + 1;
             while (j < s.len and isIdentChar(s[j])) j += 1;
+            // `a[i]`: the subscript is part of the name.
+            if (j < s.len and s[j] == '[') {
+                self.pos = j;
+                j = (subscriptEnd(s, j) orelse return self.fail("bad array subscript")) + 1;
+            }
             self.pos = j;
             return .{ .kind = .ident, .start = i, .end = j };
         }
@@ -448,6 +455,19 @@ const Arith = struct {
         tok.end = i + width;
         self.pos = tok.end;
         return tok;
+    }
+
+    /// The `]` closing the subscript opened at `open`.
+    fn subscriptEnd(s: []const u8, open: usize) ?usize {
+        var depth: usize = 0;
+        for (s[open..], open..) |c, i| {
+            if (c == '[') depth += 1;
+            if (c == ']') {
+                depth -= 1;
+                if (depth == 0) return i;
+            }
+        }
+        return null;
     }
 
     fn identFollows(s: []const u8, from: usize) bool {
@@ -697,21 +717,57 @@ const Arith = struct {
     /// a plain number is evaluated as an expression in turn.
     fn lookup(self: *Arith, name: []const u8) Error!i64 {
         if (self.noeval != 0) return 0;
-        if (self.sh.getVar(name)) |v| switch (v) {
-            .int => |n| return n,
-            .boolean => |b| return @intFromBool(b),
-            .none => return 0,
-            .string => |s| return self.nested(s),
-            // The allocating writer fails only when allocation does.
-            .float, .list => return self.nested(v.renderAlloc(self.arena) catch return error.OutOfMemory),
-        };
+        if (std.mem.indexOfScalar(u8, name, '[')) |open| {
+            return self.lookupElement(name[0..open], name[open + 1 .. name.len - 1], name);
+        }
+        // `getVar` also computes RANDOM, SECONDS and the other dynamic names.
+        if (self.sh.getVar(name)) |v| return self.valueOf(v);
         if (self.sh.getEnv(name)) |s| return self.nested(s);
-        // Dynamic parameters the expander computes are not stored variables.
-        const brace = try std.fmt.allocPrint(self.arena, "${{{s}}}", .{name});
-        const dynamic = try expand.expandLiteral(self.sh, self.arena, brace);
-        if (dynamic.len != 0) return self.nested(dynamic);
         if (self.sh.options.nounset) {
             setMessage("{s}: unbound variable", .{name});
+            return error.InvalidArithmetic;
+        }
+        return 0;
+    }
+
+    /// A stored value: numbers as they are, text evaluated in turn, and an
+    /// array by its element 0, as in bash.
+    fn valueOf(self: *Arith, v: value.Value) Error!i64 {
+        return switch (v) {
+            .int => |n| n,
+            .boolean => |b| @intFromBool(b),
+            .none => 0,
+            .string => |s| self.nested(s),
+            // The allocating writer fails only when allocation does.
+            .float => self.nested(v.renderAlloc(self.arena) catch return error.OutOfMemory),
+            .list => |items| if (items.len == 0) 0 else self.valueOf(items[0]),
+            .map => |entries| for (entries) |entry| {
+                if (std.mem.eql(u8, entry.key, "0")) break self.valueOf(entry.value);
+            } else 0,
+        };
+    }
+
+    /// `a[i]` and `m[key]`: an indexed subscript is itself arithmetic, and a
+    /// negative one counts from the end.
+    fn lookupElement(self: *Arith, base: []const u8, subscript: []const u8, whole: []const u8) Error!i64 {
+        const stored = self.sh.getVar(base) orelse if (self.sh.getEnv(base)) |s| value.Value{ .string = s } else null;
+        const found: ?value.Value = if (stored) |v| switch (v) {
+            .map => |entries| for (entries) |entry| {
+                if (std.mem.eql(u8, entry.key, subscript)) break entry.value;
+            } else null,
+            .list => |items| blk: {
+                const n = try self.nested(subscript);
+                const index = if (n < 0) n + @as(i64, @intCast(items.len)) else n;
+                if (index < 0 or index >= items.len) break :blk null;
+                break :blk items[@intCast(index)];
+            },
+            else => if (try self.nested(subscript) == 0) v else null,
+        } else null;
+        if (found) |v| {
+            if (v != .none) return self.valueOf(v);
+        }
+        if (self.sh.options.nounset) {
+            setMessage("{s}: unbound variable", .{whole});
             return error.InvalidArithmetic;
         }
         return 0;
@@ -726,12 +782,24 @@ const Arith = struct {
     /// variable's environment entry in step.
     fn store(self: *Arith, name: []const u8, v: i64) Error!void {
         if (self.noeval != 0) return;
+        if (std.mem.indexOfScalar(u8, name, '[')) |open| {
+            const digits = try std.fmt.allocPrint(self.arena, "{d}", .{v});
+            const base = name[0..open];
+            arrays.assignElement(self.sh, self.arena, base, name[open + 1 .. name.len - 1], digits, false) catch |err| switch (err) {
+                error.ReadonlyVariable => {
+                    setMessage("{s}: readonly variable", .{base});
+                    return error.InvalidArithmetic;
+                },
+                else => |e| return e,
+            };
+            return;
+        }
         self.sh.assignVar(name, .{ .int = v }) catch |err| switch (err) {
             error.ReadonlyVariable => {
                 setMessage("{s}: readonly variable", .{name});
                 return error.InvalidArithmetic;
             },
-            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| return e,
         };
         if (self.sh.options.allexport or self.sh.env.contains(name)) {
             var buf: [24]u8 = undefined;

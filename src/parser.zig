@@ -18,6 +18,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
+const compound_assign = @import("compound.zig");
 
 pub const Error = error{ SyntaxError, OutOfMemory } || std.mem.Allocator.Error;
 
@@ -102,14 +103,32 @@ fn redirectFdWord(text: []const u8) ?RedirectFd {
     return .{ .fd = parseFdNumber(text) orelse return null };
 }
 
-/// Splits `NAME=value` when NAME is a plain identifier. A quoted or otherwise
-/// non-identifier left-hand side is an ordinary word.
+/// Splits `NAME=value`, `NAME+=value` and `NAME[subscript]=value` when NAME
+/// is a plain identifier. A quoted or otherwise non-identifier left-hand side
+/// is an ordinary word.
 fn parseAssignment(word: []const u8) ?ast.PrefixAssign {
-    const eq = std.mem.indexOfScalar(u8, word, '=') orelse return null;
-    if (eq == 0) return null;
-    const name = word[0..eq];
+    var i: usize = 0;
+    while (i < word.len and (std.ascii.isAlphanumeric(word[i]) or word[i] == '_')) i += 1;
+    const name = word[0..i];
     if (!isIdentifier(name)) return null;
-    return .{ .name = name, .value = word[eq + 1 ..] };
+    var index: ?[]const u8 = null;
+    if (i < word.len and word[i] == '[') {
+        const close = compound_assign.closeBracket(word, i) orelse return null;
+        index = word[i + 1 .. close];
+        i = close + 1;
+    }
+    var append = false;
+    if (i < word.len and word[i] == '+') {
+        append = true;
+        i += 1;
+    }
+    if (i >= word.len or word[i] != '=') return null;
+    return .{ .name = name, .value = word[i + 1 ..], .index = index, .append = append };
+}
+
+/// Commands whose `NAME=(...)` arguments are array assignments.
+fn isDeclaration(word: []const u8) bool {
+    return eql(word, "declare") or eql(word, "typeset") or eql(word, "local");
 }
 
 /// Everything a speculative parse can change. Here-document redirects are
@@ -1004,7 +1023,7 @@ pub const Parser = struct {
                     // `NAME=value` words before the command word form the
                     // command's temporary environment.
                     if (words.items.len == 0 and redirects.items.len == 0) {
-                        if (parseAssignment(self.tok.text)) |assignment| {
+                        if (try self.assignmentWord()) |assignment| {
                             try assigns.append(self.arena, assignment);
                             self.advance();
                             last_word = null;
@@ -1012,7 +1031,7 @@ pub const Parser = struct {
                         }
                     }
                     last_word = self.tok;
-                    try words.append(self.arena, self.tok.text);
+                    try words.append(self.arena, try self.declarationWord(words.items));
                     self.advance();
                 },
                 .lparen => {
@@ -1163,6 +1182,42 @@ pub const Parser = struct {
             if (redirect.kind == .here_doc) try self.pending_heredocs.append(self.arena, redirect);
         }
         return command;
+    }
+
+    /// A `NAME=value` word before the command word, including the array forms
+    /// `NAME[i]=v`, `NAME+=v` and `NAME=(...)`. A list may span lines, so the
+    /// lexer is moved past its closing parenthesis.
+    fn assignmentWord(self: *Parser) Error!?ast.PrefixAssign {
+        var assignment = parseAssignment(self.tok.text) orelse return null;
+        if (assignment.value.len == 0 or assignment.value[0] != '(') return assignment;
+        if (assignment.index != null) return self.fail("an array element cannot be assigned a list");
+        const open = self.tok.start + (@intFromPtr(assignment.value.ptr) - @intFromPtr(self.tok.text.ptr));
+        const close = try self.skipCompound(open);
+        assignment.value = self.lex.src[open + 1 .. close];
+        assignment.compound = true;
+        return assignment;
+    }
+
+    /// The current word, extended to the whole `NAME=(...)` list when it is an
+    /// argument of `declare`, `typeset` or `local`.
+    fn declarationWord(self: *Parser, words: []const ast.Word) Error!ast.Word {
+        if (words.len == 0 or !isDeclaration(words[0])) return self.tok.text;
+        const offset = compound_assign.openParen(self.tok.text) orelse return self.tok.text;
+        const close = try self.skipCompound(self.tok.start + offset);
+        return self.lex.src[self.tok.start .. close + 1];
+    }
+
+    /// Moves the lexer past the `)` closing the list opened at `open`.
+    fn skipCompound(self: *Parser, open: usize) Error!usize {
+        const src = self.lex.src;
+        const close = compound_assign.findClose(src, open) orelse return self.fail("unterminated array assignment");
+        if (close + 1 < src.len and std.mem.indexOfScalar(u8, " \t\r\n;&|<>)", src[close + 1]) == null) {
+            return self.fail("unexpected text after an array assignment");
+        }
+        const start_line = self.tok.line - std.mem.count(u8, self.tok.text, "\n");
+        self.lex.pos = close + 1;
+        self.lex.line = start_line + std.mem.count(u8, src[self.tok.start .. close + 1], "\n");
+        return close;
     }
 
     const HereDocDelimiter = struct { text: []const u8, expand: bool };
@@ -1368,13 +1423,13 @@ pub const Parser = struct {
                 } else {
                     node.* = .{ .int = std.fmt.parseInt(i64, text, 10) catch return self.fail("invalid number") };
                 }
-                return node;
+                return self.parseIndexing(node);
             },
             .dquote, .squote => {
                 const word = self.quotedWord();
                 self.advance();
                 node.* = .{ .string = word };
-                return node;
+                return self.parseIndexing(node);
             },
             .word => {
                 // Reached for `$(...)` in expression position: expanding the
@@ -1382,7 +1437,7 @@ pub const Parser = struct {
                 const word = self.tok.text;
                 self.advance();
                 node.* = .{ .string = word };
-                return node;
+                return self.parseIndexing(node);
             },
             .ident => {
                 const name = self.tok.text;
@@ -1406,7 +1461,7 @@ pub const Parser = struct {
                         .callee = name,
                         .args = try args.toOwnedSlice(self.arena),
                     } };
-                    return node;
+                    return self.parseIndexing(node);
                 }
                 if (eql(name, "true")) {
                     node.* = .{ .boolean = true };
@@ -1421,14 +1476,14 @@ pub const Parser = struct {
                     return node;
                 }
                 node.* = .{ .ident = name };
-                return node;
+                return self.parseIndexing(node);
             },
             .lparen => {
                 self.advance();
                 const inner = try self.parseExpr();
                 if (self.tok.tag != .rparen) return self.fail("expected ')'");
                 self.advance();
-                return inner;
+                return self.parseIndexing(inner);
             },
             .lbracket => {
                 self.advance();
@@ -1444,10 +1499,25 @@ pub const Parser = struct {
                 if (self.tok.tag != .rbracket) return self.fail("expected ']' to close the list");
                 self.advance();
                 node.* = .{ .list = try items.toOwnedSlice(self.arena) };
-                return node;
+                return self.parseIndexing(node);
             },
             else => return self.fail("expected an expression"),
         }
+    }
+
+    /// `target[index]`, repeated for `grid[0][1]`.
+    fn parseIndexing(self: *Parser, target: *ast.Expr) Error!*ast.Expr {
+        var current = target;
+        while (self.tok.tag == .lbracket) {
+            self.advance();
+            const index = try self.parseExpr();
+            if (self.tok.tag != .rbracket) return self.fail("expected ']' to close the index");
+            self.advance();
+            const node = try self.arena.create(ast.Expr);
+            node.* = .{ .index = .{ .target = current, .index = index } };
+            current = node;
+        }
+        return current;
     }
 
     /// Rebuilds the raw source text of a quoted literal, quotes included, so
@@ -1722,6 +1792,33 @@ test "parse pipeline negation" {
     // `!a` is a command word, not negation.
     try std.testing.expect(!prog.stmts[2].pipeline.negate);
     try std.testing.expectEqualStrings("!a", prog.stmts[2].pipeline.commands[0].words[0]);
+}
+
+test "parse array assignments and expression indexing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var p = Parser.init(arena_state.allocator(),
+        \\a=(one "two three"
+        \\   four) ; m[k]+=v
+        \\declare -A m=([x]=1 [y]=2) n
+        \\let v = l[0][-1]
+        \\echo $LINENO
+    );
+    const prog = try p.parseProgram();
+    try std.testing.expectEqual(@as(usize, 5), prog.stmts.len);
+    const list = prog.stmts[0].pipeline.commands[0].assigns[0];
+    try std.testing.expect(list.compound);
+    try std.testing.expectEqualStrings("one \"two three\"\n   four", list.value);
+    const element = prog.stmts[1].pipeline.commands[0].assigns[0];
+    try std.testing.expectEqualStrings("k", element.index.?);
+    try std.testing.expect(element.append);
+    const words = prog.stmts[2].pipeline.commands[0].words;
+    try std.testing.expectEqual(@as(usize, 4), words.len);
+    try std.testing.expectEqualStrings("m=([x]=1 [y]=2)", words[2]);
+    try std.testing.expect(prog.stmts[3].var_decl.value.* == .index);
+
+    var bad = Parser.init(arena_state.allocator(), "a=(x y");
+    try std.testing.expectError(error.SyntaxError, bad.parseProgram());
 }
 
 test "parse command-prefix assignments" {

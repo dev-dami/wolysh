@@ -15,6 +15,11 @@ test {
     _ = @import("shell.zig");
     _ = @import("expand.zig");
     _ = @import("arith.zig");
+    _ = @import("compound.zig");
+    _ = @import("param_ops.zig");
+    _ = @import("arrays.zig");
+    _ = @import("special_vars.zig");
+    _ = @import("builtins/declare.zig");
     _ = @import("regex.zig");
     _ = @import("builtins.zig");
     _ = @import("builtins/cd.zig");

@@ -75,6 +75,12 @@ pub const Redirect = struct {
 pub const PrefixAssign = struct {
     name: []const u8,
     value: Word,
+    /// `NAME[subscript]=value`: the raw subscript text.
+    index: ?[]const u8 = null,
+    /// `NAME+=value`.
+    append: bool = false,
+    /// `NAME=(...)`: `value` is the raw text between the parentheses.
+    compound: bool = false,
 };
 
 pub const Command = struct {
@@ -133,6 +139,8 @@ pub const Expr = union(enum) {
     /// Logical operators short-circuit and return a bool.
     logic: struct { op: ChainOp, lhs: *Expr, rhs: *Expr },
     call: struct { callee: []const u8, args: []*Expr },
+    /// `list[i]` (negative counts from the end) and `map["key"]`.
+    index: struct { target: *Expr, index: *Expr },
 };
 
 pub const VarDecl = struct {

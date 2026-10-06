@@ -16,6 +16,8 @@ const history = @import("history.zig");
 const fs = @import("fs.zig");
 const proc = @import("proc.zig");
 const command_cache = @import("command_cache.zig");
+const special_vars = @import("special_vars.zig");
+const arrays = @import("arrays.zig");
 const strict = @import("strict.zig");
 
 /// Runs `$(...)` and returns its stdout. Installed by `exec.zig`, which breaks
@@ -90,6 +92,8 @@ pub const Shell = struct {
     aliases: std.StringHashMap([]const u8),
     /// Names locked by `readonly`; `setVar`/`setEnv` refuse to rebind them.
     readonly: std.StringHashMap(void),
+    /// `declare -i/-l/-u` attributes, applied by `setVar` on every assignment.
+    attrs: std.StringHashMap(Attrs),
     /// Saved bindings for nested `local` scopes, outermost frame first.
     scopes: std.ArrayList(Scope) = .empty,
     /// Trap handler source per trap id: `exit_trap`, the signal numbers, then
@@ -193,6 +197,18 @@ pub const Shell = struct {
         name: []const u8,
         was_set: bool,
         previous: value.Value = .none,
+        attrs: Attrs = .{},
+    };
+
+    pub const Attrs = packed struct(u8) {
+        integer: bool = false,
+        lower: bool = false,
+        upper: bool = false,
+        _pad: u5 = 0,
+
+        pub fn any(self: Attrs) bool {
+            return self.integer or self.lower or self.upper;
+        }
     };
 
     fn blank(gpa: std.mem.Allocator) Shell {
@@ -204,6 +220,7 @@ pub const Shell = struct {
             .func_lines = std.StringHashMap(u32).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
             .readonly = std.StringHashMap(void).init(gpa),
+            .attrs = std.StringHashMap(Attrs).init(gpa),
             .jobs = .{},
             .hist = .{},
             .cwd = &.{},
@@ -224,6 +241,7 @@ pub const Shell = struct {
     pub fn init(gpa: std.mem.Allocator, init_args: std.process.Init.Minimal) !Shell {
         var sh = blank(gpa);
         errdefer sh.deinit();
+        special_vars.start();
 
         sh.cwd = (try fs.getCwd(gpa)) orelse (try gpa.dupe(u8, "/"));
         sh.shell_pgid = sys.getpgid(0) orelse sh.pid;
@@ -298,6 +316,10 @@ pub const Shell = struct {
         while (rit.next()) |entry| self.gpa.free(entry.key_ptr.*);
         self.readonly.deinit();
 
+        var attr_it = self.attrs.iterator();
+        while (attr_it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.attrs.deinit();
+
         for (self.scopes.items) |*scope| {
             for (scope.saved.items) |saved| {
                 self.gpa.free(saved.name);
@@ -337,17 +359,21 @@ pub const Shell = struct {
 
     // --- variables ----------------------------------------------------------
 
+    /// A stored variable, else a computed one such as `RANDOM` or `UID`.
     pub fn getVar(self: *const Shell, name: []const u8) ?value.Value {
-        return self.vars.get(name);
+        return self.vars.get(name) orelse special_vars.get(self, name);
     }
 
     pub fn hasVar(self: *const Shell, name: []const u8) bool {
         return self.vars.contains(name);
     }
 
-    /// Stores `val`, deep-copying it so the caller's arena can be reset.
+    /// Stores `val`, deep-copying it so the caller's arena can be reset. The
+    /// variable's `declare` attributes apply first; `RANDOM` and `SECONDS`
+    /// take the assignment without storing it.
     pub fn setVar(self: *Shell, name: []const u8, val: value.Value) !void {
-        const owned = try cloneValue(self.gpa, val);
+        if (special_vars.assign(self, name, val)) return;
+        const owned = try cloneValue(self.gpa, try arrays.applyAttrs(self, name, val));
         errdefer freeValue(self.gpa, owned);
         const gop = try self.vars.getOrPut(name);
         if (gop.found_existing) {
@@ -360,12 +386,32 @@ pub const Shell = struct {
 
     pub fn unsetVar(self: *Shell, name: []const u8) bool {
         if (self.isReadonly(name)) return false;
+        if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
         if (self.vars.fetchRemove(name)) |kv| {
             self.gpa.free(kv.key);
             freeValue(self.gpa, kv.value);
             return true;
         }
         return false;
+    }
+
+    pub fn getAttrs(self: *const Shell, name: []const u8) Attrs {
+        return self.attrs.get(name) orelse .{};
+    }
+
+    pub fn setAttrs(self: *Shell, name: []const u8, attrs: Attrs) !void {
+        if (!attrs.any()) {
+            if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
+            return;
+        }
+        const gop = try self.attrs.getOrPut(name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.attrs.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = attrs;
     }
 
     // --- readonly -----------------------------------------------------------
@@ -408,12 +454,15 @@ pub const Shell = struct {
         if (self.scopes.items.len == 0) return;
         var scope = self.scopes.pop().?;
         while (scope.saved.pop()) |saved| {
+            // The saved value is restored as it was, then its attributes.
+            self.setAttrs(saved.name, .{}) catch {};
             if (saved.was_set) {
                 self.setVar(saved.name, saved.previous) catch {};
             } else if (self.vars.fetchRemove(saved.name)) |kv| {
                 self.gpa.free(kv.key);
                 freeValue(self.gpa, kv.value);
             }
+            self.setAttrs(saved.name, saved.attrs) catch {};
             self.gpa.free(saved.name);
             freeValue(self.gpa, saved.previous);
         }
@@ -433,14 +482,17 @@ pub const Shell = struct {
         }
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
-        const previous = self.getVar(name);
+        const previous = self.vars.get(name);
         const copy = if (previous) |v| try cloneValue(self.gpa, v) else value.Value.none;
         errdefer if (previous != null) freeValue(self.gpa, copy);
         try scope.saved.append(self.gpa, .{
             .name = owned,
             .was_set = previous != null,
             .previous = copy,
+            .attrs = self.getAttrs(name),
         });
+        // A local starts without the attributes of the binding it shadows.
+        try self.setAttrs(name, .{});
     }
 
     // --- traps --------------------------------------------------------------
@@ -1123,16 +1175,42 @@ fn readGitHead(arena: std.mem.Allocator, dir: []const u8) !?[]const u8 {
     return fs.readFileAlloc(arena, worktree_head, 4096);
 }
 
-pub fn cloneValue(allocator: std.mem.Allocator, v: value.Value) !value.Value {
+pub fn cloneValue(allocator: std.mem.Allocator, v: value.Value) std.mem.Allocator.Error!value.Value {
     return switch (v) {
         .string => |s| value.Value{ .string = try allocator.dupe(u8, s) },
         .list => |items| blk: {
             const out = try allocator.alloc(value.Value, items.len);
-            for (items, 0..) |item, i| out[i] = try cloneValue(allocator, item);
+            var done: usize = 0;
+            errdefer {
+                for (out[0..done]) |item| freeValue(allocator, item);
+                allocator.free(out);
+            }
+            while (done < items.len) : (done += 1) out[done] = try cloneValue(allocator, items[done]);
             break :blk value.Value{ .list = out };
+        },
+        .map => |entries| blk: {
+            const out = try allocator.alloc(value.Entry, entries.len);
+            var done: usize = 0;
+            errdefer {
+                for (out[0..done]) |entry| freeEntry(allocator, entry);
+                allocator.free(out);
+            }
+            while (done < entries.len) : (done += 1) out[done] = try cloneEntry(allocator, entries[done]);
+            break :blk value.Value{ .map = out };
         },
         else => v,
     };
+}
+
+pub fn cloneEntry(allocator: std.mem.Allocator, entry: value.Entry) std.mem.Allocator.Error!value.Entry {
+    const key = try allocator.dupe(u8, entry.key);
+    errdefer allocator.free(key);
+    return .{ .key = key, .value = try cloneValue(allocator, entry.value) };
+}
+
+pub fn freeEntry(allocator: std.mem.Allocator, entry: value.Entry) void {
+    allocator.free(entry.key);
+    freeValue(allocator, entry.value);
 }
 
 pub fn freeValue(allocator: std.mem.Allocator, v: value.Value) void {
@@ -1142,6 +1220,11 @@ pub fn freeValue(allocator: std.mem.Allocator, v: value.Value) void {
             if (items.len == 0) return;
             for (items) |item| freeValue(allocator, item);
             allocator.free(items);
+        },
+        .map => |entries| {
+            if (entries.len == 0) return;
+            for (entries) |entry| freeEntry(allocator, entry);
+            allocator.free(entries);
         },
         else => {},
     }
