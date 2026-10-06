@@ -390,6 +390,8 @@ fn startBackground(
     sh.last_bg_pid = last_pid;
 
     const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, false) catch return 1;
+    // As in bash, only an interactive shell announces the job.
+    if (!sh.interactive) return 0;
     var buf: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job.id, last_pid }) catch return 0;
     sys.writeStr(sh.default_err, line);
