@@ -84,6 +84,9 @@ pub const Shell = struct {
     env: std.StringHashMap([]const u8),
     /// Function name -> source text of its `fn` declaration.
     funcs: std.StringHashMap([]const u8),
+    /// Function name -> line its definition starts on, so a body re-parsed
+    /// from `funcs` reports the original line numbers.
+    func_lines: std.StringHashMap(u32),
     aliases: std.StringHashMap([]const u8),
     /// Names locked by `readonly`; `setVar`/`setEnv` refuse to rebind them.
     readonly: std.StringHashMap(void),
@@ -198,6 +201,7 @@ pub const Shell = struct {
             .vars = std.StringHashMap(value.Value).init(gpa),
             .env = std.StringHashMap([]const u8).init(gpa),
             .funcs = std.StringHashMap([]const u8).init(gpa),
+            .func_lines = std.StringHashMap(u32).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
             .readonly = std.StringHashMap(void).init(gpa),
             .jobs = .{},
@@ -278,6 +282,10 @@ pub const Shell = struct {
             self.gpa.free(entry.value_ptr.*);
         }
         self.funcs.deinit();
+
+        var lit = self.func_lines.keyIterator();
+        while (lit.next()) |key| self.gpa.free(key.*);
+        self.func_lines.deinit();
 
         var ait = self.aliases.iterator();
         while (ait.next()) |entry| {
@@ -660,6 +668,23 @@ pub const Shell = struct {
 
     pub fn getFunc(self: *const Shell, name: []const u8) ?[]const u8 {
         return self.funcs.get(name);
+    }
+
+    pub fn setFuncLine(self: *Shell, name: []const u8, line: u32) !void {
+        const gop = try self.func_lines.getOrPut(name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.func_lines.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = line;
+    }
+
+    /// Line a function's definition starts on; 1 when it is not known.
+    pub fn getFuncLine(self: *const Shell, name: []const u8) u32 {
+        const line = self.func_lines.get(name) orelse 0;
+        return if (line == 0) 1 else line;
     }
 
     pub fn setAlias(self: *Shell, name: []const u8, val: []const u8) !void {

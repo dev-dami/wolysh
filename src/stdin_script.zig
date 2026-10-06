@@ -194,22 +194,37 @@ fn continuesLine(source: []const u8) bool {
     return slashes % 2 == 1;
 }
 
-/// `if` statements accept an `else` on a later line, so one that ends the
-/// statement without an `else` is not finished yet.
+/// Native `if cond { }` statements accept an `else` on a later line, so one
+/// that ends the statement without an `else` is not finished yet. (A POSIX
+/// `if` ends at its `fi`; the caller only looks further after a `}`.)
 fn endsWithOpenIf(stmts: []const ast.Stmt) bool {
     if (stmts.len == 0) return false;
     var stmt = stmts[stmts.len - 1];
     while (true) {
-        const branch = switch (stmt) {
-            .if_ => |b| b,
-            else => return false,
-        };
+        const branch = ifCommand(stmt) orelse return false;
         const else_block = branch.else_ orelse return true;
         // `else if` is a block holding the nested `if`, which may itself
         // still take an `else`.
         if (else_block.stmts.len != 1) return false;
         stmt = else_block.stmts[0];
     }
+}
+
+/// The `if` a statement consists of, when it is nothing else: no pipe, list,
+/// background or redirection around it.
+fn ifCommand(stmt: ast.Stmt) ?ast.If {
+    const chain = switch (stmt) {
+        .pipeline => |pipeline| pipeline,
+        else => return null,
+    };
+    if (chain.commands.len != 1 or chain.links.len != 0 or chain.background or chain.negate) return null;
+    const cmd = chain.commands[0];
+    if (cmd.redirects.len != 0) return null;
+    const compound = cmd.compound orelse return null;
+    return switch (compound.kind) {
+        .if_ => |branch| branch,
+        else => null,
+    };
 }
 
 fn lastTag(source: []const u8) lexer.Tag {

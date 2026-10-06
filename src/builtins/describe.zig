@@ -67,10 +67,11 @@ fn resolve(ctx: Ctx, arena: Allocator, name: []const u8, how: Lookup) Allocator.
     if (!how.path_only) {
         if (ctx.sh.getAlias(name)) |text| try matches.append(arena, .{ .kind = .alias, .detail = text });
         if (isKeyword(name)) try matches.append(arena, .{ .kind = .keyword });
-        if (isBuiltinName(name)) try matches.append(arena, .{ .kind = .builtin });
+        // A function shadows a builtin of the same name when it runs.
         if (how.functions) {
             if (ctx.sh.getFunc(name)) |source| try matches.append(arena, .{ .kind = .function, .detail = source });
         }
+        if (isBuiltinName(name)) try matches.append(arena, .{ .kind = .builtin });
         if (matches.items.len != 0 and !how.all) return matches.items;
     }
 

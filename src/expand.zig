@@ -36,6 +36,9 @@ const Mode = enum {
     command_word,
     /// A single value: no splitting, no globbing.
     literal,
+    /// A single pattern (`case` items): no splitting, and text from a quoted
+    /// context stays backslash-escaped so it matches literally.
+    pattern,
 };
 
 fn isSpaceByte(c: u8) bool {
@@ -89,6 +92,14 @@ pub fn expandWord(
 /// markers left behind.
 pub fn expandLiteral(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u8) Error![]const u8 {
     var ex = Expander{ .sh = sh, .arena = arena, .mode = .literal };
+    try ex.scan(word);
+    return arena.dupe(u8, ex.buf.items);
+}
+
+/// Expands a word to one glob pattern for `glob.matchSegment`: quoted parts
+/// are escaped, unquoted expansions keep their metacharacters live.
+pub fn expandPattern(sh: *shell.Shell, arena: std.mem.Allocator, word: []const u8) Error![]const u8 {
+    var ex = Expander{ .sh = sh, .arena = arena, .mode = .pattern };
     try ex.scan(word);
     return arena.dupe(u8, ex.buf.items);
 }
@@ -201,7 +212,7 @@ pub const Expander = struct {
 
     /// Appends an unquoted value, splitting it into fields on `IFS`.
     fn appendSplitRaw(self: *Expander, bytes: []const u8) Error!void {
-        if (self.mode == .literal) return self.appendRaw(bytes);
+        if (self.mode != .command_word) return self.appendRaw(bytes);
         if (bytes.len == 0) return;
         var seps: [64]u8 = undefined;
         const ifs = self.ifsSpec(&seps);
@@ -258,9 +269,9 @@ pub const Expander = struct {
     }
 
     /// Emits the pending field, globbing it when it still has live
-    /// metacharacters. Does nothing in literal mode.
+    /// metacharacters. Does nothing outside command words.
     fn flush(self: *Expander) Error!void {
-        if (self.mode == .literal) return;
+        if (self.mode != .command_word) return;
         if (!self.active) {
             self.buf.clearRetainingCapacity();
             return;
@@ -1033,6 +1044,8 @@ fn findClosingDouble(s: []const u8, from: usize) usize {
 /// Finds the delimiter matching the opener at `open_index`, skipping quoted
 /// regions and nested openers.
 fn findMatching(s: []const u8, open_index: usize, open: u8, close: u8) ?usize {
+    // `$(...)` may hold a `case`, whose patterns end in an unmatched `)`.
+    if (open == '(' and open_index > 0 and s[open_index - 1] == '$') return lexer.closingParen(s, open_index);
     var depth: usize = 0;
     var i = open_index;
     while (i < s.len) : (i += 1) {
