@@ -18,7 +18,6 @@ const usage = "wsh: bind: usage: bind [-lpsvPSVX] [-m keymap] [-f filename] [-q 
 pub fn run(ctx: Ctx) u8 {
     var parser = options.Parser.init(ctx.argv, "lpsvPSVXm:f:q:u:r:x:");
     var status: u8 = 0;
-    var acted = false;
     while (true) {
         switch (parser.next()) {
             .end => break,
@@ -33,7 +32,6 @@ pub fn run(ctx: Ctx) u8 {
                 return 2;
             },
             .option => |c| {
-                acted = true;
                 switch (c) {
                     'l' => for (bindings.functionNames()) |name| {
                         ctx.out(name);
@@ -70,10 +68,8 @@ pub fn run(ctx: Ctx) u8 {
     }
 
     for (parser.rest()) |binding| {
-        acted = true;
         if (!bindFunction(ctx, binding)) status = 1;
     }
-    _ = acted;
     return status;
 }
 
