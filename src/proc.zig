@@ -40,6 +40,9 @@ pub const Stage = struct {
     child_ctx: ?*anyopaque = null,
     stdio: Stdio = .{},
     redirects: []const Redirection = &.{},
+    /// Descriptors the child must not keep: the shell's ends of a coprocess's
+    /// pipes, which would otherwise stop the child seeing end of input.
+    close_in_child: []const i32 = &.{},
 };
 
 pub const Redirection = struct {
@@ -407,6 +410,7 @@ fn childRun(stage: Stage, fd_in: i32, fd_out: i32, pipes: []const [2]i32, group:
         _ = linux.close(fds[0]);
         _ = linux.close(fds[1]);
     }
+    for (stage.close_in_child) |fd| _ = linux.close(fd);
 
     for (stage.redirects) |redirect| {
         sys.dup2(redirect.source, redirect.target);

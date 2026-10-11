@@ -79,6 +79,12 @@ pub fn discardPendingSignal(sig: u32) void {
     _ = trap_pending.fetchAnd(~(@as(u64, 1) << @intCast(sig - 1)), .monotonic);
 }
 
+/// One active function call: its name and the line it was called from.
+pub const Frame = struct {
+    name: []u8,
+    call_line: u32,
+};
+
 pub const Shell = struct {
     gpa: std.mem.Allocator,
 
@@ -89,6 +95,11 @@ pub const Shell = struct {
     /// Function name -> line its definition starts on, so a body re-parsed
     /// from `funcs` reports the original line numbers.
     func_lines: std.StringHashMap(u32),
+    /// Functions marked by `export -f`; children receive them as
+    /// `BASH_FUNC_name%%` environment entries.
+    exported_funcs: std.StringHashMap(void),
+    /// Functions locked by `readonly -f`; they cannot be redefined or unset.
+    readonly_funcs: std.StringHashMap(void),
     aliases: std.StringHashMap([]const u8),
     /// Names locked by `readonly`; `setVar`/`setEnv` refuse to rebind them.
     readonly: std.StringHashMap(void),
@@ -123,6 +134,10 @@ pub const Shell = struct {
     /// Set when an interactive `exit` was refused because jobs are stopped;
     /// an immediately repeated `exit` or Ctrl-D then leaves anyway.
     exit_warned: bool = false,
+    /// The history entry made for the interactive command line being run (empty
+    /// when none was kept), so `fc` and `history -s` can tell which entry is the
+    /// command itself. Borrowed from the history.
+    entered_entry: []const u8 = "",
 
     pid: i32 = 0,
     shell_pgid: i32 = 0,
@@ -167,6 +182,8 @@ pub const Shell = struct {
     options: Options = .{},
     /// Source line of the statement being executed, for `$LINENO`.
     current_line: u32 = 0,
+    /// Active function calls, outermost first, for `caller`.
+    call_frames: std.ArrayList(Frame) = .empty,
     /// Non-zero while running a condition: an `if`/`while`/`until` test, a
     /// non-final part of an `&&`/`||` list, or a `!` pipeline. `set -e` and the
     /// ERR trap do not fire there.
@@ -219,6 +236,8 @@ pub const Shell = struct {
             .env = std.StringHashMap([]const u8).init(gpa),
             .funcs = std.StringHashMap([]const u8).init(gpa),
             .func_lines = std.StringHashMap(u32).init(gpa),
+            .exported_funcs = std.StringHashMap(void).init(gpa),
+            .readonly_funcs = std.StringHashMap(void).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
             .readonly = std.StringHashMap(void).init(gpa),
             .attrs = std.StringHashMap(Attrs).init(gpa),
@@ -281,6 +300,9 @@ pub const Shell = struct {
     }
 
     pub fn deinit(self: *Shell) void {
+        for (self.call_frames.items) |frame| self.gpa.free(frame.name);
+        self.call_frames.deinit(self.gpa);
+
         var vit = self.vars.iterator();
         while (vit.next()) |entry| {
             self.gpa.free(entry.key_ptr.*);
@@ -301,6 +323,14 @@ pub const Shell = struct {
             self.gpa.free(entry.value_ptr.*);
         }
         self.funcs.deinit();
+
+        var xit = self.exported_funcs.keyIterator();
+        while (xit.next()) |key| self.gpa.free(key.*);
+        self.exported_funcs.deinit();
+
+        var rfit = self.readonly_funcs.keyIterator();
+        while (rfit.next()) |key| self.gpa.free(key.*);
+        self.readonly_funcs.deinit();
 
         var lit = self.func_lines.keyIterator();
         while (lit.next()) |key| self.gpa.free(key.*);
@@ -688,9 +718,10 @@ pub const Shell = struct {
         while (it.next()) |entry| try out.append(self.gpa, entry.key_ptr.*);
     }
 
-    /// Builds the `envp` array passed to children.
+    /// Builds the `envp` array passed to children, including the functions
+    /// marked by `export -f`.
     pub fn buildEnvp(self: *const Shell, arena: std.mem.Allocator) ![*:null]const ?[*:0]const u8 {
-        const arr = try arena.alloc(?[*:0]const u8, self.env.count() + 1);
+        const arr = try arena.alloc(?[*:0]const u8, self.env.count() + self.exported_funcs.count() + 1);
         var i: usize = 0;
         var it = self.env.iterator();
         while (it.next()) |entry| {
@@ -701,6 +732,14 @@ pub const Shell = struct {
             arr[i] = pair.ptr;
             i += 1;
         }
+        var fit = self.exported_funcs.keyIterator();
+        while (fit.next()) |name| {
+            // Bash's `() { body; }` form; functions without one are not exported.
+            const body = (try self.exportForm(arena, name.*)) orelse continue;
+            const pair = try std.fmt.allocPrintSentinel(arena, "BASH_FUNC_{s}%%={s}", .{ name.*, body }, 0);
+            arr[i] = pair.ptr;
+            i += 1;
+        }
         arr[i] = null;
         return @ptrCast(arr.ptr);
     }
@@ -708,6 +747,7 @@ pub const Shell = struct {
     // --- functions and aliases ---------------------------------------------
 
     pub fn defineFunc(self: *Shell, name: []const u8, source: []const u8) !void {
+        if (self.readonly_funcs.contains(name)) return error.ReadonlyFunction;
         const owned = try self.gpa.dupe(u8, source);
         errdefer self.gpa.free(owned);
         const gop = try self.funcs.getOrPut(name);
@@ -717,6 +757,65 @@ pub const Shell = struct {
             gop.key_ptr.* = try self.gpa.dupe(u8, name);
         }
         gop.value_ptr.* = owned;
+    }
+
+    /// `export -f` / `readonly -f`: the name of an existing function is added to `set`.
+    fn markFunc(self: *Shell, set: *std.StringHashMap(void), name: []const u8) !void {
+        if (set.contains(name)) return;
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try set.put(owned, {});
+    }
+
+    pub fn exportFunc(self: *Shell, name: []const u8) !void {
+        try self.markFunc(&self.exported_funcs, name);
+    }
+
+    pub fn unexportFunc(self: *Shell, name: []const u8) void {
+        if (self.exported_funcs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
+    }
+
+    pub fn readonlyFunc(self: *Shell, name: []const u8) !void {
+        try self.markFunc(&self.readonly_funcs, name);
+    }
+
+    pub fn isFuncReadonly(self: *const Shell, name: []const u8) bool {
+        return self.readonly_funcs.contains(name);
+    }
+
+    pub fn pushFrame(self: *Shell, name: []const u8, call_line: u32) !void {
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.call_frames.append(self.gpa, .{ .name = owned, .call_line = call_line });
+    }
+
+    pub fn popFrame(self: *Shell) void {
+        const frame = self.call_frames.pop() orelse return;
+        self.gpa.free(frame.name);
+    }
+
+    /// Whether a history entry is the one made for the command line being run
+    /// right now, by identity: an identical earlier entry does not count.
+    pub fn isEnteredLine(self: *const Shell, entry: []const u8) bool {
+        return self.entered_entry.len != 0 and entry.ptr == self.entered_entry.ptr and entry.len == self.entered_entry.len;
+    }
+
+    /// The function as `() { ... }` for `BASH_FUNC_name%%`, or null for a
+    /// declaration that has no such form (named parameters).
+    pub fn exportForm(self: *const Shell, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+        const source = self.funcs.get(name) orelse return null;
+        var rest: []const u8 = std.mem.trim(u8, source, " \t\r\n");
+        inline for (.{ "function", "fn" }) |keyword| {
+            if (std.mem.startsWith(u8, rest, keyword) and rest.len > keyword.len and (rest[keyword.len] == ' ' or rest[keyword.len] == '\t')) {
+                rest = std.mem.trimStart(u8, rest[keyword.len..], " \t");
+                break;
+            }
+        }
+        if (!std.mem.startsWith(u8, rest, name)) return null;
+        rest = std.mem.trimStart(u8, rest[name.len..], " \t");
+        if (std.mem.startsWith(u8, rest, "()")) return rest;
+        if (std.mem.startsWith(u8, rest, "{")) return try std.fmt.allocPrint(arena, "() {s}", .{rest});
+        return null;
     }
 
     pub fn getFunc(self: *const Shell, name: []const u8) ?[]const u8 {

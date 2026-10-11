@@ -3,15 +3,18 @@
 const std = @import("std");
 const builtins = @import("../builtins.zig");
 const history = @import("../history.zig");
+const histexpand = @import("../interactive/histexpand.zig");
 
 const Ctx = builtins.Ctx;
 
-const usage = "history: usage: history [-c] [-d offset] [n] or history -anrw [filename]\n";
+const usage = "history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]\n";
 
 pub fn run(ctx: Ctx) u8 {
     var clear = false;
     var delete: ?[]const u8 = null;
     var file_op: ?u8 = null;
+    var print_args = false;
+    var store_args = false;
     var index: usize = 1;
     while (index < ctx.argv.len) : (index += 1) {
         const arg = ctx.argv[index];
@@ -36,17 +39,15 @@ pub fn run(ctx: Ctx) u8 {
                 }
                 break;
             },
-            'a', 'r', 'w' => {
+            'a', 'n', 'r', 'w' => {
                 if (file_op != null and file_op.? != flag) {
                     ctx.err("wsh: history: cannot use more than one of -anrw\n");
                     return 1;
                 }
                 file_op = flag;
             },
-            'n', 'p', 's' => {
-                ctx.errFmt("wsh: history: -{c}: not supported\n", .{flag});
-                return 2;
-            },
+            'p' => print_args = true,
+            's' => store_args = true,
             else => {
                 ctx.errFmt("wsh: history: -{c}: invalid option\n", .{flag});
                 ctx.err(usage);
@@ -55,6 +56,9 @@ pub fn run(ctx: Ctx) u8 {
         };
     }
     const rest = ctx.argv[@min(index, ctx.argv.len)..];
+
+    if (print_args) return printExpansions(ctx, rest);
+    if (store_args) return storeArgs(ctx, rest);
 
     if (!clear and delete == null and file_op == null) {
         if (rest.len == 0) return list(ctx, 0);
@@ -85,6 +89,55 @@ pub fn run(ctx: Ctx) u8 {
     if (rest.len != 0) {
         ctx.err("wsh: history: too many arguments\n");
         return 1;
+    }
+    return 0;
+}
+
+/// `history -p arg...`: prints each argument after history expansion, without
+/// storing anything.
+fn printExpansions(ctx: Ctx, args: []const []const u8) u8 {
+    const arena = ctx.sh.scratch();
+    for (args) |arg| {
+        const outcome = histexpand.expand(arena, &ctx.sh.hist, arg) catch return 1;
+        switch (outcome) {
+            .unchanged => ctx.out(arg),
+            .expanded, .print_only => |text| ctx.out(text),
+            .failed => |message| {
+                ctx.errFmt("wsh: {s}\n", .{message});
+                return 1;
+            },
+        }
+        ctx.out("\n");
+    }
+    return 0;
+}
+
+/// `history -s arg...`: stores the arguments, joined by spaces, as one entry.
+/// The `history -s` line itself is dropped first, as in bash.
+fn storeArgs(ctx: Ctx, args: []const []const u8) u8 {
+    if (args.len == 0) return 0;
+    const sh = ctx.sh;
+    if (sh.hist.count() > 0 and sh.isEnteredLine(sh.hist.get(sh.hist.count() - 1))) {
+        // It reached the history file when it was entered; take it out there too.
+        const own = sh.gpa.dupe(u8, sh.hist.get(sh.hist.count() - 1)) catch return 1;
+        defer sh.gpa.free(own);
+        sh.hist.remove(sh.gpa, sh.hist.count() - 1);
+        if (sh.history_path.len != 0) {
+            sh.hist.file_entries = history.forgetInFile(sh.gpa, sh.history_path, &.{own}) catch {
+                ctx.errFmt("wsh: history: {s}: cannot rewrite\n", .{sh.history_path});
+                return 1;
+            };
+        }
+    }
+    const line = std.mem.join(sh.scratch(), " ", args) catch return 1;
+    const entry = (sh.hist.record(sh.gpa, line, .{ .ignoredups = false }) catch return 1) orelse return 0;
+    // Entries reach the history file as they are entered; this one is no exception.
+    if (sh.history_path.len != 0) {
+        sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
+            ctx.errFmt("wsh: history: {s}: cannot write\n", .{sh.history_path});
+            return 1;
+        };
+        sh.hist.unsaved = sh.hist.count();
     }
     return 0;
 }
@@ -196,6 +249,14 @@ fn fileOperation(ctx: Ctx, op: u8, file: ?[]const u8) u8 {
                     ctx.errFmt("wsh: history: {s}: cannot write\n", .{path});
                     return 1;
                 };
+            }
+        },
+        'n' => {
+            const skip = if (is_history_file) sh.hist.file_entries else 0;
+            const total = (sh.hist.readNewFrom(sh.gpa, path, skip) catch return 1) orelse return 1;
+            if (is_history_file) {
+                sh.hist.file_entries = total;
+                return 0;
             }
         },
         'r' => {

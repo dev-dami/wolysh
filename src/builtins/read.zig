@@ -200,7 +200,7 @@ const TerminalMode = struct {
 
 // --- read --------------------------------------------------------------------
 
-const read_usage = "wsh: read: usage: read [-rs] [-a array] [-d delim] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]\n";
+const read_usage = "wsh: read: usage: read [-rseE] [-i text] [-a array] [-d delim] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]\n";
 
 /// The bytes of one record, with a flag per byte saying whether a backslash
 /// escaped it (escaped bytes never split fields).
@@ -224,8 +224,10 @@ pub fn read(ctx: Ctx) u8 {
     var prompt: ?[]const u8 = null;
     var timeout: ?i128 = null;
     var fd = ctx.stdin;
+    var editing = false;
+    var initial: ?[]const u8 = null;
 
-    var parser = options.Parser.init(ctx.argv, "ra:d:n:N:p:st:u:eiE");
+    var parser = options.Parser.init(ctx.argv, "ra:d:n:N:p:st:u:ei:E");
     while (true) {
         switch (parser.next()) {
             .end => break,
@@ -257,10 +259,11 @@ pub fn read(ctx: Ctx) u8 {
                     return 1;
                 },
                 'u' => fd = parseFd(ctx, "read", parser.optarg) orelse return 1,
-                else => {
-                    ctx.errFmt("wsh: read: -{c}: line editing is not supported\n", .{c});
-                    return 2;
-                },
+                // Line editing is the terminal driver's (erase, kill-word,
+                // kill-line); `-i` queues its text as if it had been typed.
+                'e', 'E' => editing = true,
+                'i' => initial = parser.optarg,
+                else => unreachable,
             },
         }
     }
@@ -292,6 +295,9 @@ pub fn read(ctx: Ctx) u8 {
     if (prompt) |text| {
         if (is_tty) ctx.err(text);
     }
+    if (editing and is_tty) {
+        if (initial) |text| queueInput(fd, text, nchars, delim);
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
     defer arena_state.deinit();
@@ -322,6 +328,22 @@ pub fn read(ctx: Ctx) u8 {
         return 1;
     };
     return if (assigned) status else 1;
+}
+
+/// Pushes `text` onto the terminal's input queue (`TIOCSTI`), so it appears
+/// on the line being read. Best effort: some kernels disable the ioctl.
+fn queueInput(fd: i32, text: []const u8, limit: ?usize, delim: u8) void {
+    const tiocsti = 0x5412;
+    // Only what `read` will consume may be queued: anything past `-n`/`-N`
+    // characters or the delimiter would be left for the next command.
+    const capped = if (limit) |n| text[0..@min(n, text.len)] else text;
+    for (capped) |*byte| {
+        if (byte.* == delim) return;
+        // A control byte would act on the line discipline (newline submits,
+        // Ctrl-D ends input) or leave commands queued, so queueing stops there.
+        if ((byte.* < 0x20 and byte.* != '\t') or byte.* == 0x7f) return;
+        if (linux.errno(linux.ioctl(fd, tiocsti, @intFromPtr(byte))) != .SUCCESS) return;
+    }
 }
 
 const RecordOptions = struct {

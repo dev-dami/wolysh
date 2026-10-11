@@ -94,6 +94,9 @@ pub const Command = struct {
     /// `if`, loops, `case` and `select`. Like a group, a compound command runs
     /// in the current shell unless it is piped or backgrounded.
     compound: ?*Compound = null,
+    /// `coproc [NAME] command`: the name of the coprocess; the command runs in
+    /// the background with its input and output connected to the shell.
+    coproc: ?[]const u8 = null,
 };
 
 pub const ChainOp = enum { and_, or_ };

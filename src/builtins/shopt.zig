@@ -5,17 +5,27 @@ const linux = std.os.linux;
 const builtins = @import("../builtins.zig");
 const shellmod = @import("../shell.zig");
 const sys = @import("../sys.zig");
+const set_builtin = @import("set.zig");
 
 const Options = shellmod.Options;
 
 /// Every name `shopt` accepts, in the order it lists them.
-const names = [_][]const u8{ "dotglob", "extglob", "failglob", "globstar", "nocaseglob", "nocasematch", "nullglob" };
+pub const names = [_][]const u8{ "dotglob", "extglob", "failglob", "globstar", "nocaseglob", "nocasematch", "nullglob" };
 
 fn flag(options: *Options, name: []const u8) ?*bool {
     inline for (names) |known| {
         if (std.mem.eql(u8, name, known)) return &@field(options, known);
     }
     return null;
+}
+
+/// `shopt -o` shows the `set -o` options: `set -o name` / `set +o name` for `-p`.
+fn showSetOption(ctx: builtins.Ctx, name: []const u8, on: bool, as_command: bool) void {
+    if (as_command) {
+        ctx.outFmt("set {s}o {s}\n", .{ if (on) "-" else "+", name });
+    } else {
+        ctx.outFmt("{s:<15}\t{s}\n", .{ name, if (on) "on" else "off" });
+    }
 }
 
 fn show(ctx: builtins.Ctx, name: []const u8, on: bool, as_command: bool) void {
@@ -34,6 +44,7 @@ pub fn run(ctx: builtins.Ctx) u8 {
     var unset = false;
     var as_command = false;
     var quiet = false;
+    var set_options = false;
     var index: usize = 1;
     while (index < ctx.argv.len) : (index += 1) {
         const arg = ctx.argv[index];
@@ -48,13 +59,10 @@ pub fn run(ctx: builtins.Ctx) u8 {
                 'u' => unset = true,
                 'p' => as_command = true,
                 'q' => quiet = true,
-                'o' => {
-                    ctx.err("wsh: shopt: -o: not supported; use set -o\n");
-                    return 2;
-                },
+                'o' => set_options = true,
                 else => {
                     ctx.errFmt("wsh: shopt: -{c}: invalid option\n", .{c});
-                    ctx.err("shopt: usage: shopt [-pqsu] [optname ...]\n");
+                    ctx.err("shopt: usage: shopt [-pqsu] [-o] [optname ...]\n");
                     return 2;
                 },
             }
@@ -67,6 +75,7 @@ pub fn run(ctx: builtins.Ctx) u8 {
 
     const options = &ctx.sh.options;
     const requested = ctx.argv[index..];
+    if (set_options) return runSetOptions(ctx, requested, set, unset, as_command, quiet);
     if (requested.len == 0) {
         for (names) |name| {
             const on = flag(options, name).?.*;
@@ -90,6 +99,37 @@ pub fn run(ctx: builtins.Ctx) u8 {
         } else {
             if (!target.*) status = 1;
             if (!quiet) show(ctx, name, target.*, as_command);
+        }
+    }
+    return status;
+}
+
+/// `shopt -o`: the same listing, setting and querying, over the `set -o` options.
+fn runSetOptions(ctx: builtins.Ctx, requested: []const []const u8, set: bool, unset: bool, as_command: bool, quiet: bool) u8 {
+    const options = &ctx.sh.options;
+    if (requested.len == 0) {
+        var i: usize = 0;
+        while (i < set_builtin.option_count) : (i += 1) {
+            const on = set_builtin.get(options, i);
+            if ((set and !on) or (unset and on)) continue;
+            if (!quiet) showSetOption(ctx, set_builtin.optionName(i), on, as_command);
+        }
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (requested) |name| {
+        const found = set_builtin.byName(name) orelse {
+            ctx.errFmt("wsh: shopt: {s}: invalid option name\n", .{name});
+            status = 1;
+            continue;
+        };
+        if (set or unset) {
+            set_builtin.put(options, found, set);
+        } else {
+            const on = set_builtin.get(options, found);
+            if (!on) status = 1;
+            if (!quiet) showSetOption(ctx, name, on, as_command);
         }
     }
     return status;

@@ -20,6 +20,9 @@ const glob = @import("../glob.zig");
 const value = @import("../value.zig");
 const expand = @import("../expand.zig");
 const command_suggest = @import("../command_suggest.zig");
+const bindings = @import("bindings.zig");
+const set_builtin = @import("../builtins/set.zig");
+const shopt_builtin = @import("../builtins/shopt.zig");
 
 const Shell = shellmod.Shell;
 const Allocator = std.mem.Allocator;
@@ -307,7 +310,15 @@ pub fn complete(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize) !
         return .{ .start = ctx.start + dollar, .items = try dedupe(arena, items.items) };
     }
 
-    if (ctx.command_index == null and !ctx.redirect) {
+    // `complete -E` covers an empty line, `complete -I` an initial word.
+    const initial_spec = if (ctx.command_index == null and !ctx.redirect)
+        compspec.lookup(if (ctx.raw.len == 0) "-E" else "-I")
+    else
+        null;
+
+    if (initial_spec) |spec| {
+        sort = try programmable(sh, arena, line, cursor, ctx, spec, &items);
+    } else if (ctx.command_index == null and !ctx.redirect) {
         const word = ctx.raw;
         const command_count = items.items.len;
         try completeCommands(sh, arena, word, &items);
@@ -577,6 +588,8 @@ fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usiz
     if (compspec.lookup(command) orelse compspec.lookup(name)) |spec| {
         return programmable(sh, arena, line, cursor, ctx, spec, items);
     }
+    // `complete -D`: the default for commands without a specification of their own.
+    if (compspec.lookup("-D")) |spec| return programmable(sh, arena, line, cursor, ctx, spec, items);
 
     if (eql(name, "cd") or eql(name, "pushd")) {
         try completePaths(sh, arena, ctx.raw, .dirs, items);
@@ -645,43 +658,49 @@ pub const Request = struct {
 };
 
 fn programmable(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize, ctx: Context, spec: Spec, items: *std.ArrayList([]const u8)) !bool {
-    const command = ctx.words[ctx.command_index.?];
-    const relative = ctx.words[ctx.command_index.?..];
+    // No command index: the word being completed is the command name itself,
+    // so the function sees every word of the line.
+    const first = ctx.command_index orelse 0;
     const request = Request{
-        .command = command,
+        .command = if (ctx.command_index != null) ctx.words[first] else "",
         .word = ctx.word,
-        .previous = if (ctx.cword > ctx.command_index.?) ctx.words[ctx.cword - 1] else "",
+        .previous = if (ctx.cword > first) ctx.words[ctx.cword - 1] else "",
         .line = line[ctx.line_start..ctx.line_end],
         .point = cursor - ctx.line_start,
-        .words = relative,
-        .cword = ctx.cword - ctx.command_index.?,
+        .words = ctx.words[first..],
+        .cword = ctx.cword - first,
     };
+    // `compopt` with no command name, run from a completion function, edits
+    // the options of the specification being used.
+    var opts = spec.options;
+    compspec.active_options = &opts;
+    defer compspec.active_options = null;
     var candidates: std.ArrayList([]const u8) = .empty;
     try generate(sh, arena, spec, request, &candidates);
-    if (spec.options.plusdirs) try pathNames(sh, arena, ctx.word, .dirs, &candidates);
+    if (opts.plusdirs) try pathNames(sh, arena, ctx.word, .dirs, &candidates);
 
-    const filenames = spec.options.filenames or spec.actions.file or spec.actions.directory or spec.options.plusdirs;
+    const filenames = opts.filenames or spec.actions.file or spec.actions.directory or opts.plusdirs;
     for (candidates.items) |candidate| {
         if (filenames) {
             const expanded = try sh.tildeExpand(arena, candidate);
             const is_dir = fs.isDir(try arena.dupeZ(u8, expanded));
-            const text = if (spec.options.noquote) candidate else try quotePath(arena, candidate);
-            const suffix: []const u8 = if (is_dir) "/" else if (spec.options.nospace) "" else " ";
+            const text = if (opts.noquote) candidate else try quotePath(arena, candidate);
+            const suffix: []const u8 = if (is_dir) "/" else if (opts.nospace) "" else " ";
             try items.append(arena, try std.mem.concat(arena, u8, &.{ text, suffix }));
         } else {
-            const suffix: []const u8 = if (spec.options.nospace) "" else " ";
+            const suffix: []const u8 = if (opts.nospace) "" else " ";
             try items.append(arena, try std.mem.concat(arena, u8, &.{ candidate, suffix }));
         }
     }
 
     if (items.items.len == 0) {
-        if (spec.options.dirnames) {
+        if (opts.dirnames) {
             try completePaths(sh, arena, ctx.raw, .dirs, items);
-        } else if (spec.options.default or spec.options.bashdefault) {
+        } else if (opts.default or opts.bashdefault) {
             try completePaths(sh, arena, ctx.raw, .all, items);
         }
     }
-    return !spec.options.nosort;
+    return !opts.nosort;
 }
 
 /// The candidates a specification produces for `request.word`, in bash's
@@ -722,7 +741,7 @@ pub fn generate(sh: *Shell, arena: Allocator, spec: Spec, request: Request, out:
         }
     }
     if (actions.keyword) {
-        const keywords = [_][]const u8{ "!", "case", "do", "done", "elif", "else", "esac", "fi", "fn", "for", "function", "if", "in", "let", "return", "select", "then", "time", "until", "while", "{", "}" };
+        const keywords = [_][]const u8{ "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "fn", "for", "function", "if", "in", "let", "return", "select", "then", "time", "until", "while", "{", "}" };
         for (keywords) |keyword| if (std.mem.startsWith(u8, keyword, word)) try generated.append(arena, keyword);
     }
     if (actions.signal) {
@@ -736,6 +755,41 @@ pub fn generate(sh: *Shell, arena: Allocator, spec: Spec, request: Request, out:
     }
     if (actions.user) try passwdNames(arena, "/etc/passwd", word, &generated);
     if (actions.variable) try variableNames(sh, arena, word, &generated);
+    if (actions.arrayvar) {
+        var it = sh.vars.iterator();
+        while (it.next()) |entry| {
+            const is_array = switch (entry.value_ptr.*) {
+                .list, .map => true,
+                else => false,
+            };
+            if (is_array and std.mem.startsWith(u8, entry.key_ptr.*, word)) try generated.append(arena, try arena.dupe(u8, entry.key_ptr.*));
+        }
+    }
+    if (actions.binding) {
+        for (bindings.functionNames()) |name| if (std.mem.startsWith(u8, name, word)) try generated.append(arena, name);
+    }
+    if (actions.enabled or actions.disabled) {
+        for (builtins.all()) |b| {
+            if (!std.mem.startsWith(u8, b.name, word)) continue;
+            const on = builtins.isEnabled(b.name);
+            if ((on and actions.enabled) or (!on and actions.disabled)) try generated.append(arena, b.name);
+        }
+    }
+    if (actions.helptopic) {
+        for (builtins.all()) |b| if (std.mem.startsWith(u8, b.name, word)) try generated.append(arena, b.name);
+        for ([_][]const u8{ ".", "eval", "source" }) |name| if (std.mem.startsWith(u8, name, word)) try generated.append(arena, name);
+    }
+    if (actions.service) try serviceNames(arena, word, &generated);
+    if (actions.setopt) {
+        var index: usize = 0;
+        while (index < set_builtin.option_count) : (index += 1) {
+            const name = set_builtin.optionName(index);
+            if (std.mem.startsWith(u8, name, word)) try generated.append(arena, name);
+        }
+    }
+    if (actions.shopt) {
+        for (shopt_builtin.names) |name| if (std.mem.startsWith(u8, name, word)) try generated.append(arena, name);
+    }
 
     if (spec.glob) |pattern| {
         var matches: std.ArrayList([]const u8) = .empty;
@@ -1300,6 +1354,18 @@ fn passwdNames(arena: Allocator, path: [:0]const u8, prefix: []const u8, out: *s
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = line[0..colon];
         if (name.len == 0 or name[0] == '#' or name[0] == '+' or name[0] == '-') continue;
+        if (std.mem.startsWith(u8, name, prefix)) try out.append(arena, name);
+    }
+}
+
+/// Service names from /etc/services: the first field of each line.
+fn serviceNames(arena: Allocator, prefix: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const text = (fs.readFileAlloc(arena, "/etc/services", helper_output_max) catch null) orelse return;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const name = fields.next() orelse continue;
+        if (name[0] == '#') continue;
         if (std.mem.startsWith(u8, name, prefix)) try out.append(arena, name);
     }
 }

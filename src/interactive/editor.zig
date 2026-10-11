@@ -24,6 +24,7 @@ const complete = @import("complete.zig");
 const wcwidth = @import("wcwidth.zig");
 const histexpand = @import("histexpand.zig");
 const vi = @import("vi.zig");
+const bindings = @import("bindings.zig");
 
 const Shell = shellmod.Shell;
 pub const IsComplete = *const fn ([]const u8) bool;
@@ -411,6 +412,15 @@ pub const Editor = struct {
             return .handled;
         }
 
+        const chord: ?bindings.Chord = switch (key) {
+            .byte => |b| .{ .byte = b },
+            .alt => |c| .{ .meta = true, .byte = c },
+            else => null,
+        };
+        if (chord) |c| {
+            if (bindings.lookup(c)) |target| return self.runBinding(target, key);
+        }
+
         switch (key) {
             // The terminal is gone or the shell got SIGHUP: no more keys will
             // come, even with text on the line (Ctrl-D arrives as a byte).
@@ -457,6 +467,96 @@ pub const Editor = struct {
             .page_up, .page_down, .resize, .unknown => {},
         }
         return .handled;
+    }
+
+    /// A key rebound with `bind`.
+    fn runBinding(self: *Editor, target: bindings.Target, key: Key) Outcome {
+        switch (target) {
+            .unbound => return .handled,
+            .function => |function| return self.runFunction(function, key),
+            .command => |text| {
+                self.runBoundCommand(text);
+                return .handled;
+            },
+        }
+    }
+
+    fn runFunction(self: *Editor, function: bindings.Function, key: Key) Outcome {
+        switch (function) {
+            .accept_line => return .accept,
+            .abort => {},
+            .backward_char => self.moveLeft(),
+            .backward_delete_char => self.deleteBefore(),
+            .backward_kill_word => self.killWordBackward(),
+            .backward_word => self.moveWordLeft(),
+            .beginning_of_line => self.cursor = 0,
+            .capitalize_word => self.changeWordCase(.capital),
+            .clear_screen => self.clearScreen(),
+            .complete => self.handleTab(),
+            .delete_char => self.deleteAtCursor(),
+            .downcase_word => self.changeWordCase(.lower),
+            .end_of_line => self.cursor = self.buf.items.len,
+            .forward_char => self.moveRight(),
+            .forward_word => self.moveWordRight(),
+            .kill_line => self.killRange(self.cursor, self.buf.items.len, .forward, true),
+            .kill_word => self.killWordForward(),
+            .next_history => self.historyNext(),
+            .previous_history => self.historyPrev(),
+            .reverse_search_history => self.reverseSearch(),
+            .self_insert => switch (key) {
+                .byte => |b| if (b >= 0x20 and b != 0x7f) {
+                    self.insertSlice(&.{b});
+                    self.this_command = .insert;
+                },
+                .alt => |c| if (c >= 0x20 and c != 0x7f) {
+                    self.insertSlice(&.{c});
+                    self.this_command = .insert;
+                },
+                else => {},
+            },
+            .transpose_chars => self.transpose(),
+            .undo => self.undo(),
+            .unix_line_discard => self.killRange(0, self.cursor, .backward, true),
+            .unix_word_rubout => self.killWordBackwardUnix(),
+            .upcase_word => self.changeWordCase(.upper),
+            .yank => self.yank(),
+            .yank_last_arg => self.yankLastArg(),
+            .yank_pop => self.yankPop(),
+        }
+        return .handled;
+    }
+
+    /// `bind -x`: runs a shell command with the line in `READLINE_LINE` and
+    /// the cursor in `READLINE_POINT`, then takes both back.
+    fn runBoundCommand(self: *Editor, command: []const u8) void {
+        const runner = self.sh.trap_runner orelse return;
+        const sh = self.sh;
+        var cursor_text: [24]u8 = undefined;
+        const point = std.fmt.bufPrint(&cursor_text, "{d}", .{self.cursor}) catch return;
+        sh.setVar("READLINE_LINE", .{ .string = self.buf.items }) catch return;
+        sh.setVar("READLINE_POINT", .{ .string = point }) catch return;
+
+        self.leaveFrame();
+        self.write(term.paste_off);
+        if (self.raw) |raw| raw.disable();
+        const saved_status = sh.last_status;
+        _ = runner(sh, command, 1);
+        sh.last_status = saved_status;
+        if (self.raw) |raw| {
+            if (term.RawMode.enable(self.in_fd)) |again| raw.* = again;
+        }
+        self.write(term.paste_on);
+
+        if (sh.getVar("READLINE_LINE")) |line| {
+            if (std.meta.activeTag(line) == .string) self.setLine(line.string);
+        }
+        if (sh.getVar("READLINE_POINT")) |position| {
+            if (position.asInt()) |n| {
+                if (n >= 0) self.cursor = @min(@as(usize, @intCast(n)), self.buf.items.len);
+            }
+        }
+        _ = sh.unsetVar("READLINE_LINE");
+        _ = sh.unsetVar("READLINE_POINT");
     }
 
     fn handleControlOrByte(self: *Editor, b: u8) Outcome {

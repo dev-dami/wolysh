@@ -7,6 +7,26 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Builtins `enable`, `bind`, `caller`, `fc`, `compopt` and `suspend`, and the
+  `coproc` keyword (`NAME[0]` reads from the coprocess, `NAME[1]` writes to it,
+  `NAME_PID` holds its process id).
+- `export -f` and `readonly -f`; exported functions reach child shells as
+  `BASH_FUNC_name%%` and are restored on startup.
+- `history -n`, `-p` and `-s`, `shopt -o`, `read -e`, `-E` and `-i`.
+- `complete`/`compopt` with `-D`, `-E` and `-I`, `complete -s`, and the
+  `arrayvar`, `binding`, `disabled`, `enabled`, `helptopic`, `service`,
+  `setopt` and `shopt` actions.
+- Back-references (`\1` to `\9`) in `[[ =~ ]]` patterns, matched by a
+  backtracking engine that gives up after a fixed amount of work.
+- `BASH_COMMAND` is set while a DEBUG trap runs.
+
+### Fixed
+
+- After the "There are stopped jobs." warning, an empty or cancelled line now
+  disarms it, so only an immediately repeated `exit` leaves the shell.
+
 ## [0.5.0] - 2026-10-06
 
 Most of Bash's scripting language now works in wsh. The scripting features

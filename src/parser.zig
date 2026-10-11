@@ -1145,6 +1145,26 @@ pub const Parser = struct {
     fn parseCommand(self: *Parser) Error!ast.Command {
         self.setMode(.word);
         if (self.tok.tag == .word and oneOf(self.tok.text, &list_terminators)) return self.fail("unexpected keyword");
+        var coproc: ?[]const u8 = null;
+        if (isKeyword(self.tok, "coproc")) {
+            const before = self.save();
+            self.advance();
+            self.setMode(.word);
+            var coproc_name: []const u8 = "COPROC";
+            // `coproc NAME compound` names the coprocess; otherwise the word
+            // after `coproc` already starts the command.
+            if (self.tok.tag == .word and isIdentifier(self.tok.text) and !oneOf(self.tok.text, &list_terminators)) {
+                const after_keyword = self.save();
+                const word = self.tok.text;
+                self.advance();
+                self.setMode(.word);
+                const compound_follows = self.tok.tag == .lbrace or self.tok.tag == .lparen or
+                    (self.tok.tag == .word and oneOf(self.tok.text, &compound_keywords));
+                if (compound_follows) coproc_name = word else self.restore(after_keyword);
+            }
+            // A bare `coproc` is an ordinary command word.
+            if (self.atPipelineEnd()) self.restore(before) else coproc = coproc_name;
+        }
         var words: std.ArrayList(ast.Word) = .empty;
         var redirects: std.ArrayList(ast.Redirect) = .empty;
         var assigns: std.ArrayList(ast.PrefixAssign) = .empty;
@@ -1334,6 +1354,7 @@ pub const Parser = struct {
             .group = group,
             .assigns = try assigns.toOwnedSlice(self.arena),
             .compound = compound,
+            .coproc = coproc,
         };
         for (command.redirects) |*redirect| {
             if (redirect.kind == .here_doc) try self.pending_heredocs.append(self.arena, redirect);

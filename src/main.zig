@@ -100,6 +100,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     };
 
+    importExportedFunctions(&sh, gpa);
+
     // bash's rule: interactive when commands come from a terminal and errors
     // go to one, or when `-i` asks for it. Standard output may be a pipe.
     const reads_input = options.command == null and options.script == null;
@@ -423,15 +425,20 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         if (proc.hangupPending()) return hangUp(sh);
         // A SIGINT sent while the line was being typed must not cancel it.
         sh.interrupted = false;
-        if (editor_state.interrupted) continue;
-        if (source.len == 0) continue;
+        // A cancelled or empty line is not a repeated `exit`: disarm the warning.
+        if (editor_state.interrupted or source.len == 0) {
+            sh.exit_warned = false;
+            continue;
+        }
 
         const line = histexpand.apply(sh, source) orelse continue;
-        recordHistory(sh, line, &history_error_reported);
+        const entry = recordHistory(sh, line, &history_error_reported);
         prompt.command_number += 1;
         session.beforeCommand(sh, line);
         const warned = sh.exit_warned;
+        sh.entered_entry = entry orelse "";
         var status = exec.runSource(sh, line);
+        sh.entered_entry = "";
         // Only an immediately repeated `exit` gets past the stopped-jobs warning.
         if (warned) sh.exit_warned = false;
         if (sh.interrupted) {
@@ -449,6 +456,35 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
     return strict.finish(sh, sh.exit_code);
 }
 
+/// Turns inherited `BASH_FUNC_name%%` entries (from `export -f`) back into
+/// functions, still marked as exported. The entries leave the environment.
+fn importExportedFunctions(sh: *Shell, gpa: std.mem.Allocator) void {
+    const prefix = "BASH_FUNC_";
+    const suffix = "%%";
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |key| gpa.free(key);
+        keys.deinit(gpa);
+    }
+    var it = sh.env.keyIterator();
+    while (it.next()) |key| {
+        if (!std.mem.startsWith(u8, key.*, prefix) or !std.mem.endsWith(u8, key.*, suffix)) continue;
+        const copy = gpa.dupe(u8, key.*) catch return;
+        keys.append(gpa, copy) catch {
+            gpa.free(copy);
+            return;
+        };
+    }
+    for (keys.items) |key| {
+        const name = key[prefix.len .. key.len - suffix.len];
+        const definition = gpa.dupe(u8, sh.getEnv(key) orelse "") catch return;
+        defer gpa.free(definition);
+        _ = sh.unsetEnv(key);
+        if (name.len == 0 or !std.mem.startsWith(u8, definition, "()")) continue;
+        if (exec.importFunction(sh, name, definition)) sh.exportFunc(name) catch {};
+    }
+}
+
 /// SIGHUP: entries already reached the history file as they were entered, so
 /// the jobs get the hangup, the EXIT trap runs and the shell exits.
 fn hangUp(sh: *Shell) u8 {
@@ -459,19 +495,20 @@ fn hangUp(sh: *Shell) u8 {
 
 /// Adds an entered line to the history under `HISTCONTROL` and appends it to
 /// the history file at once. A file that cannot be written is reported once.
-fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) void {
+fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) ?[]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
     defer arena_state.deinit();
     const control_text = prompt.textVar(sh, arena_state.allocator(), "HISTCONTROL") catch null;
-    const entry = (sh.hist.record(sh.gpa, source, history.Control.parse(control_text)) catch return) orelse return;
-    if (sh.history_path.len == 0) return;
+    const entry = (sh.hist.record(sh.gpa, source, history.Control.parse(control_text)) catch return null) orelse return null;
+    if (sh.history_path.len == 0) return entry;
     sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
-        if (reported.*) return;
+        if (reported.*) return entry;
         reported.* = true;
         var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot write {s}\n", .{sh.history_path}) catch return;
+        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot write {s}\n", .{sh.history_path}) catch return entry;
         sys.writeStr(2, msg);
     };
+    return entry;
 }
 
 /// Puts the shell in its own process group and claims the terminal, which is

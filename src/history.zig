@@ -145,6 +145,23 @@ pub const History = struct {
         return true;
     }
 
+    /// Adds the entries of a history file after its first `skip`, for
+    /// `history -n`. Returns how many entries the file holds, or null when it
+    /// does not exist.
+    pub fn readNewFrom(self: *History, allocator: std.mem.Allocator, path: []const u8, skip_entries: usize) !?usize {
+        const data = (try readFile(allocator, path)) orelse return null;
+        defer allocator.free(data);
+        var lines = try fileLines(allocator, data);
+        defer lines.list.deinit(allocator);
+        const skip = @min(skip_entries, lines.list.items.len);
+        for (lines.list.items[skip..]) |line| {
+            const entry = if (lines.escaped) try decode(allocator, line) else try allocator.dupe(u8, line);
+            defer allocator.free(entry);
+            _ = try self.record(allocator, entry, .{ .ignoredups = false });
+        }
+        return lines.list.items.len;
+    }
+
     /// Appends one entry to the history file with a single `O_APPEND` write,
     /// so concurrent shells interleave whole entries. The file is trimmed to
     /// `limit` once it has grown well past it.

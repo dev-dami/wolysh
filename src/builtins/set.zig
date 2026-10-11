@@ -36,20 +36,20 @@ const options = [_]Option{
     .{ .name = "xtrace", .letter = 'x', .field = "xtrace" },
 };
 
-fn get(opts: *const Options, index: usize) bool {
+pub fn get(opts: *const Options, index: usize) bool {
     inline for (options, 0..) |option, i| {
         if (i == index) return @field(opts, option.field) != option.inverted;
     }
     unreachable;
 }
 
-fn put(opts: *Options, index: usize, on: bool) void {
+pub fn put(opts: *Options, index: usize, on: bool) void {
     inline for (options, 0..) |option, i| {
         if (i == index) @field(opts, option.field) = on != option.inverted;
     }
 }
 
-fn byName(name: []const u8) ?usize {
+pub fn byName(name: []const u8) ?usize {
     for (options, 0..) |option, index| {
         if (std.mem.eql(u8, option.name, name)) return index;
     }
@@ -61,6 +61,13 @@ fn byLetter(letter: u8) ?usize {
         if (option.letter == letter) return index;
     }
     return null;
+}
+
+/// How many `set -o` options there are, and the name of each, for `shopt -o`.
+pub const option_count = options.len;
+
+pub fn optionName(index: usize) []const u8 {
+    return options[index].name;
 }
 
 /// `-o NAME`/`+o NAME`, shared with the command line. False for an unknown
