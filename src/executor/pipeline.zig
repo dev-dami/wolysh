@@ -320,6 +320,20 @@ fn launchCoproc(
     return 0;
 }
 
+/// True when `cat`'s arguments name no file: only options, or nothing. A lone
+/// `-` asks for standard input explicitly, so it counts as something to read.
+fn catHasNothingToRead(args: []const []const u8) bool {
+    var options_ended = false;
+    for (args) |arg| {
+        if (!options_ended and std.mem.eql(u8, arg, "--")) {
+            options_ended = true;
+            continue;
+        }
+        if (options_ended or arg.len == 0 or arg[0] != '-' or arg.len == 1) return false;
+    }
+    return true;
+}
+
 fn runSingle(
     sh: *Shell,
     arena: std.mem.Allocator,
@@ -402,6 +416,15 @@ fn runSingle(
     const name = call_argv[0];
     const text = pipelineText(arena, &.{cmd}) catch name;
     strict.traceCommand(sh, call_argv);
+
+    if (sh.interactive and std.mem.eql(u8, name, "cat") and !command.isInternal(sh, name) and
+        catHasNothingToRead(call_argv[1..]) and sys.isTty(prepared.fds.in))
+    {
+        // A bare `cat` at the prompt would just sit waiting for typed input.
+        sys.writeStr(prepared.fds.err, "wsh: cat: nothing to cat (name a file, or pipe something in)\n");
+        sh.last_status = 1;
+        return 1;
+    }
 
     if (command.isInternal(sh, name) and !background) {
         const high = prepared.enter(arena) catch |err| return runtime.expression_error(sh, err);
