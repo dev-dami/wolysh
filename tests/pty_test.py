@@ -305,7 +305,7 @@ def main():
 
     # 8c. a subshell keeps terminal input in the foreground and returns control.
     s.clear()
-    s.send("(cat; echo SUBSHELL_DONE)\r")
+    s.send("(cat -; echo SUBSHELL_DONE)\r")
     s.drain(0.3)
     initial = strip_ansi(s.buf)
     initial_lines = [line.strip() for line in initial.replace(b"\r", b"").split(b"\n")]
