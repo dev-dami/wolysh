@@ -825,7 +825,9 @@ const Backtracker = struct {
             if (self.found or self.steps >= step_limit or start >= self.text.len) break;
             start += decodeAt(self.text, start).len;
         }
-        if (!self.found) return null;
+        // A search cut short has no trustworthy answer: the longest match may
+        // lie beyond the point where it stopped.
+        if (!self.found or self.steps >= step_limit) return null;
 
         const groups = try self.re.allocator.alloc(?Span, self.re.groups + 1);
         for (groups, 0..) |*group, i| {

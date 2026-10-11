@@ -589,7 +589,7 @@ fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usiz
         return programmable(sh, arena, line, cursor, ctx, spec, items);
     }
     // `complete -D`: the default for commands without a specification of their own.
-    const default_spec = compspec.lookup("-D");
+    if (compspec.lookup("-D")) |spec| return programmable(sh, arena, line, cursor, ctx, spec, items);
 
     if (eql(name, "cd") or eql(name, "pushd")) {
         try completePaths(sh, arena, ctx.raw, .dirs, items);
@@ -623,7 +623,6 @@ fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usiz
         try appendOptions(arena, items, options, word);
         if (items.items.len > 0) return true;
     }
-    if (default_spec) |spec| return programmable(sh, arena, line, cursor, ctx, spec, items);
     try completePaths(sh, arena, ctx.raw, .all, items);
     return true;
 }
@@ -659,15 +658,16 @@ pub const Request = struct {
 };
 
 fn programmable(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize, ctx: Context, spec: Spec, items: *std.ArrayList([]const u8)) !bool {
-    // No command index: the word being completed is the command name itself.
-    const first = ctx.command_index orelse ctx.cword;
+    // No command index: the word being completed is the command name itself,
+    // so the function sees every word of the line.
+    const first = ctx.command_index orelse 0;
     const request = Request{
         .command = if (ctx.command_index != null) ctx.words[first] else "",
         .word = ctx.word,
-        .previous = if (ctx.command_index != null and ctx.cword > first) ctx.words[ctx.cword - 1] else "",
+        .previous = if (ctx.cword > first) ctx.words[ctx.cword - 1] else "",
         .line = line[ctx.line_start..ctx.line_end],
         .point = cursor - ctx.line_start,
-        .words = if (ctx.command_index != null) ctx.words[first..] else &.{},
+        .words = ctx.words[first..],
         .cword = ctx.cword - first,
     };
     // `compopt` with no command name, run from a completion function, edits

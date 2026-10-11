@@ -163,6 +163,14 @@ fn functionAttribute(ctx: Ctx, mode: Mode, specs: []const []const u8, exporting:
             status = 1;
             continue;
         }
+        if (exporting and !mode.remove) {
+            const form = sh.exportForm(sh.scratch(), name) catch return 1;
+            if (form == null) {
+                ctx.errFmt("wsh: export: {s}: cannot export a function with named parameters\n", .{name});
+                status = 1;
+                continue;
+            }
+        }
         if (!exporting) {
             sh.readonlyFunc(name) catch return 1;
         } else if (mode.remove) {

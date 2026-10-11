@@ -62,8 +62,8 @@ pub const Spec = struct {
 
 /// Action letters in the order `complete -p` prints them.
 const action_letters = [_]struct { u8, []const u8 }{
-    .{ 'a', "alias" },   .{ 'b', "builtin" }, .{ 'c', "command" },  .{ 'd', "directory" },
-    .{ 'e', "export" },  .{ 'f', "file" },    .{ 'g', "group" },    .{ 'j', "job" },
+    .{ 'a', "alias" },   .{ 'b', "builtin" }, .{ 'c', "command" }, .{ 'd', "directory" },
+    .{ 'e', "export" },  .{ 'f', "file" },    .{ 'g', "group" },   .{ 'j', "job" },
     .{ 'k', "keyword" }, .{ 's', "service" }, .{ 'u', "user" },    .{ 'v', "variable" },
 };
 

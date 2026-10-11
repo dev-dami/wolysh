@@ -117,11 +117,19 @@ fn printExpansions(ctx: Ctx, args: []const []const u8) u8 {
 fn storeArgs(ctx: Ctx, args: []const []const u8) u8 {
     if (args.len == 0) return 0;
     const sh = ctx.sh;
-    if (sh.hist.count() > 0 and std.mem.startsWith(u8, sh.hist.get(sh.hist.count() - 1), "history")) {
+    if (sh.hist.count() > 0 and sh.isEnteredLine(sh.hist.get(sh.hist.count() - 1))) {
         sh.hist.remove(sh.gpa, sh.hist.count() - 1);
     }
     const line = std.mem.join(sh.scratch(), " ", args) catch return 1;
-    _ = sh.hist.record(sh.gpa, line, .{ .ignoredups = false }) catch return 1;
+    const entry = (sh.hist.record(sh.gpa, line, .{ .ignoredups = false }) catch return 1) orelse return 0;
+    // Entries reach the history file as they are entered; this one is no exception.
+    if (sh.history_path.len != 0) {
+        sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
+            ctx.errFmt("wsh: history: {s}: cannot write\n", .{sh.history_path});
+            return 1;
+        };
+        sh.hist.unsaved = sh.hist.count();
+    }
     return 0;
 }
 

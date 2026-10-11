@@ -13,9 +13,9 @@ const usage = "wsh: enable: usage: enable [-a] [-dnps] [-f filename] [name ...]\
 
 /// The POSIX special builtins, for `enable -s`.
 const special = [_][]const u8{
-    ":",     "break", "continue", "eval",  "exec",  "exit",
-    "export", "readonly", "return", "set", "shift", "source",
-    "times", "trap",  "unset",    ".",
+    ":",      "break",    "continue", "eval", "exec",  "exit",
+    "export", "readonly", "return",   "set",  "shift", "source",
+    "times",  "trap",     "unset",    ".",
 };
 
 fn isSpecial(name: []const u8) bool {

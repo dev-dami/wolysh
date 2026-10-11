@@ -21,7 +21,7 @@ fn visibleCount(ctx: Ctx) usize {
     const total = hist.count();
     if (total == 0) return 0;
     const last = hist.get(total - 1);
-    if (std.mem.startsWith(u8, last, "fc") and (last.len == 2 or last[2] == ' ' or last[2] == '\t')) return total - 1;
+    if (ctx.sh.isEnteredLine(last)) return total - 1;
     return total;
 }
 
@@ -181,7 +181,7 @@ fn runCommand(ctx: Ctx, text: []const u8) u8 {
     sys.writeStr(ctx.stderr, "\n");
     // The `fc` line itself is replaced by what actually ran.
     const hist = &ctx.sh.hist;
-    if (hist.count() > 0 and std.mem.startsWith(u8, hist.get(hist.count() - 1), "fc")) hist.remove(ctx.sh.gpa, hist.count() - 1);
+    if (hist.count() > 0 and ctx.sh.isEnteredLine(hist.get(hist.count() - 1))) hist.remove(ctx.sh.gpa, hist.count() - 1);
     _ = hist.record(ctx.sh.gpa, text, .{ .ignoredups = false }) catch {};
     return run_source(ctx.sh, text);
 }

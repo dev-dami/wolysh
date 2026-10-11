@@ -134,6 +134,9 @@ pub const Shell = struct {
     /// Set when an interactive `exit` was refused because jobs are stopped;
     /// an immediately repeated `exit` or Ctrl-D then leaves anyway.
     exit_warned: bool = false,
+    /// The interactive command line being run, so `fc` and `history -s` can
+    /// tell which history entry is the command itself. Borrowed from the REPL.
+    entered_line: []const u8 = "",
 
     pid: i32 = 0,
     shell_pgid: i32 = 0,
@@ -730,10 +733,8 @@ pub const Shell = struct {
         }
         var fit = self.exported_funcs.keyIterator();
         while (fit.next()) |name| {
-            const source = self.funcs.get(name.*) orelse continue;
-            // Bash's `() { body; }` form: everything from the parameter list on.
-            const open = std.mem.indexOfScalar(u8, source, '(') orelse continue;
-            const body = source[open..];
+            // Bash's `() { body; }` form; functions without one are not exported.
+            const body = (try self.exportForm(arena, name.*)) orelse continue;
             const pair = try std.fmt.allocPrintSentinel(arena, "BASH_FUNC_{s}%%={s}", .{ name.*, body }, 0);
             arr[i] = pair.ptr;
             i += 1;
@@ -790,6 +791,29 @@ pub const Shell = struct {
     pub fn popFrame(self: *Shell) void {
         const frame = self.call_frames.pop() orelse return;
         self.gpa.free(frame.name);
+    }
+
+    /// Whether a history entry is the command line being run right now.
+    pub fn isEnteredLine(self: *const Shell, entry: []const u8) bool {
+        return self.entered_line.len != 0 and std.mem.eql(u8, entry, std.mem.trim(u8, self.entered_line, " \t\r\n"));
+    }
+
+    /// The function as `() { ... }` for `BASH_FUNC_name%%`, or null for a
+    /// declaration that has no such form (named parameters).
+    pub fn exportForm(self: *const Shell, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+        const source = self.funcs.get(name) orelse return null;
+        var rest: []const u8 = std.mem.trim(u8, source, " \t\r\n");
+        inline for (.{ "function", "fn" }) |keyword| {
+            if (std.mem.startsWith(u8, rest, keyword) and rest.len > keyword.len and (rest[keyword.len] == ' ' or rest[keyword.len] == '\t')) {
+                rest = std.mem.trimStart(u8, rest[keyword.len..], " \t");
+                break;
+            }
+        }
+        if (!std.mem.startsWith(u8, rest, name)) return null;
+        rest = std.mem.trimStart(u8, rest[name.len..], " \t");
+        if (std.mem.startsWith(u8, rest, "()")) return rest;
+        if (std.mem.startsWith(u8, rest, "{")) return try std.fmt.allocPrint(arena, "() {s}", .{rest});
+        return null;
     }
 
     pub fn getFunc(self: *const Shell, name: []const u8) ?[]const u8 {

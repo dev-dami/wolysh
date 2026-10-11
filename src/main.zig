@@ -436,7 +436,9 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         prompt.command_number += 1;
         session.beforeCommand(sh, line);
         const warned = sh.exit_warned;
+        sh.entered_line = line;
         var status = exec.runSource(sh, line);
+        sh.entered_line = "";
         // Only an immediately repeated `exit` gets past the stopped-jobs warning.
         if (warned) sh.exit_warned = false;
         if (sh.interrupted) {

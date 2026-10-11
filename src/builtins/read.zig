@@ -335,6 +335,9 @@ pub fn read(ctx: Ctx) u8 {
 fn queueInput(fd: i32, text: []const u8) void {
     const tiocsti = 0x5412;
     for (text) |*byte| {
+        // A control byte would act on the line discipline (newline submits,
+        // Ctrl-D ends input) or leave commands queued, so queueing stops there.
+        if ((byte.* < 0x20 and byte.* != '\t') or byte.* == 0x7f) return;
         if (linux.errno(linux.ioctl(fd, tiocsti, @intFromPtr(byte))) != .SUCCESS) return;
     }
 }
