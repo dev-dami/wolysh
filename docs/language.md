@@ -166,7 +166,8 @@ configuration can override either alias.
 Builtins include `cd`, `pwd`, `echo`, `print`, `printf`, `exit`, `export`,
 `unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `parallel`, `history`, `read`,
 `test`, `source`, `eval`, `shift`, `type`, `command`, `builtin`, `local`,
-`readonly`, `trap`, `umask`, `kill`, `exec`, `pushd`, `popd`, `dirs`, and `:`.
+`readonly`, `trap`, `umask`, `kill`, `exec`, `pushd`, `popd`, `dirs`, `fc`,
+`enable`, `bind`, `caller`, `compopt`, `suspend`, and `:`.
 `echo` accepts bundled flags such as `-ne` and interprets escapes; other
 commands resolve through `PATH`.
 
@@ -197,13 +198,27 @@ Configuration is loaded from `$XDG_CONFIG_HOME/wsh/config` or
 `~/.config/wsh/config`; history is stored under `$XDG_DATA_HOME/wsh/history`.
 See [`examples/config`](../examples/config) for a working example.
 
+## Coprocesses and key bindings
+
+`coproc [NAME] command` runs the command in the background with a pipe to its
+input and another from its output. `NAME[0]` is the descriptor to read from,
+`NAME[1]` the one to write to, and `NAME_PID` the process id; `NAME` defaults to
+`COPROC`. Naming a coprocess works with compound commands, as in Bash.
+
+`bind` changes single-key bindings in the line editor: `bind '"\C-g": kill-line'`,
+`bind '"\ex": undo'` or `bind -x '"\C-o": cmd'`, which runs a shell command
+with `READLINE_LINE` and `READLINE_POINT` set. `bind -l` lists the function
+names and `bind -p` the current bindings. Key sequences of more than one key and
+keyboard macros are not supported.
+
 ## Known limitations
 
 - `$name` on an indexed array expands to every element, as it does for wsh
   lists; Bash gives element 0. Write `${name[0]}` in scripts meant for both
   shells, including for `$BASH_REMATCH`.
-- `BASH_COMMAND` is not set, so a DEBUG trap cannot see the command about to
-  run.
+- Regular expressions with back-references give up (no match) after a fixed
+  amount of work instead of running for exponential time.
+- `read -e` uses the terminal driver's line editing, not the line editor.
 - `<` and `>` in `[[ ]]` compare bytes; Bash orders them by the current
   locale's collation.
 

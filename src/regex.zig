@@ -5,8 +5,10 @@
 //! overall match is the leftmost, then the longest, as POSIX requires. Among
 //! equally good matches the captures follow the earlier alternative and greedy
 //! repetition, which is also what glibc reports. Beyond POSIX, the GNU escapes
-//! `\w \W \s \S \b \B \< \> \` \'` are understood; back-references are not,
-//! since they cannot be matched in linear time.
+//! `\w \W \s \S \b \B \< \> \` \'` are understood. A pattern with a
+//! back-reference (`\1`) cannot be matched in linear time, so it runs on a
+//! backtracking matcher instead, which tries every path for the longest match
+//! and gives up (no match) after a fixed amount of work.
 //!
 //! Text and pattern are read as UTF-8, so `.` and bracket expressions match
 //! whole characters and ranges use code point order. Character classes and
@@ -26,7 +28,7 @@ pub const Error = error{
     BadRange,
     TrailingBackslash,
     TooBig,
-    BackReference,
+    BadBackReference,
 } || Allocator.Error;
 
 /// glibc's wording for each compile error.
@@ -42,7 +44,7 @@ pub fn errorMessage(err: Error) []const u8 {
         error.BadRange => "Invalid range end",
         error.TrailingBackslash => "Trailing backslash",
         error.TooBig => "Regular expression too big",
-        error.BackReference => "Back-references are not supported",
+        error.BadBackReference => "Invalid back reference",
         error.OutOfMemory => "Memory exhausted",
     };
 }
@@ -74,9 +76,16 @@ pub const Regex = struct {
     /// match), then two progress-check slots per nullable loop.
     slots: usize,
     icase: bool,
+    /// The pattern has a back-reference, which needs the backtracking matcher.
+    backrefs: bool = false,
 
     /// The leftmost-longest match anywhere in `text`, or null.
     pub fn match(self: *const Regex, text: []const u8) Allocator.Error!?Match {
+        if (self.backrefs) {
+            var bt = try Backtracker.init(self, text);
+            defer bt.deinit();
+            return bt.run();
+        }
         var vm = try Vm.init(self, text);
         defer vm.deinit();
         return vm.run();
@@ -105,6 +114,7 @@ pub fn compileOptions(arena: Allocator, pattern: []const u8, options: Options) E
         .groups = parser.groups,
         .slots = compiler.loop_base + 2 * parser.loops,
         .icase = options.icase,
+        .backrefs = parser.backrefs,
     };
 }
 
@@ -202,6 +212,8 @@ const Node = union(enum) {
     set: u32,
     assert: Assert,
     group: struct { index: u32, child: *const Node },
+    /// `\1` to `\9`: the text the numbered group matched.
+    backref: u32,
     concat: []const Node,
     alternate: []const Node,
     /// `loop` numbers the progress-check slots of a repeat whose body can
@@ -212,7 +224,7 @@ const Node = union(enum) {
 /// Whether `node` can match the empty string.
 fn nullable(node: Node) bool {
     return switch (node) {
-        .empty, .assert => true,
+        .empty, .assert, .backref => true,
         .char, .any, .set => false,
         .group => |g| nullable(g.child.*),
         .concat => |items| for (items) |item| {
@@ -232,6 +244,7 @@ const Parser = struct {
     groups: u32 = 0,
     loops: u32 = 0,
     depth: u32 = 0,
+    backrefs: bool = false,
     sets: std.ArrayList(Set) = .empty,
 
     fn parseAlternation(self: *Parser) Error!Node {
@@ -299,7 +312,12 @@ const Parser = struct {
         const c = self.src[self.pos + 1];
         self.pos += 2;
         return switch (c) {
-            '1'...'9' => error.BackReference,
+            '1'...'9' => blk: {
+                const number: u32 = c - '0';
+                if (number > self.groups) break :blk error.BadBackReference;
+                self.backrefs = true;
+                break :blk .{ .backref = number };
+            },
             'w', 'W' => .{ .set = try self.addSet(.{ .ranges = &.{}, .classes = .initOne(.word), .negated = c == 'W' }) },
             's', 'S' => .{ .set = try self.addSet(.{ .ranges = &.{}, .classes = .initOne(.space), .negated = c == 'S' }) },
             'b' => .{ .assert = .word_boundary },
@@ -499,6 +517,8 @@ const Inst = union(enum) {
     jmp: u32,
     save: u32,
     assert: Assert,
+    /// Matches the text a group captured earlier.
+    backref: u32,
     /// Sets a loop's "has iterated" slot to 1 (`on`) or unset.
     flag: struct { slot: u32, on: bool },
     /// Ends an iteration of a loop whose body can match empty. An iteration
@@ -533,6 +553,7 @@ const Compiler = struct {
             .any => _ = try self.emit(.any),
             .set => |index| _ = try self.emit(.{ .set = index }),
             .assert => |a| _ = try self.emit(.{ .assert = a }),
+            .backref => |n| _ = try self.emit(.{ .backref = n }),
             .group => |g| {
                 _ = try self.emit(.{ .save = 2 * g.index });
                 try self.gen(g.child.*);
@@ -747,6 +768,7 @@ const Vm = struct {
                         if (!assertHolds(a, self.text, pos)) break;
                         pc += 1;
                     },
+                    .backref => unreachable,
                     .char, .any, .set, .match => {
                         try list.pcs.append(gpa, pc);
                         try list.caps.appendSlice(gpa, self.work);
@@ -760,6 +782,159 @@ const Vm = struct {
     fn setSlot(self: *Vm, slot: u32, value: usize) Allocator.Error!void {
         try self.stack.append(self.re.allocator, .{ .restore = .{ .slot = slot, .value = self.work[slot] } });
         self.work[slot] = value;
+    }
+};
+
+/// Matches a pattern with back-references by trying every path, depth first,
+/// from each start position in turn. The first start that matches wins, and
+/// among its matches the longest; ties go to the earlier path. Gives up after
+/// `step_limit` instructions, since such patterns can take exponential time.
+const Backtracker = struct {
+    const step_limit: usize = 20_000_000;
+
+    const Task = union(enum) {
+        explore: struct { pc: u32, pos: usize },
+        restore: struct { slot: u32, value: usize },
+    };
+
+    re: *const Regex,
+    text: []const u8,
+    slots: []usize,
+    best: []usize,
+    found: bool = false,
+    steps: usize = 0,
+    stack: std.ArrayList(Task) = .empty,
+
+    fn init(re: *const Regex, text: []const u8) Allocator.Error!Backtracker {
+        const slots = try re.allocator.alloc(usize, re.slots);
+        errdefer re.allocator.free(slots);
+        return .{ .re = re, .text = text, .slots = slots, .best = try re.allocator.alloc(usize, re.slots) };
+    }
+
+    fn deinit(self: *Backtracker) void {
+        const gpa = self.re.allocator;
+        self.stack.deinit(gpa);
+        gpa.free(self.best);
+        gpa.free(self.slots);
+    }
+
+    fn run(self: *Backtracker) Allocator.Error!?Match {
+        var start: usize = 0;
+        while (true) {
+            try self.explore(start);
+            if (self.found or self.steps >= step_limit or start >= self.text.len) break;
+            start += decodeAt(self.text, start).len;
+        }
+        if (!self.found) return null;
+
+        const groups = try self.re.allocator.alloc(?Span, self.re.groups + 1);
+        for (groups, 0..) |*group, i| {
+            const first = self.best[2 * i];
+            const last = self.best[2 * i + 1];
+            group.* = if (first == unset or last == unset) null else .{ .start = first, .end = last };
+        }
+        return .{ .groups = groups };
+    }
+
+    fn setSlot(self: *Backtracker, slot: u32, value: usize) Allocator.Error!void {
+        try self.stack.append(self.re.allocator, .{ .restore = .{ .slot = slot, .value = self.slots[slot] } });
+        self.slots[slot] = value;
+    }
+
+    fn explore(self: *Backtracker, start: usize) Allocator.Error!void {
+        const gpa = self.re.allocator;
+        const insts = self.re.insts;
+        const text = self.text;
+        @memset(self.slots, unset);
+        self.stack.clearRetainingCapacity();
+        try self.stack.append(gpa, .{ .explore = .{ .pc = 0, .pos = start } });
+
+        while (self.stack.pop()) |task| {
+            var pc: u32 = undefined;
+            var pos: usize = undefined;
+            switch (task) {
+                .restore => |r| {
+                    self.slots[r.slot] = r.value;
+                    continue;
+                },
+                .explore => |e| {
+                    pc = e.pc;
+                    pos = e.pos;
+                },
+            }
+            path: while (true) {
+                self.steps += 1;
+                if (self.steps >= step_limit) return;
+                switch (insts[pc]) {
+                    .jmp => |target| pc = target,
+                    .split => |targets| {
+                        try self.stack.append(gpa, .{ .explore = .{ .pc = targets[1], .pos = pos } });
+                        pc = targets[0];
+                    },
+                    .save => |slot| {
+                        try self.setSlot(slot, pos);
+                        pc += 1;
+                    },
+                    .flag => |f| {
+                        try self.setSlot(f.slot, if (f.on) 1 else unset);
+                        pc += 1;
+                    },
+                    .progress => |p| {
+                        if (self.slots[p.start] != pos) {
+                            try self.setSlot(p.flag, 1);
+                            pc += 1;
+                        } else if (self.slots[p.flag] == unset) {
+                            pc = p.exit;
+                        } else {
+                            break :path;
+                        }
+                    },
+                    .assert => |a| {
+                        if (!assertHolds(a, text, pos)) break :path;
+                        pc += 1;
+                    },
+                    .char => |want| {
+                        if (pos >= text.len) break :path;
+                        const got = decodeAt(text, pos);
+                        const same = want == got.cp or (self.re.icase and foldLower(want) == foldLower(got.cp));
+                        if (!same) break :path;
+                        pos += got.len;
+                        pc += 1;
+                    },
+                    .any => {
+                        if (pos >= text.len) break :path;
+                        pos += decodeAt(text, pos).len;
+                        pc += 1;
+                    },
+                    .set => |index| {
+                        if (pos >= text.len) break :path;
+                        const got = decodeAt(text, pos);
+                        if (!self.re.sets[index].matches(got.cp, self.re.icase)) break :path;
+                        pos += got.len;
+                        pc += 1;
+                    },
+                    .backref => |number| {
+                        const first = self.slots[2 * number];
+                        const last = self.slots[2 * number + 1];
+                        if (first == unset or last == unset or last < first) break :path;
+                        const captured = text[first..last];
+                        if (pos + captured.len > text.len) break :path;
+                        const here = text[pos..][0..captured.len];
+                        const same = if (self.re.icase) std.ascii.eqlIgnoreCase(captured, here) else std.mem.eql(u8, captured, here);
+                        if (!same) break :path;
+                        pos += captured.len;
+                        pc += 1;
+                    },
+                    .match => {
+                        if (!self.found or self.slots[1] > self.best[1]) {
+                            @memcpy(self.best, self.slots);
+                            self.found = true;
+                        }
+                        break :path;
+                    },
+                }
+            }
+        }
     }
 };
 
@@ -971,9 +1146,19 @@ test "invalid patterns" {
     try expectCompileError("[[:alpha:]-z]", error.BadRange);
     try expectCompileError("[a-[:alpha:]]", error.BadRange);
     try expectCompileError("\\", error.TrailingBackslash);
-    try expectCompileError("(a)\\1", error.BackReference);
+    try expectCompileError("\\1", error.BadBackReference);
+    try expectCompileError("(a)\\2", error.BadBackReference);
     try expectCompileError("(((a{100}){100}){100})", error.TooBig);
     try testing.expectEqualStrings("Unmatched ( or \\(", errorMessage(error.UnmatchedParen));
+}
+
+test "back-references" {
+    try expectMatch("(a)\\1", "xaay", "aa|a");
+    try expectMatch("(a+)b\\1", "aabaa", "aabaa|aa");
+    try expectMatch("(.)(.)\\2\\1", "xabbay", "abba|a|b");
+    try expectMatch("^(a|b)\\1$", "ab", null);
+    try expectMatch("(a*)\\1", "aaaa", "aaaa|aa");
+    try expectMatchOptions("(a)\\1", "aA", "aA|a", .{ .icase = true });
 }
 
 test "matching time is linear in the text" {

@@ -40,6 +40,24 @@ pub fn runSource(sh: *Shell, src: []const u8) u8 {
     return runSourceAt(sh, src, 1);
 }
 
+/// Defines the function an inherited `BASH_FUNC_name%%` entry carries. Only a
+/// single function definition named `name` is accepted, and nothing in it runs.
+pub fn importFunction(sh: *Shell, name: []const u8, definition: []const u8) bool {
+    const arena = sh.scratch();
+    const text = std.fmt.allocPrint(arena, "{s} {s}", .{ name, definition }) catch return false;
+    var p = parser_mod.Parser.initAt(arena, text, 1);
+    const program = p.parseProgram() catch return false;
+    if (program.stmts.len != 1) return false;
+    const decl = switch (program.stmts[0]) {
+        .fn_decl => |d| d,
+        else => return false,
+    };
+    if (!std.mem.eql(u8, decl.name, name)) return false;
+    sh.defineFunc(name, decl.source) catch return false;
+    sh.setFuncLine(name, 1) catch return false;
+    return true;
+}
+
 /// `runSource` with `$LINENO` counting from `line`.
 fn runSourceAt(sh: *Shell, src: []const u8, line: u32) u8 {
     const arena = sh.scratch();
@@ -148,7 +166,13 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
 
         .fn_decl => |decl| {
             setLine(sh, decl.line);
-            sh.defineFunc(decl.name, decl.source) catch return 1;
+            sh.defineFunc(decl.name, decl.source) catch |err| {
+                if (err == error.ReadonlyFunction) {
+                    const msg = std.fmt.allocPrint(arena, "wsh: {s}: readonly function\n", .{decl.name}) catch return 1;
+                    sys.writeStr(sh.default_err, msg);
+                }
+                return statementFailed(sh, 1);
+            };
             sh.setFuncLine(decl.name, decl.line) catch return 1;
             return 0;
         },

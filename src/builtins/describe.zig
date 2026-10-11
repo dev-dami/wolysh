@@ -14,7 +14,7 @@ pub const keywords = [_][]const u8{
     "let",   "if",       "else",   "for",  "while", "fn", "return", "alias", "env",
     "break", "continue", "then",   "elif", "fi",    "do", "done",   "case",  "esac",
     "until", "function", "select", "time", "in",    "[[", "]]",     "{",     "}",
-    "!",
+    "!",      "coproc",
 };
 
 /// Builtins the executor handles itself rather than through the table.

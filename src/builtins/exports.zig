@@ -109,6 +109,7 @@ pub fn writeAlias(arena: Allocator, out: *std.ArrayList(u8), name: []const u8, t
 const Mode = struct {
     list: bool = false,
     remove: bool = false,
+    functions: bool = false,
 };
 
 /// Parses `-p`, `-n` and `--`; reports anything else. Returns null after an
@@ -119,27 +120,65 @@ fn parseMode(ctx: Ctx, parser: *options.Parser, usage: []const u8) ?Mode {
         switch (parser.next()) {
             .end => return mode,
             .invalid, .missing => |c| {
-                if (c == 'f') {
-                    ctx.errFmt("wsh: {s}: -f: function attributes are not supported\n", .{ctx.argv[0]});
-                } else {
-                    ctx.errFmt("wsh: {s}: -{c}: invalid option\n", .{ ctx.argv[0], c });
-                }
+                ctx.errFmt("wsh: {s}: -{c}: invalid option\n", .{ ctx.argv[0], c });
                 ctx.err(usage);
                 return null;
             },
             .option => |c| switch (c) {
                 'p' => mode.list = true,
                 'n' => mode.remove = true,
+                'f' => mode.functions = true,
                 else => unreachable,
             },
         }
     }
 }
 
+/// `export -f` / `readonly -f`: with names, marks existing functions; without,
+/// lists the marked ones as their definition plus a `declare -fx`/`-fr` line.
+fn functionAttribute(ctx: Ctx, mode: Mode, specs: []const []const u8, exporting: bool) u8 {
+    const sh = ctx.sh;
+    const builtin_name = ctx.argv[0];
+    if (specs.len == 0) {
+        var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var out: std.ArrayList(u8) = .empty;
+        const set = if (exporting) &sh.exported_funcs else &sh.readonly_funcs;
+        const names = sortedKeys(arena, set.keyIterator()) catch return 1;
+        for (names) |name| {
+            const source = sh.getFunc(name) orelse continue;
+            out.appendSlice(arena, source) catch return 1;
+            if (source.len == 0 or source[source.len - 1] != '\n') out.append(arena, '\n') catch return 1;
+            out.print(arena, "declare {s} {s}\n", .{ if (exporting) "-fx" else "-fr", name }) catch return 1;
+        }
+        ctx.out(out.items);
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (specs) |name| {
+        if (sh.getFunc(name) == null) {
+            ctx.errFmt("wsh: {s}: {s}: not a function\n", .{ builtin_name, name });
+            status = 1;
+            continue;
+        }
+        if (!exporting) {
+            sh.readonlyFunc(name) catch return 1;
+        } else if (mode.remove) {
+            sh.unexportFunc(name);
+        } else {
+            sh.exportFunc(name) catch return 1;
+        }
+    }
+    return status;
+}
+
 pub fn exportBuiltin(ctx: Ctx) u8 {
-    var parser = options.Parser.init(ctx.argv, "pn");
-    const mode = parseMode(ctx, &parser, "wsh: export: usage: export [-n] [name[=value] ...] or export -p\n") orelse return 2;
+    var parser = options.Parser.init(ctx.argv, "pnf");
+    const mode = parseMode(ctx, &parser, "wsh: export: usage: export [-fn] [name[=value] ...] or export -p\n") orelse return 2;
     const specs = parser.rest();
+    if (mode.functions) return functionAttribute(ctx, mode, specs, true);
     if (specs.len == 0) return if (mode.remove) 0 else listExports(ctx);
 
     var status: u8 = 0;
@@ -179,9 +218,10 @@ pub fn exportBuiltin(ctx: Ctx) u8 {
 }
 
 pub fn readonlyBuiltin(ctx: Ctx) u8 {
-    var parser = options.Parser.init(ctx.argv, "p");
-    _ = parseMode(ctx, &parser, "wsh: readonly: usage: readonly [name[=value] ...] or readonly -p\n") orelse return 2;
+    var parser = options.Parser.init(ctx.argv, "pf");
+    const mode = parseMode(ctx, &parser, "wsh: readonly: usage: readonly [-f] [name[=value] ...] or readonly -p\n") orelse return 2;
     const specs = parser.rest();
+    if (mode.functions) return functionAttribute(ctx, mode, specs, false);
     if (specs.len == 0) return listReadonly(ctx);
 
     var status: u8 = 0;
@@ -242,7 +282,12 @@ test "export -p and -n" {
     try testing.expectEqual(@as(u8, 0), exportBuiltin(.{ .sh = &sh, .argv = &.{ "export", "-n", "B" } }));
     try testing.expect(sh.getEnv("B") == null);
     try testing.expectEqualStrings("x\"y$z`w\\v", sh.getVar("B").?.string);
-    try testing.expectEqual(@as(u8, 2), exportBuiltin(.{ .sh = &sh, .argv = &.{ "export", "-f", "fn" }, .stderr = -1 }));
+    try testing.expectEqual(@as(u8, 1), exportBuiltin(.{ .sh = &sh, .argv = &.{ "export", "-f", "fn" }, .stderr = -1 }));
+    try sh.defineFunc("fn", "fn fn() {\n}\n");
+    try testing.expectEqual(@as(u8, 0), exportBuiltin(.{ .sh = &sh, .argv = &.{ "export", "-f", "fn" } }));
+    try testing.expect(sh.exported_funcs.contains("fn"));
+    try testing.expectEqual(@as(u8, 0), readonlyBuiltin(.{ .sh = &sh, .argv = &.{ "readonly", "-f", "fn" } }));
+    try testing.expectError(error.ReadonlyFunction, sh.defineFunc("fn", "fn fn() {\n}\n"));
     try testing.expectEqual(@as(u8, 1), exportBuiltin(.{ .sh = &sh, .argv = &.{ "export", "1x=2" }, .stderr = -1 }));
 }
 

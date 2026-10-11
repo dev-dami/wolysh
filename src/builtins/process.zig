@@ -1,4 +1,4 @@
-//! Process attributes: `ulimit`, `umask`, `times` and `logout`.
+//! Process attributes: `ulimit`, `umask`, `times`, `suspend` and `logout`.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -342,6 +342,36 @@ pub fn umask(ctx: Ctx) u8 {
 }
 
 // --- logout ------------------------------------------------------------------
+
+/// `suspend [-f]`: stops the shell itself until it is continued. A login
+/// shell, or a shell without job control, only suspends when forced.
+pub fn suspendBuiltin(ctx: Ctx) u8 {
+    var force = false;
+    var parser = options.Parser.init(ctx.argv, "f");
+    while (true) {
+        switch (parser.next()) {
+            .end => break,
+            .invalid, .missing => |c| {
+                ctx.errFmt("wsh: suspend: -{c}: invalid option\n", .{c});
+                ctx.err("wsh: suspend: usage: suspend [-f]\n");
+                return 2;
+            },
+            .option => force = true,
+        }
+    }
+    if (!force) {
+        if (ctx.sh.login) {
+            ctx.err("wsh: suspend: cannot suspend a login shell\n");
+            return 1;
+        }
+        if (!ctx.sh.job_control) {
+            ctx.err("wsh: suspend: cannot suspend: no job control\n");
+            return 1;
+        }
+    }
+    _ = linux.kill(linux.getpid(), .STOP);
+    return 0;
+}
 
 pub fn logout(ctx: Ctx) u8 {
     if (!ctx.sh.login) {

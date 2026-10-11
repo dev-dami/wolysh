@@ -281,11 +281,17 @@ pub fn runReturnTrap(sh: *Shell) void {
     if (handler.len != 0) runHandler(sh, handler);
 }
 
-/// The DEBUG trap: before each simple command.
-pub fn beforeCommand(sh: *Shell) void {
+/// The DEBUG trap: before each simple command. `words` are the command's
+/// words as written; `BASH_COMMAND` holds them while the trap runs.
+pub fn beforeCommand(sh: *Shell, words: []const []const u8) void {
     if (running_traps != 0) return;
     const handler = sh.getTrap(Shell.debug_trap) orelse return;
-    if (handler.len != 0) runHandler(sh, handler);
+    if (handler.len == 0) return;
+    if (words.len != 0) {
+        const text: []const u8 = std.mem.join(sh.scratch(), " ", words) catch "";
+        sh.setVar("BASH_COMMAND", .{ .string = text }) catch {};
+    }
+    runHandler(sh, handler);
 }
 
 // --- set -x -----------------------------------------------------------------

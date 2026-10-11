@@ -5,6 +5,7 @@ const expand_mod = @import("../expand.zig");
 const proc = @import("../proc.zig");
 const shellmod = @import("../shell.zig");
 const sys = @import("../sys.zig");
+const value = @import("../value.zig");
 const command = @import("command.zig");
 const expression = @import("expression.zig");
 const redirect = @import("redirect.zig");
@@ -166,7 +167,7 @@ fn runStages(
                 alias_names.appendSlice(arena, resolved.names) catch return 1;
             }
         }
-        if (runsAsCommand(cmd)) strict.beforeCommand(sh);
+        if (runsAsCommand(cmd)) strict.beforeCommand(sh, cmd.words);
 
         const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
         defer scope.restore();
@@ -229,6 +230,96 @@ fn makeStage(
     return try launchStage(sh, arena, argv, redirects);
 }
 
+/// `coproc [NAME] command`: starts the command in the background with a pipe
+/// to its input and another from its output. The shell's ends are left in
+/// `NAME[1]` (to write to it) and `NAME[0]` (to read from it), and the
+/// process id in `NAME_PID`.
+fn runCoproc(
+    sh: *Shell,
+    arena: std.mem.Allocator,
+    cmd: ast.Command,
+    name: []const u8,
+    opened: *std.ArrayList(i32),
+    runtime: Runtime,
+) u8 {
+    var inner = cmd;
+    inner.coproc = null;
+
+    var to_child: [2]i32 = undefined;
+    var from_child: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&to_child, .{ .CLOEXEC = true })) != .SUCCESS) return 1;
+    if (linux.errno(linux.pipe2(&from_child, .{ .CLOEXEC = true })) != .SUCCESS) {
+        sys.closeFd(to_child[0]);
+        sys.closeFd(to_child[1]);
+        return 1;
+    }
+
+    const status = launchCoproc(sh, arena, inner, name, to_child, from_child, opened, runtime);
+    // The child holds its own ends now; on failure nothing else needs them.
+    sys.closeFd(to_child[0]);
+    sys.closeFd(from_child[1]);
+    if (status != 0) {
+        sys.closeFd(to_child[1]);
+        sys.closeFd(from_child[0]);
+    }
+    return status;
+}
+
+fn launchCoproc(
+    sh: *Shell,
+    arena: std.mem.Allocator,
+    cmd: ast.Command,
+    name: []const u8,
+    to_child: [2]i32,
+    from_child: [2]i32,
+    opened: *std.ArrayList(i32),
+    runtime: Runtime,
+) u8 {
+    const scope = assign.enter(sh, arena, cmd) catch |err| return runtime.expression_error(sh, err);
+    defer scope.restore();
+    const prepared = redirect.apply(sh, arena, cmd, opened) catch |err| return runtime.expression_error(sh, err);
+
+    var stage: proc.Stage = undefined;
+    const body = stageBody(arena, cmd) catch |err| return runtime.expression_error(sh, err);
+    if (body) |statements| {
+        stage = subshell.makeStage(sh, arena, statements, prepared.redirects, scope, runtime.run_statements) catch |err| {
+            return runtime.expression_error(sh, err);
+        };
+    } else {
+        var argv: std.ArrayList([]const u8) = .empty;
+        expand_mod.expandCommand(sh, arena, cmd.words, &argv) catch |err| return runtime.expression_error(sh, err);
+        if (argv.items.len == 0) return 0;
+        const call_argv = argv.toOwnedSlice(arena) catch return 1;
+        strict.traceCommand(sh, call_argv);
+        stage = makeStage(sh, arena, call_argv, prepared.redirects, scope, runtime) catch |err| {
+            return runtime.expression_error(sh, err);
+        };
+    }
+    stage.stdio.in = to_child[0];
+    stage.stdio.out = from_child[1];
+    stage.close_in_child = arena.dupe(i32, &.{ to_child[1], from_child[0] }) catch return 1;
+
+    const text = std.fmt.allocPrint(arena, "coproc {s}", .{name}) catch "coproc";
+    const launched = proc.launch(arena, &.{stage}, .{}) catch |err| return runtime.expression_error(sh, err);
+    const pid = launched.pids[launched.pids.len - 1];
+    sh.last_bg_pid = pid;
+    const job = sh.jobs.add(sh.gpa, launched.pgid, launched.pids, text, false) catch return 1;
+    if (sh.interactive) {
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job.id, pid }) catch "";
+        sys.writeStr(sh.default_err, line);
+    }
+
+    // The shell reads what the child writes (`NAME[0]`) and writes what the
+    // child reads (`NAME[1]`).
+    const fds = [_]value.Value{ .{ .int = from_child[0] }, .{ .int = to_child[1] } };
+    sh.setVar(name, .{ .list = &fds }) catch return 1;
+    var pid_name_buf: [256]u8 = undefined;
+    const pid_name = std.fmt.bufPrint(&pid_name_buf, "{s}_PID", .{name}) catch return 1;
+    sh.setVar(pid_name, .{ .int = pid }) catch return 1;
+    return 0;
+}
+
 fn runSingle(
     sh: *Shell,
     arena: std.mem.Allocator,
@@ -238,6 +329,7 @@ fn runSingle(
     runtime: Runtime,
     outcome: *Outcome,
 ) u8 {
+    if (cmd.coproc) |coproc_name| return runCoproc(sh, arena, cmd, coproc_name, opened, runtime);
     if (expression.misuse(cmd.words)) |name| {
         expression.reportMisuse(sh, name);
         return 2;
@@ -254,7 +346,7 @@ fn runSingle(
         defer command.restoreAliases(mark);
         return runSingle(sh, arena, grouped, background, opened, runtime, outcome);
     }
-    if (runsAsCommand(cmd)) strict.beforeCommand(sh);
+    if (runsAsCommand(cmd)) strict.beforeCommand(sh, cmd.words);
 
     const substitutions = sh.substitutions;
     var argv: std.ArrayList([]const u8) = .empty;

@@ -34,6 +34,10 @@ const strict = @import("strict.zig");
 const set_builtin = @import("builtins/set.zig");
 const trap_builtin = @import("builtins/trap.zig");
 const shopt = @import("builtins/shopt.zig");
+const enable_builtin = @import("builtins/enable.zig");
+const caller_builtin = @import("builtins/caller.zig");
+const fc_builtin = @import("builtins/fc.zig");
+const bind_builtin = @import("builtins/bind.zig");
 
 const Shell = shellmod.Shell;
 
@@ -78,11 +82,30 @@ pub const Builtin = struct {
     run: *const fn (Ctx) u8,
 };
 
+/// Builtins turned off by `enable -n`, parallel to `table`.
+var disabled = [_]bool{false} ** table.len;
+
+/// The builtin called `name` unless `enable -n` turned it off.
 pub fn lookup(name: []const u8) ?*const Builtin {
-    for (&table) |*b| {
-        if (std.mem.eql(u8, b.name, name)) return b;
+    for (&table, 0..) |*b, index| {
+        if (std.mem.eql(u8, b.name, name)) return if (disabled[index]) null else b;
     }
     return null;
+}
+
+/// `enable` / `enable -n`. False when `name` is not a builtin.
+pub fn setEnabled(name: []const u8, on: bool) bool {
+    for (&table, 0..) |*b, index| {
+        if (std.mem.eql(u8, b.name, name)) {
+            disabled[index] = !on;
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn isEnabled(name: []const u8) bool {
+    return lookup(name) != null;
 }
 
 pub fn isBuiltin(name: []const u8) bool {
@@ -278,6 +301,11 @@ fn unsetVariable(ctx: Ctx, name: []const u8) bool {
 }
 
 fn unsetFunction(ctx: Ctx, name: []const u8) bool {
+    if (ctx.sh.isFuncReadonly(name)) {
+        ctx.errFmt("wsh: unset: {s}: cannot unset: readonly function\n", .{name});
+        return false;
+    }
+    ctx.sh.unexportFunc(name);
     if (ctx.sh.funcs.fetchRemove(name)) |kv| {
         ctx.sh.gpa.free(kv.key);
         ctx.sh.gpa.free(kv.value);
@@ -948,6 +976,7 @@ const table = [_]Builtin{
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },
     .{ .name = "complete", .summary = "define how arguments of a command complete", .run = complete_builtin.runComplete },
     .{ .name = "compgen", .summary = "print completion candidates", .run = complete_builtin.runCompgen },
+    .{ .name = "compopt", .summary = "change completion options", .run = complete_builtin.runCompopt },
     .{ .name = "mapfile", .summary = "read lines into an array", .run = read_builtin.mapfile },
     .{ .name = "readarray", .summary = "read lines into an array", .run = read_builtin.mapfile },
     .{ .name = "hash", .summary = "check where commands resolve in PATH", .run = describe_builtin.hashBuiltin },
@@ -957,6 +986,11 @@ const table = [_]Builtin{
     .{ .name = "ulimit", .summary = "get or set resource limits", .run = process_builtin.ulimit },
     .{ .name = "times", .summary = "print shell and child CPU times", .run = process_builtin.times },
     .{ .name = "logout", .summary = "exit a login shell", .run = process_builtin.logout },
+    .{ .name = "suspend", .summary = "suspend the shell until it is continued", .run = process_builtin.suspendBuiltin },
+    .{ .name = "caller", .summary = "print the call stack of the current function", .run = caller_builtin.run },
+    .{ .name = "fc", .summary = "list, edit and re-run history commands", .run = fc_builtin.run },
+    .{ .name = "enable", .summary = "enable and disable builtins", .run = enable_builtin.run },
+    .{ .name = "bind", .summary = "show or change line editor key bindings", .run = bind_builtin.run },
 };
 
 // --- tests -----------------------------------------------------------------

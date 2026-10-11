@@ -100,6 +100,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     };
 
+    importExportedFunctions(&sh, gpa);
+
     // bash's rule: interactive when commands come from a terminal and errors
     // go to one, or when `-i` asks for it. Standard output may be a pipe.
     const reads_input = options.command == null and options.script == null;
@@ -423,8 +425,11 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         if (proc.hangupPending()) return hangUp(sh);
         // A SIGINT sent while the line was being typed must not cancel it.
         sh.interrupted = false;
-        if (editor_state.interrupted) continue;
-        if (source.len == 0) continue;
+        // A cancelled or empty line is not a repeated `exit`: disarm the warning.
+        if (editor_state.interrupted or source.len == 0) {
+            sh.exit_warned = false;
+            continue;
+        }
 
         const line = histexpand.apply(sh, source) orelse continue;
         recordHistory(sh, line, &history_error_reported);
@@ -447,6 +452,35 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
     }
 
     return strict.finish(sh, sh.exit_code);
+}
+
+/// Turns inherited `BASH_FUNC_name%%` entries (from `export -f`) back into
+/// functions, still marked as exported. The entries leave the environment.
+fn importExportedFunctions(sh: *Shell, gpa: std.mem.Allocator) void {
+    const prefix = "BASH_FUNC_";
+    const suffix = "%%";
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |key| gpa.free(key);
+        keys.deinit(gpa);
+    }
+    var it = sh.env.keyIterator();
+    while (it.next()) |key| {
+        if (!std.mem.startsWith(u8, key.*, prefix) or !std.mem.endsWith(u8, key.*, suffix)) continue;
+        const copy = gpa.dupe(u8, key.*) catch return;
+        keys.append(gpa, copy) catch {
+            gpa.free(copy);
+            return;
+        };
+    }
+    for (keys.items) |key| {
+        const name = key[prefix.len .. key.len - suffix.len];
+        const definition = gpa.dupe(u8, sh.getEnv(key) orelse "") catch return;
+        defer gpa.free(definition);
+        _ = sh.unsetEnv(key);
+        if (name.len == 0 or !std.mem.startsWith(u8, definition, "()")) continue;
+        if (exec.importFunction(sh, name, definition)) sh.exportFunc(name) catch {};
+    }
 }
 
 /// SIGHUP: entries already reached the history file as they were entered, so

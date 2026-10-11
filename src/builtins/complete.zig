@@ -12,6 +12,14 @@ const Ctx = builtins.Ctx;
 
 pub const Actions = struct {
     alias: bool = false,
+    arrayvar: bool = false,
+    binding: bool = false,
+    disabled: bool = false,
+    enabled: bool = false,
+    helptopic: bool = false,
+    service: bool = false,
+    setopt: bool = false,
+    shopt: bool = false,
     builtin: bool = false,
     command: bool = false,
     directory: bool = false,
@@ -56,14 +64,11 @@ pub const Spec = struct {
 const action_letters = [_]struct { u8, []const u8 }{
     .{ 'a', "alias" },   .{ 'b', "builtin" }, .{ 'c', "command" },  .{ 'd', "directory" },
     .{ 'e', "export" },  .{ 'f', "file" },    .{ 'g', "group" },    .{ 'j', "job" },
-    .{ 'k', "keyword" }, .{ 'u', "user" },    .{ 'v', "variable" },
+    .{ 'k', "keyword" }, .{ 's', "service" }, .{ 'u', "user" },    .{ 'v', "variable" },
 };
 
 /// Actions that only have a long `-A` name.
-const long_actions = [_][]const u8{ "function", "hostname", "running", "signal", "stopped" };
-
-/// bash actions wsh does not implement.
-const unsupported_actions = [_][]const u8{ "arrayvar", "binding", "disabled", "enabled", "helptopic", "service", "setopt", "shopt" };
+const long_actions = [_][]const u8{ "arrayvar", "binding", "disabled", "enabled", "function", "helptopic", "hostname", "running", "setopt", "shopt", "signal", "stopped" };
 
 const option_names = [_][]const u8{ "bashdefault", "default", "dirnames", "filenames", "noquote", "nosort", "nospace", "plusdirs" };
 
@@ -93,6 +98,20 @@ fn setOption(options: *Options, name: []const u8) bool {
     }
     return false;
 }
+
+fn clearOption(options: *Options, name: []const u8) bool {
+    inline for (std.meta.fields(Options)) |field| {
+        if (std.mem.eql(u8, field.name, name)) {
+            @field(options, field.name) = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The options of the specification being completed with, while a completion
+/// function runs; `compopt` without a command name edits them.
+pub var active_options: ?*Options = null;
 
 fn hasOption(options: Options, name: []const u8) bool {
     inline for (std.meta.fields(Options)) |field| {
@@ -172,6 +191,8 @@ const compgen_usage = "compgen: usage: compgen [-abcdefgjksuv] [-o option] [-A a
 
 const Parsed = struct {
     spec: Spec = .{},
+    /// `-D`, `-E` or `-I`: the specification applies to that case, not to names.
+    special: ?[]const u8 = null,
     print: bool = false,
     remove: bool = false,
     names: []const []const u8 = &.{},
@@ -213,12 +234,12 @@ fn parse(ctx: Ctx, builtin_name: []const u8, is_compgen: bool) ?Parsed {
                     if (letter == 'p') parsed.print = true else parsed.remove = true;
                 },
                 'D', 'E', 'I' => {
-                    ctx.errFmt("wsh: {s}: -{c}: not supported\n", .{ builtin_name, letter });
-                    return null;
-                },
-                's' => {
-                    ctx.errFmt("wsh: {s}: -s: service completion is not supported\n", .{builtin_name});
-                    return null;
+                    if (is_compgen) return invalidOption(ctx, builtin_name, letter, is_compgen);
+                    parsed.special = switch (letter) {
+                        'D' => "-D",
+                        'E' => "-E",
+                        else => "-I",
+                    };
                 },
                 else => {
                     for (action_letters) |entry| {
@@ -248,12 +269,6 @@ fn applyOperand(ctx: Ctx, builtin_name: []const u8, spec: *Spec, letter: u8, ope
             return false;
         },
         'A' => {
-            for (unsupported_actions) |name| {
-                if (std.mem.eql(u8, name, operand)) {
-                    ctx.errFmt("wsh: {s}: {s}: action not supported\n", .{ builtin_name, operand });
-                    return false;
-                }
-            }
             if (!setAction(&spec.actions, operand)) {
                 ctx.errFmt("wsh: {s}: {s}: invalid action name\n", .{ builtin_name, operand });
                 return false;
@@ -274,7 +289,9 @@ fn applyOperand(ctx: Ctx, builtin_name: []const u8, spec: *Spec, letter: u8, ope
 // --- builtins -----------------------------------------------------------------------
 
 pub fn runComplete(ctx: Ctx) u8 {
-    const parsed = parse(ctx, "complete", false) orelse return 2;
+    var parsed = parse(ctx, "complete", false) orelse return 2;
+    const special_names = [1][]const u8{parsed.special orelse ""};
+    if (parsed.special != null) parsed.names = &special_names;
 
     if (parsed.print or ctx.argv.len == 1) return printSpecs(ctx, parsed.names);
 
@@ -304,6 +321,90 @@ pub fn runComplete(ctx: Ctx) u8 {
         };
     }
     return 0;
+}
+
+const compopt_usage = "compopt: usage: compopt [-o|+o option] [-DEI] [name ...]\n";
+
+/// `compopt [-o option] [+o option] [-DEI] [name ...]`: turns completion
+/// options on (`-o`) or off (`+o`) for the named commands, or for the
+/// completion in progress when no name is given.
+pub fn runCompopt(ctx: Ctx) u8 {
+    var set_names: std.ArrayList([]const u8) = .empty;
+    defer set_names.deinit(ctx.sh.gpa);
+    var clear_names: std.ArrayList([]const u8) = .empty;
+    defer clear_names.deinit(ctx.sh.gpa);
+    var special: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < ctx.argv.len) : (i += 1) {
+        const arg = ctx.argv[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            break;
+        }
+        if (arg.len < 2 or (arg[0] != '-' and arg[0] != '+')) break;
+        const enabling = arg[0] == '-';
+        var j: usize = 1;
+        while (j < arg.len) : (j += 1) {
+            switch (arg[j]) {
+                'o' => {
+                    var operand: []const u8 = undefined;
+                    if (j + 1 < arg.len) {
+                        operand = arg[j + 1 ..];
+                    } else if (i + 1 < ctx.argv.len) {
+                        i += 1;
+                        operand = ctx.argv[i];
+                    } else {
+                        ctx.err("wsh: compopt: -o: option requires an argument\n");
+                        return 2;
+                    }
+                    j = arg.len;
+                    var probe = Options{};
+                    if (!setOption(&probe, operand)) {
+                        ctx.errFmt("wsh: compopt: {s}: invalid option name\n", .{operand});
+                        return 1;
+                    }
+                    (if (enabling) &set_names else &clear_names).append(ctx.sh.gpa, operand) catch return 1;
+                },
+                'D' => special = "-D",
+                'E' => special = "-E",
+                'I' => special = "-I",
+                else => {
+                    ctx.errFmt("wsh: compopt: {c}{c}: invalid option\n", .{ arg[0], arg[j] });
+                    ctx.err(compopt_usage);
+                    return 2;
+                },
+            }
+        }
+    }
+
+    const special_names = [1][]const u8{special orelse ""};
+    const names: []const []const u8 = if (special != null) &special_names else ctx.argv[i..];
+
+    if (names.len == 0) {
+        const active = active_options orelse {
+            ctx.err("wsh: compopt: not currently executing completion function\n");
+            return 1;
+        };
+        applyOptions(active, set_names.items, clear_names.items);
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (names) |name| {
+        const spec = registry.getPtr(name) orelse {
+            ctx.errFmt("wsh: compopt: {s}: no completion specification\n", .{name});
+            status = 1;
+            continue;
+        };
+        applyOptions(&spec.options, set_names.items, clear_names.items);
+    }
+    return status;
+}
+
+fn applyOptions(options: *Options, set_names: []const []const u8, clear_names: []const []const u8) void {
+    for (set_names) |name| _ = setOption(options, name);
+    for (clear_names) |name| _ = clearOption(options, name);
 }
 
 pub fn runCompgen(ctx: Ctx) u8 {
@@ -467,8 +568,6 @@ test "complete rejects what it does not support" {
         .{ .argv = &.{ "complete", "-Z", "x" }, .message = "wsh: complete: -Z: invalid option\n" ++ usage },
         .{ .argv = &.{ "complete", "-o", "bogus", "x" }, .message = "wsh: complete: bogus: invalid option name\n" },
         .{ .argv = &.{ "complete", "-A", "bogus", "x" }, .message = "wsh: complete: bogus: invalid action name\n" },
-        .{ .argv = &.{ "complete", "-A", "binding", "x" }, .message = "wsh: complete: binding: action not supported\n" },
-        .{ .argv = &.{ "complete", "-D", "-F", "f" }, .message = "wsh: complete: -D: not supported\n" },
         .{ .argv = &.{ "complete", "-W" }, .message = "wsh: complete: -W: option requires an argument\n" },
         .{ .argv = &.{ "complete", "-W", "a b" }, .message = usage },
     };

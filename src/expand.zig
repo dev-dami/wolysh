@@ -26,7 +26,6 @@ const special_vars = @import("special_vars.zig");
 pub const Error = error{
     UnterminatedSubstitution,
     SubstitutionFailed,
-    UnsupportedArithmetic,
     InvalidArithmetic,
     DivisionByZero,
     BraceExpansionTooLarge,
