@@ -282,7 +282,7 @@ class RedirectCompatibilityTests(unittest.TestCase):
             result.stderr,
             b"wsh: shopt: bogus: invalid shell option name\n"
             b"wsh: shopt: cannot set and unset shell options simultaneously\n"
-            b"wsh: shopt: -x: invalid option\nshopt: usage: shopt [-pqsu] [optname ...]\n",
+            b"wsh: shopt: -x: invalid option\nshopt: usage: shopt [-pqsu] [-o] [optname ...]\n",
         )
 
     def test_shopt_lists_every_option(self):
