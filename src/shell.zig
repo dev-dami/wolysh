@@ -134,9 +134,10 @@ pub const Shell = struct {
     /// Set when an interactive `exit` was refused because jobs are stopped;
     /// an immediately repeated `exit` or Ctrl-D then leaves anyway.
     exit_warned: bool = false,
-    /// The interactive command line being run, so `fc` and `history -s` can
-    /// tell which history entry is the command itself. Borrowed from the REPL.
-    entered_line: []const u8 = "",
+    /// The history entry made for the interactive command line being run (empty
+    /// when none was kept), so `fc` and `history -s` can tell which entry is the
+    /// command itself. Borrowed from the history.
+    entered_entry: []const u8 = "",
 
     pid: i32 = 0,
     shell_pgid: i32 = 0,
@@ -793,9 +794,10 @@ pub const Shell = struct {
         self.gpa.free(frame.name);
     }
 
-    /// Whether a history entry is the command line being run right now.
+    /// Whether a history entry is the one made for the command line being run
+    /// right now, by identity: an identical earlier entry does not count.
     pub fn isEnteredLine(self: *const Shell, entry: []const u8) bool {
-        return self.entered_line.len != 0 and std.mem.eql(u8, entry, std.mem.trim(u8, self.entered_line, " \t\r\n"));
+        return self.entered_entry.len != 0 and entry.ptr == self.entered_entry.ptr and entry.len == self.entered_entry.len;
     }
 
     /// The function as `() { ... }` for `BASH_FUNC_name%%`, or null for a

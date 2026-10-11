@@ -432,13 +432,13 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         }
 
         const line = histexpand.apply(sh, source) orelse continue;
-        recordHistory(sh, line, &history_error_reported);
+        const entry = recordHistory(sh, line, &history_error_reported);
         prompt.command_number += 1;
         session.beforeCommand(sh, line);
         const warned = sh.exit_warned;
-        sh.entered_line = line;
+        sh.entered_entry = entry orelse "";
         var status = exec.runSource(sh, line);
-        sh.entered_line = "";
+        sh.entered_entry = "";
         // Only an immediately repeated `exit` gets past the stopped-jobs warning.
         if (warned) sh.exit_warned = false;
         if (sh.interrupted) {
@@ -495,19 +495,20 @@ fn hangUp(sh: *Shell) u8 {
 
 /// Adds an entered line to the history under `HISTCONTROL` and appends it to
 /// the history file at once. A file that cannot be written is reported once.
-fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) void {
+fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) ?[]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
     defer arena_state.deinit();
     const control_text = prompt.textVar(sh, arena_state.allocator(), "HISTCONTROL") catch null;
-    const entry = (sh.hist.record(sh.gpa, source, history.Control.parse(control_text)) catch return) orelse return;
-    if (sh.history_path.len == 0) return;
+    const entry = (sh.hist.record(sh.gpa, source, history.Control.parse(control_text)) catch return null) orelse return null;
+    if (sh.history_path.len == 0) return entry;
     sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
-        if (reported.*) return;
+        if (reported.*) return entry;
         reported.* = true;
         var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot write {s}\n", .{sh.history_path}) catch return;
+        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot write {s}\n", .{sh.history_path}) catch return entry;
         sys.writeStr(2, msg);
     };
+    return entry;
 }
 
 /// Puts the shell in its own process group and claims the terminal, which is

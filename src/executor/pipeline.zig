@@ -312,12 +312,27 @@ fn launchCoproc(
 
     // The shell reads what the child writes (`NAME[0]`) and writes what the
     // child reads (`NAME[1]`).
-    const fds = [_]value.Value{ .{ .int = from_child[0] }, .{ .int = to_child[1] } };
-    sh.setVar(name, .{ .list = &fds }) catch return 1;
     var pid_name_buf: [256]u8 = undefined;
     const pid_name = std.fmt.bufPrint(&pid_name_buf, "{s}_PID", .{name}) catch return 1;
+    closeCoprocDescriptors(sh, name, pid_name);
+    const fds = [_]value.Value{ .{ .int = from_child[0] }, .{ .int = to_child[1] } };
+    sh.setVar(name, .{ .list = &fds }) catch return 1;
     sh.setVar(pid_name, .{ .int = pid }) catch return 1;
     return 0;
+}
+
+/// A new coprocess under a name that already holds one replaces it, so the
+/// shell's ends of the old pipes are closed before the names are rebound.
+fn closeCoprocDescriptors(sh: *Shell, name: []const u8, pid_name: []const u8) void {
+    if (sh.getVar(pid_name) == null) return;
+    const old = sh.getVar(name) orelse return;
+    switch (old) {
+        .list => |items| for (items) |item| {
+            const number = item.asInt() orelse continue;
+            if (number > 2) sys.closeFd(@intCast(number));
+        },
+        else => {},
+    }
 }
 
 /// True when `cat`'s arguments name no file: only options, or nothing. A lone

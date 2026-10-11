@@ -296,7 +296,7 @@ pub fn read(ctx: Ctx) u8 {
         if (is_tty) ctx.err(text);
     }
     if (editing and is_tty) {
-        if (initial) |text| queueInput(fd, text);
+        if (initial) |text| queueInput(fd, text, nchars, delim);
     }
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
@@ -332,9 +332,13 @@ pub fn read(ctx: Ctx) u8 {
 
 /// Pushes `text` onto the terminal's input queue (`TIOCSTI`), so it appears
 /// on the line being read. Best effort: some kernels disable the ioctl.
-fn queueInput(fd: i32, text: []const u8) void {
+fn queueInput(fd: i32, text: []const u8, limit: ?usize, delim: u8) void {
     const tiocsti = 0x5412;
-    for (text) |*byte| {
+    // Only what `read` will consume may be queued: anything past `-n`/`-N`
+    // characters or the delimiter would be left for the next command.
+    const capped = if (limit) |n| text[0..@min(n, text.len)] else text;
+    for (capped) |*byte| {
+        if (byte.* == delim) return;
         // A control byte would act on the line discipline (newline submits,
         // Ctrl-D ends input) or leave commands queued, so queueing stops there.
         if ((byte.* < 0x20 and byte.* != '\t') or byte.* == 0x7f) return;
