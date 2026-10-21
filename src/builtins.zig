@@ -966,7 +966,8 @@ fn builtinShift(ctx: Ctx) u8 {
         };
     }
     if (count > ctx.sh.positional.len) {
-        ctx.err("wsh: shift: not enough positional parameters\n");
+        // Bash fails quietly unless `shopt -s shift_verbose`.
+        if (ctx.sh.options.shift_verbose) ctx.errFmt("wsh: shift: {d}: shift count out of range\n", .{count});
         return 1;
     }
     ctx.sh.positional = ctx.sh.positional[count..];

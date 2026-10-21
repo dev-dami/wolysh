@@ -80,7 +80,7 @@ class CoreCompatTests(unittest.TestCase):
     def test_unset_functions_and_options(self):
         result = run_shell("fn greet() { echo hi }; unset -f greet; greet")
         self.assertEqual(result.returncode, 127)
-        self.assertIn(b"command not found: greet", result.stderr)
+        self.assertIn(b"greet: command not found", result.stderr)
         # Without an option a name with no variable falls back to the function.
         result = run_shell("fn greet() { echo hi }; unset greet; greet")
         self.assertEqual(result.returncode, 127)
@@ -295,9 +295,9 @@ class CoreCompatTests(unittest.TestCase):
     def test_self_referencing_aliases_do_not_recurse(self):
         result = run_shell("alias greet = echo hi; greet\ngreet", timeout=5)
         self.assertEqual(result.stdout, b"hi\n")
-        self.assertIn(b"command not found: greet", result.stderr)
+        self.assertIn(b"greet: command not found", result.stderr)
         result = run_shell("alias loop = echo x | loop\nloop | cat", timeout=5)
-        self.assertIn(b"command not found: loop", result.stderr)
+        self.assertIn(b"loop: command not found", result.stderr)
         self.assert_output("alias echo = echo prefixed\necho hi", "prefixed hi\n")
 
     # --- 9. kill ------------------------------------------------------------

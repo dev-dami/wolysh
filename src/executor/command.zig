@@ -196,8 +196,10 @@ pub fn dispatch(sh: *Shell, argv: []const []const u8, runtime: Runtime) u8 {
 
 pub fn commandNotFoundMessage(sh: *Shell, arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
     var message: std.ArrayList(u8) = .empty;
-    const initial = try std.fmt.allocPrint(arena, "wsh: command not found: {s}\n", .{name});
+    // Bash's wording; spelling suggestions are for people at a prompt.
+    const initial = try std.fmt.allocPrint(arena, "wsh: {s}: command not found\n", .{name});
     try message.appendSlice(arena, initial);
+    if (!sh.interactive) return try message.toOwnedSlice(arena);
 
     const matches = if (sh.command_cache.lookup(name)) |cached| cached.matches else blk: {
         const found = command_suggest.find(sh, arena, name) catch return try message.toOwnedSlice(arena);

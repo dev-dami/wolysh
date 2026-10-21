@@ -211,9 +211,10 @@ class ArithmeticTests(unittest.TestCase):
         )
 
     def test_readonly_variable_is_not_assigned(self):
+        # As in Bash, the failed expansion also ends the script.
         result = run_shell("readonly r=1; echo $(( r = 2 )); echo r=$r")
         self.assertEqual(result.stderr.decode(), "wsh: r: readonly variable\n")
-        self.assertEqual(result.stdout, b"r=1\n")
+        self.assertEqual((result.returncode, result.stdout), (1, b""))
 
     def test_minimum_integer_division_does_not_crash(self):
         result = run_shell("echo $(( (-9223372036854775807-1) / -1 )) $(( (-9223372036854775807-1) % -1 ))")

@@ -20,6 +20,7 @@ const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const compound_assign = @import("compound.zig");
 const test_ops = @import("builtins/test.zig");
+const sys = @import("sys.zig");
 
 pub const Error = error{ SyntaxError, OutOfMemory } || std.mem.Allocator.Error;
 
@@ -198,6 +199,12 @@ pub const Parser = struct {
         if (self.heredoc_next < self.pending_heredocs.items.len) {
             return self.fail("expected a newline before the here-document body");
         }
+        switch (self.lex.unclosed) {
+            0 => {},
+            '"' => return self.fail("unexpected end of input looking for the closing '\"'"),
+            '\'' => return self.fail("unexpected end of input looking for the closing \"'\""),
+            else => return self.fail("unexpected end of input looking for the closing '`'"),
+        }
         return stmts.toOwnedSlice(self.arena);
     }
 
@@ -314,7 +321,9 @@ pub const Parser = struct {
                 if (eql(kw, "let")) {
                     if (try self.tryParseLet()) |stmt| return stmt;
                 }
-                if (eql(kw, "fn")) return self.parseFn();
+                if (eql(kw, "fn")) {
+                    if (self.looksLikeFnDeclaration()) return self.parseFn();
+                }
                 if (eql(kw, "return")) return self.parseReturn();
                 if (eql(kw, "alias")) return self.parseAlias();
                 if (eql(kw, "break")) return self.parseLoopControl(true);
@@ -954,6 +963,18 @@ pub const Parser = struct {
         } };
     }
 
+    /// `fn NAME(` starts a declaration; anything else (`fn a b`) is a call
+    /// to a command or function named `fn`.
+    fn looksLikeFnDeclaration(self: *Parser) bool {
+        const saved = self.save();
+        defer self.restore(saved);
+        self.advance(); // `fn`
+        self.setMode(.expr);
+        if (self.tok.tag != .ident) return false;
+        self.advance();
+        return self.tok.tag == .lparen;
+    }
+
     fn parseFn(self: *Parser) Error!ast.Stmt {
         const line = lineOf(self.tok);
         const decl_start = self.tok.start;
@@ -1479,6 +1500,8 @@ pub const Parser = struct {
     fn consumePendingHereDocs(self: *Parser) Error!void {
         var cursor = self.lex.pos;
         var line = self.lex.line;
+        // The lexer has already counted the newline that ends the opener.
+        const opener_line = if (line > 1) line - 1 else line;
         for (self.pending_heredocs.items[self.heredoc_next..]) |redirect| {
             const body_start = cursor;
             var found = false;
@@ -1502,7 +1525,17 @@ pub const Parser = struct {
                 cursor = line_end + 1;
                 line += 1;
             }
-            if (!found) return self.fail("unterminated here-document");
+            // Bash takes the rest of the input as the body, with a warning.
+            if (!found) {
+                var buf: [320]u8 = undefined;
+                const warning = std.fmt.bufPrint(&buf, "wsh: warning: here-document at line {d} delimited by end-of-file (wanted `{s}')\n", .{ opener_line, redirect.target }) catch "wsh: warning: here-document delimited by end-of-file\n";
+                sys.writeStr(2, warning);
+                var rest = self.lex.src[body_start..];
+                // Every body line ends in a newline, the last one included.
+                if (rest.len > 0 and rest[rest.len - 1] != '\n') rest = try std.mem.concat(self.arena, u8, &.{ rest, "\n" });
+                redirect.body = if (redirect.strip_tabs) try stripLeadingTabs(self.arena, rest) else rest;
+                cursor = self.lex.src.len;
+            }
         }
 
         self.lex.pos = cursor;

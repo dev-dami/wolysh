@@ -146,6 +146,20 @@ case("groups", 'echo $(( ${#GROUPS[@]} > 0 )) $(( GROUPS[0] == $(id -g) ))')
 case("bash_aliases", "alias ll='ls -l'\necho ${BASH_aliases-x} ${BASH_ALIASES[ll]}")
 case("optind_opterr_defaults", "echo $OPTIND $OPTERR")
 
+# --- errors -------------------------------------------------------------------------
+case("command_not_found_message", "nonexistent_command_xyz; echo $?")
+case("arithmetic_expansion_error_stops_the_script", "echo before; x=$((1/0)); echo after", stderr=False)
+case("arithmetic_command_error_continues", "((1/0)); echo after:$?; let 1/0; echo after:$?", stderr=False)
+case("arithmetic_error_in_a_pipeline_stage", "echo $(( 1/0 )) | cat; echo after", stderr=False)
+case("arithmetic_error_in_a_subshell", "( echo $((1/0)) ); echo after:$?", stderr=False)
+case("unterminated_double_quote", 'echo "abc', stderr=False)
+case("unterminated_single_quote", "echo 'abc", stderr=False)
+case("unterminated_backquote", "echo `x", stderr=False)
+case("heredoc_ended_by_end_of_file", "cat <<EOF\nbody", stderr=False)
+case("shift_past_the_end_is_quiet", "shift 2; echo $?; shopt -s shift_verbose; shift 2 2>/dev/null; echo $?")
+case("function_named_fn", 'fn() { echo "args: $#"; }; fn a b c')
+case("xtrace_for_and_case", 'set -x; for i in "a b" c; do :; done; case "x y" in x*) echo m;; esac')
+
 # --- hash --------------------------------------------------------------------
 case("hash_r_is_silent", "hash -r; echo ok")
 

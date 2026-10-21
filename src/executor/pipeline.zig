@@ -191,7 +191,14 @@ fn runStages(
             return 2;
         }
         var argv: std.ArrayList([]const u8) = .empty;
-        expand_mod.expandCommand(sh, arena, resolved.words, &argv) catch |err| return runtime.expression_error(sh, err);
+        expand_mod.expandCommand(sh, arena, resolved.words, &argv) catch |err| {
+            // Bash expands each stage in its own process, so a failed
+            // expansion ends that stage, not the shell.
+            const exiting = sh.should_exit;
+            const status = runtime.expression_error(sh, err);
+            if (!exiting) sh.should_exit = false;
+            return status;
+        };
         if (argv.items.len == 0) continue;
 
         const prepared = redirect.apply(sh, arena, cmd, &opened) catch |err| return runtime.expression_error(sh, err);
