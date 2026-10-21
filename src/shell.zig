@@ -182,6 +182,11 @@ pub const Shell = struct {
     readonly: std.StringHashMap(void),
     /// `declare -i/-l/-u` attributes, applied by `setVar` on every assignment.
     attrs: std.StringHashMap(Attrs),
+    /// `$BASH_SUBSHELL`: how many subshells deep this process is.
+    subshell_depth: u32 = 0,
+    /// `$BASH_COMMAND`: the command being run, as written (truncated).
+    command_text: [1024]u8 = undefined,
+    command_len: usize = 0,
     /// Coprocesses started and not yet forgotten.
     coproc_list: std.ArrayList(struct { name: []u8, pid: i32 }) = .empty,
     /// How many variables carry the `nameref` attribute, so the common case
@@ -568,12 +573,26 @@ pub const Shell = struct {
         const name = self.deref(name_in);
         if (special_vars.assign(self, name, val)) return;
         // Whatever is stored next is no longer the list `let` made.
-        if (self.attrs.get(name)) |old| if (old.native_list) {
+        if (self.attrs.count() != 0) if (self.attrs.get(name)) |old| if (old.native_list) {
             var attrs = old;
             attrs.native_list = false;
             try self.setAttrs(name, attrs);
         };
         return self.storeVar(name, try arrays.applyAttrs(self, name, val));
+    }
+
+    pub fn noteCommand(self: *Shell, words: []const []const u8) void {
+        var len: usize = 0;
+        for (words, 0..) |word, index| {
+            if (index != 0 and len < self.command_text.len) {
+                self.command_text[len] = ' ';
+                len += 1;
+            }
+            const n = @min(word.len, self.command_text.len - len);
+            @memcpy(self.command_text[len..][0..n], word[0..n]);
+            len += n;
+        }
+        self.command_len = len;
     }
 
     /// True when `$name` stands for every element: a list made by `let`.

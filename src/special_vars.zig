@@ -18,14 +18,10 @@ const sys = @import("sys.zig");
 const set_options = @import("set_options.zig");
 
 pub const names = [_][]const u8{
-    "BASH_LINENO",  "BASH_SOURCE",   "FUNCNAME",
-    "BASH",         "BASHPID",       "BASH_VERSINFO",
-    "BASH_VERSION", "EPOCHREALTIME", "EPOCHSECONDS",
-    "EUID",         "HOSTNAME",      "HOSTTYPE",
-    "IFS",          "LINENO",        "MACHTYPE",
-    "OSTYPE",       "PPID",          "PS4",
-    "RANDOM",       "SECONDS",       "SHELLOPTS",
-    "SRANDOM",      "UID",           "WSH_VERSION",
+    "BASH_ALIASES", "BASH_COMMAND", "BASH_SUBSHELL", "DIRSTACK", "GROUPS",    "HISTCMD",       "OPTERR",       "OPTIND",
+    "BASH_LINENO",  "BASH_SOURCE",  "FUNCNAME",      "BASH",     "BASHPID",   "BASH_VERSINFO", "BASH_VERSION", "EPOCHREALTIME",
+    "EPOCHSECONDS", "EUID",         "HOSTNAME",      "HOSTTYPE", "IFS",       "LINENO",        "MACHTYPE",     "OSTYPE",
+    "PPID",         "PS4",          "RANDOM",        "SECONDS",  "SHELLOPTS", "SRANDOM",       "UID",          "WSH_VERSION",
 };
 
 /// The Bash version scripts see. Scripts test the major number or look for
@@ -42,6 +38,9 @@ var options_buf: [512]u8 = undefined;
 /// Backing for the call-stack arrays: one entry per active call plus `main`.
 var stack_funcname: [shell.Shell.max_call_depth + 2]value.Value = undefined;
 var stack_source: [shell.Shell.max_call_depth + 2]value.Value = undefined;
+var dirstack_buf: [shell.Shell.max_dirs + 1]value.Value = undefined;
+var groups_buf: [64]value.Value = undefined;
+var alias_entries: std.ArrayList(value.Entry) = .empty;
 var stack_lineno: [shell.Shell.max_call_depth + 2]value.Value = undefined;
 
 /// Monotonic time at which `SECONDS` read zero.
@@ -60,16 +59,19 @@ pub fn start() void {
     parent_pid = linux.getppid();
 }
 
+const lookup = blk: {
+    var pairs: [names.len]struct { []const u8, void } = undefined;
+    for (names, 0..) |name, i| pairs[i] = .{ name, {} };
+    break :blk std.StaticStringMap(void).initComptime(pairs);
+};
+
 pub fn isSpecial(name: []const u8) bool {
-    for (names) |candidate| {
-        if (std.mem.eql(u8, candidate, name)) return true;
-    }
-    return false;
+    return lookup.has(name);
 }
 
 /// The computed value of `name`, or null when it is not a special variable.
 pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
-    if (name.len < 3 or name[0] < 'A' or name[0] > 'Z') return null;
+    if (name.len < 3 or name[0] < 'A' or name[0] > 'Z' or !lookup.has(name)) return null;
     const eql = std.mem.eql;
     if (eql(u8, name, "RANDOM")) return .{ .int = nextRandom() };
     if (eql(u8, name, "SECONDS")) return .{ .int = @divFloor(monotonicNs() - secondsOrigin(), std.time.ns_per_s) };
@@ -92,6 +94,13 @@ pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
     if (eql(u8, name, "FUNCNAME") or eql(u8, name, "BASH_SOURCE") or eql(u8, name, "BASH_LINENO")) {
         return callStack(sh, name);
     }
+    if (eql(u8, name, "BASH_COMMAND")) return .{ .string = sh.command_text[0..sh.command_len] };
+    if (eql(u8, name, "BASH_SUBSHELL")) return .{ .int = sh.subshell_depth };
+    if (eql(u8, name, "HISTCMD")) return .{ .int = @intCast(@max(sh.hist.count(), 1)) };
+    if (eql(u8, name, "OPTIND") or eql(u8, name, "OPTERR")) return .{ .int = 1 };
+    if (eql(u8, name, "DIRSTACK")) return dirStack(sh);
+    if (eql(u8, name, "GROUPS")) return groups();
+    if (eql(u8, name, "BASH_ALIASES")) return aliasMap(sh);
     // Bash starts with its own IFS and ignores the one it inherits.
     if (eql(u8, name, "IFS")) return .{ .string = " \t\n" };
     if (eql(u8, name, "PS4")) return .{ .string = "+ " };
@@ -137,6 +146,37 @@ fn callStack(sh: *const shell.Shell, name: []const u8) ?value.Value {
     }
     out[count] = if (funcname) .{ .string = "main" } else if (source) .{ .string = sh.script_file } else .{ .int = 0 };
     return .{ .list = out[0 .. count + 1] };
+}
+
+/// `DIRSTACK`: the current directory, then what `pushd` saved.
+fn dirStack(sh: *const shell.Shell) value.Value {
+    const count = @min(sh.dir_stack.items.len + 1, dirstack_buf.len);
+    dirstack_buf[0] = .{ .string = sh.cwd };
+    for (1..count) |i| dirstack_buf[i] = .{ .string = sh.dir_stack.items[i - 1] };
+    return .{ .list = dirstack_buf[0..count] };
+}
+
+/// `GROUPS`: the groups the user is in.
+fn groups() value.Value {
+    var ids: [64]u32 = undefined;
+    const rc = linux.getgroups(ids.len, &ids);
+    const count: usize = if (linux.errno(rc) == .SUCCESS) @min(rc, ids.len) else 0;
+    if (count == 0) {
+        groups_buf[0] = .{ .int = linux.getgid() };
+        return .{ .list = groups_buf[0..1] };
+    }
+    for (0..count) |i| groups_buf[i] = .{ .int = ids[i] };
+    return .{ .list = groups_buf[0..count] };
+}
+
+/// `BASH_ALIASES`: every alias, keyed by name.
+fn aliasMap(sh: *const shell.Shell) ?value.Value {
+    alias_entries.clearRetainingCapacity();
+    var it = sh.aliases.iterator();
+    while (it.next()) |entry| {
+        alias_entries.append(sh.gpa, .{ .key = entry.key_ptr.*, .value = .{ .string = entry.value_ptr.* } }) catch return null;
+    }
+    return .{ .map = alias_entries.items };
 }
 
 fn shellPath() ?[]const u8 {

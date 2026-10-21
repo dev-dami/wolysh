@@ -309,6 +309,26 @@ class SessionTests(unittest.TestCase):
 
     # --- hooks -----------------------------------------------------------------
 
+    def test_ps0_and_prompt_command_array(self):
+        s = self.start()
+        s.run("PS0='<ps0 $((6*7))>'")
+        s.run("PROMPT_COMMAND=('echo PC-ONE' 'echo PC-TWO')")
+        start = len(s.buf)
+        status, output = s.run("echo body")
+        self.assertEqual(status, 0)
+        tail = strip_ansi(s.buf[start:])
+        self.assertIn(b"<ps0 42>", tail)
+        self.assertLess(tail.find(b"<ps0 42>"), tail.find(b"body\r\n"))
+        self.assertIsNotNone(s.read_until(b"PC-TWO", start))
+        self.assertLess(s.buf.find(b"PC-ONE", start), s.buf.find(b"PC-TWO", start))
+
+    def test_histtimeformat_shows_entry_times(self):
+        s = self.start()
+        s.run("echo stamped")
+        status, output = s.run("HISTTIMEFORMAT='%Y|' history 2")
+        self.assertEqual(status, 0)
+        self.assertRegex(output, rb"\d+  20\d\d\|echo stamped")
+
     def test_hooks_run_and_leave_the_status_alone(self):
         s = self.start()
         s.run("fn precmd() { echo PRECMD-RAN; false }")

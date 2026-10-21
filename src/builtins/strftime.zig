@@ -60,7 +60,7 @@ pub const Zone = struct {
     types: []const TimeType = &.{},
     rule: ?Rule = null,
 
-    const utc = Zone{ .rule = .{ .std_type = .{ .utoff = 0, .isdst = false, .abbr = "UTC" } } };
+    pub const utc = Zone{ .rule = .{ .std_type = .{ .utoff = 0, .isdst = false, .abbr = "UTC" } } };
 
     fn lookup(self: Zone, t: i64) TimeType {
         if (self.transitions.len == 0) {

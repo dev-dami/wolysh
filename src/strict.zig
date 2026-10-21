@@ -206,6 +206,7 @@ fn syncFatalHandlers(sh: *Shell) void {
 /// ones stay ignored, and the parent's EXIT, DEBUG and RETURN traps (and ERR,
 /// unless `set -E`) are dropped. Traps the child sets itself still run.
 pub fn enterSubshell(sh: *Shell) void {
+    sh.subshell_depth += 1;
     var sig: u32 = 1;
     while (sig <= Shell.max_signal) : (sig += 1) {
         // A signal the parent has yet to handle is the parent's business.
@@ -285,12 +286,11 @@ pub fn runReturnTrap(sh: *Shell) void {
 /// words as written; `BASH_COMMAND` holds them while the trap runs.
 pub fn beforeCommand(sh: *Shell, words: []const []const u8) void {
     if (running_traps != 0) return;
+    // `$BASH_COMMAND` is the command as written; kept in a fixed buffer so
+    // it stays readable after the command's own memory is gone.
+    if (words.len != 0) sh.noteCommand(words);
     const handler = sh.getTrap(Shell.debug_trap) orelse return;
     if (handler.len == 0) return;
-    if (words.len != 0) {
-        const text: []const u8 = std.mem.join(sh.scratch(), " ", words) catch "";
-        sh.setVar("BASH_COMMAND", .{ .string = text }) catch {};
-    }
     runHandler(sh, handler);
 }
 

@@ -138,6 +138,14 @@ case(
     'coproc FOO { echo hi; }; read -u ${FOO[0]} l; echo "$l"; wait $FOO_PID; echo "[${FOO[0]-gone}] [${FOO_PID-gone}]"',
 )
 
+# --- more Bash variables -------------------------------------------------------
+case("bash_command", 'f() { echo "BC=[$BASH_COMMAND]"; }; f; trap \'echo "err: $BASH_COMMAND"\' ERR; false')
+case("bash_subshell", 'echo "$BASH_SUBSHELL $(echo $BASH_SUBSHELL) $( (echo $BASH_SUBSHELL) )"; (echo $BASH_SUBSHELL)')
+case("dirstack", 'pushd /tmp >/dev/null; echo "${#DIRSTACK[@]} ${DIRSTACK[0]}"; popd >/dev/null; echo ${#DIRSTACK[@]}')
+case("groups", 'echo $(( ${#GROUPS[@]} > 0 )) $(( GROUPS[0] == $(id -g) ))')
+case("bash_aliases", "alias ll='ls -l'\necho ${BASH_aliases-x} ${BASH_ALIASES[ll]}")
+case("optind_opterr_defaults", "echo $OPTIND $OPTERR")
+
 # --- hash --------------------------------------------------------------------
 case("hash_r_is_silent", "hash -r; echo ok")
 
