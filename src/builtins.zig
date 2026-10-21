@@ -943,6 +943,7 @@ pub fn runExternal(ctx: Ctx, argv: []const []const u8, path_env: []const u8) u8 
         .argv = proc.buildArgv(arena, argv) catch return 1,
         .envp = ctx.sh.buildEnvp(arena) catch return 1,
     };
+    proc.addScriptFallback(arena, exec, ctx.sh.shellExecutable(), resolved, argv) catch return 1;
 
     const stage = proc.Stage{
         .exec = exec,
@@ -1016,12 +1017,14 @@ fn builtinExec(ctx: Ctx) u8 {
     const err = linux.errno(linux.execve(path.ptr, argv, envp));
 
     if (err == .NOEXEC) {
+        const shell = ctx.sh.shellExecutable();
         const script_argv = arena.alloc([]const u8, command_argv.len + 1) catch return 127;
-        script_argv[0] = "/bin/sh";
+        script_argv[0] = shell;
         script_argv[1] = resolved;
         for (command_argv[1..], 0..) |argument, index| script_argv[index + 2] = argument;
         const shell_argv = proc.buildArgv(arena, script_argv) catch return 127;
-        _ = linux.execve("/bin/sh", shell_argv, envp);
+        const shell_z = arena.dupeZ(u8, shell) catch return 127;
+        _ = linux.execve(shell_z.ptr, shell_argv, envp);
     }
 
     // Still here: an interactive shell carries on with its own dispositions.

@@ -9,6 +9,7 @@ const exec = @import("exec.zig");
 const strict = @import("strict.zig");
 const set_builtin = @import("builtins/set.zig");
 const fs = @import("fs.zig");
+const builtins = @import("builtins.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
 const prompt = @import("interactive/prompt.zig");
@@ -106,11 +107,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // go to one, or when `-i` asks for it. Standard output may be a pipe.
     const reads_input = options.command == null and options.script == null;
     sh.interactive = options.interactive or (reads_input and sys.isTty(0) and sys.isTty(2));
-    // As in Bash, line editing and history are interactive features.
+    // As in Bash, line editing, history and aliases are interactive
+    // features; a script turns aliases on with `shopt -s expand_aliases`.
     if (!sh.interactive) {
         sh.options.emacs = false;
         sh.options.history = false;
         sh.options.histexpand = false;
+        sh.options.expand_aliases = false;
+        // wsh's `which` describes builtins and aliases for people; a script
+        // gets the `which` program, as under Bash.
+        _ = builtins.setEnabled("which", false);
     }
 
     if (!options.check) {
@@ -137,6 +143,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         sh.source_file = script;
         // A script file is parsed as a whole: a syntax error anywhere means
         // none of it runs.
+        if (scriptProblem(gpa, script)) |problem| {
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}: {s}\n", .{ script, problem.text }) catch return problem.status;
+            sys.writeStr(2, msg);
+            return problem.status;
+        }
         const data = readWholeFile(gpa, script) orelse {
             var buf: [512]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot read script\n", .{script}) catch return 1;
@@ -144,6 +156,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         };
         defer gpa.free(data);
+        // Bash's test: a NUL before the first newline of the first 80 bytes
+        // means a program, not a script.
+        const head = data[0..@min(data.len, 80)];
+        const first_line = head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
+        if (std.mem.indexOfScalar(u8, first_line, 0) != null) {
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot execute binary file\n", .{script}) catch return 126;
+            sys.writeStr(2, msg);
+            return 126;
+        }
         if (options.check) return exec.checkSource(&sh, data);
         if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
         return strict.finish(&sh, exec.runSource(&sh, data));
@@ -353,6 +375,18 @@ fn useRcFile(sh: *Shell, gpa: std.mem.Allocator, path: []const u8) bool {
 fn loadInteractiveConfig(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) void {
     setupPaths(sh, gpa) catch {};
     if (!no_config) loadConfig(sh);
+}
+
+const ScriptProblem = struct { text: []const u8, status: u8 };
+
+/// Why a script file cannot be run, worded and numbered as Bash does it.
+fn scriptProblem(gpa: std.mem.Allocator, path: []const u8) ?ScriptProblem {
+    const z = gpa.dupeZ(u8, path) catch return null;
+    defer gpa.free(z);
+    const kind = fs.kindFollow(z) orelse return .{ .text = "No such file or directory", .status = 127 };
+    if (kind == .dir) return .{ .text = "Is a directory", .status = 126 };
+    if (linux.errno(linux.access(z.ptr, linux.R_OK)) != .SUCCESS) return .{ .text = "Permission denied", .status = 126 };
+    return null;
 }
 
 fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {

@@ -1319,7 +1319,9 @@ pub const Expander = struct {
         if (trimmed.len == 0) return;
         if (inputRedirectOnly(trimmed)) |target| return self.substituteFile(target, quoted);
         const runner = self.sh.subst_runner orelse return;
-        const result = runner(self.sh, trimmed, self.arena) catch return Error.SubstitutionFailed;
+        // The body runs as written: trimming it would turn a final
+        // `\`-newline continuation into a literal backslash.
+        const result = runner(self.sh, src, self.arena) catch return Error.SubstitutionFailed;
         // Only trailing newlines are stripped, like every other shell.
         try self.emit(std.mem.trimEnd(u8, result, "\n"), quoted);
     }

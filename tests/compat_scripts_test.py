@@ -119,7 +119,20 @@ case("shellopts_lists_set_options", 'set -o pipefail -u; echo $SHELLOPTS')
 case("set_o_names_accepted", "set -o posix -o verbose -o monitor -o keyword -o notify +o posix +o verbose +o monitor +o keyword +o notify; echo ok")
 case("shopt_q_known_names", "for o in lastpipe inherit_errexit huponexit checkwinsize histappend; do shopt -q $o; echo $o=$?; done")
 case("shopt_p_default", "shopt -p lastpipe sourcepath")
-case("expand_aliases_off", "alias say='echo aliased'\nshopt -u expand_aliases\nsay hi 2>/dev/null || echo not-alias", stderr=False)
+case("aliases_are_off_in_scripts", "alias say='echo aliased'\nsay hi")
+case("expand_aliases_turns_them_on", "shopt -s expand_aliases\nalias say='echo aliased'\nsay hi; shopt expand_aliases")
+case("command_v_ignores_aliases_that_do_not_expand", "alias ls='ls -l'\ncommand -v ls; type -t ls")
+case(
+    "export_updates_the_variable",
+    'X=1; export X=2; echo $X; env | grep ^X=; declare -i n=1; export n=2+3; echo $n; export X+=z; echo $X',
+)
+case("exported_local_is_restored", 'f(){ local L=1; export L=2; env | grep ^L=; }; f; echo "[${L-unset}]"; env | grep -c ^L=')
+case("local_shadows_an_exported_variable", 'export G=g; g(){ local G=inner; env | grep ^G=; }; g; env | grep ^G=')
+case("local_path_changes_lookup", 'h(){ local PATH=/nope; ls >/dev/null 2>&1; echo $?; }; h; ls / >/dev/null && echo ok')
+case("assignment_updates_an_exported_variable", 'export N=1; N=$((N+1)); env | grep ^N=')
+case("which_is_the_program_in_scripts", "which sh | grep -c /; type -t which")
+case("script_without_shebang_runs_in_a_shell", "printf 'echo ran \"$@\"\\n' > nosb; chmod +x nosb; ./nosb a; command ./nosb b; (exec ./nosb c)")
+case("substitution_ending_in_a_continuation", 'x="$(echo a \\\n   )"; echo "[$x]"; y=`echo b \\\n`; echo "[$y]"')
 
 # --- builtins ------------------------------------------------------------------
 case("printf_v_array_element", 'printf -v "arr[2]" %s q; echo "${arr[2]}"; declare -A m; printf -v "m[k]" "%d" 42; echo ${m[k]}')

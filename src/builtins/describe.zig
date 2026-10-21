@@ -65,7 +65,8 @@ const Lookup = struct {
 fn resolve(ctx: Ctx, arena: Allocator, name: []const u8, how: Lookup) Allocator.Error![]const Match {
     var matches: std.ArrayList(Match) = .empty;
     if (!how.path_only) {
-        if (ctx.sh.getAlias(name)) |text| try matches.append(arena, .{ .kind = .alias, .detail = text });
+        // An alias that would not expand is not what the name runs.
+        if (ctx.sh.options.expand_aliases) if (ctx.sh.getAlias(name)) |text| try matches.append(arena, .{ .kind = .alias, .detail = text });
         if (isKeyword(name)) try matches.append(arena, .{ .kind = .keyword });
         // A function shadows a builtin of the same name when it runs.
         if (how.functions) {

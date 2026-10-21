@@ -561,12 +561,7 @@ pub fn launchStage(
         .envp = try sh.buildEnvp(arena),
     };
 
-    const shell_argv = try arena.alloc([]const u8, argv.len + 1);
-    shell_argv[0] = "/bin/sh";
-    shell_argv[1] = resolved;
-    for (argv[1..], 0..) |argument, index| shell_argv[index + 2] = argument;
-    exec.shell_path = "/bin/sh";
-    exec.shell_argv = try proc.buildArgv(arena, shell_argv);
+    try proc.addScriptFallback(arena, exec, sh.shellExecutable(), resolved, argv);
 
     return .{
         .exec = exec,

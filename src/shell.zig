@@ -308,6 +308,9 @@ pub const Shell = struct {
         was_set: bool,
         previous: value.Value = .none,
         attrs: Attrs = .{},
+        /// The environment entry the local shadowed, restored with it, so
+        /// `local x; export x=1` does not outlive the function.
+        env_previous: ?[]u8 = null,
     };
 
     pub const Attrs = packed struct(u8) {
@@ -468,6 +471,7 @@ pub const Shell = struct {
             for (scope.saved.items) |saved| {
                 self.gpa.free(saved.name);
                 freeValue(self.gpa, saved.previous);
+                if (saved.env_previous) |text| self.gpa.free(text);
             }
             scope.saved.deinit(self.gpa);
         }
@@ -578,7 +582,24 @@ pub const Shell = struct {
             attrs.native_list = false;
             try self.setAttrs(name, attrs);
         };
-        return self.storeVar(name, try arrays.applyAttrs(self, name, val));
+        const stored = try arrays.applyAttrs(self, name, val);
+        try self.storeVar(name, stored);
+        // An exported variable's new value is what children see, as in Bash.
+        if (self.env.getPtr(name)) |slot| try self.updateExported(slot, stored);
+    }
+
+    fn updateExported(self: *Shell, slot: *[]const u8, val: value.Value) !void {
+        var buf: [64]u8 = undefined;
+        const text: []const u8 = switch (val) {
+            .string => |s| s,
+            .int => |n| std.fmt.bufPrint(&buf, "{d}", .{n}) catch return,
+            // Arrays are not exported; `none` (declared, unset) keeps the old text.
+            else => return,
+        };
+        if (std.mem.eql(u8, slot.*, text)) return;
+        const owned = try self.gpa.dupe(u8, text);
+        self.gpa.free(slot.*);
+        slot.* = owned;
     }
 
     pub fn noteCommand(self: *Shell, words: []const []const u8) void {
@@ -593,6 +614,15 @@ pub const Shell = struct {
             len += n;
         }
         self.command_len = len;
+    }
+
+    /// This shell's own executable, for running scripts that have no `#!`
+    /// line; `/bin/sh` if it cannot be found.
+    pub fn shellExecutable(self: *const Shell) []const u8 {
+        return switch (special_vars.get(self, "BASH") orelse return "/bin/sh") {
+            .string => |path| path,
+            else => "/bin/sh",
+        };
     }
 
     /// True when `$name` stands for every element: a list made by `let`.
@@ -711,6 +741,13 @@ pub const Shell = struct {
                 freeValue(self.gpa, kv.value);
             }
             self.setAttrs(saved.name, saved.attrs) catch {};
+            if (saved.env_previous) |text| {
+                self.setEnv(saved.name, text) catch {};
+                self.gpa.free(text);
+            } else if (self.env.fetchRemove(saved.name)) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value);
+            }
             self.gpa.free(saved.name);
             freeValue(self.gpa, saved.previous);
         }
@@ -733,11 +770,14 @@ pub const Shell = struct {
         const previous = self.vars.get(name);
         const copy = if (previous) |v| try cloneValue(self.gpa, v) else value.Value.none;
         errdefer if (previous != null) freeValue(self.gpa, copy);
+        const env_copy: ?[]u8 = if (self.env.get(name)) |text| try self.gpa.dupe(u8, text) else null;
+        errdefer if (env_copy) |text| self.gpa.free(text);
         try scope.saved.append(self.gpa, .{
             .name = owned,
             .was_set = previous != null,
             .previous = copy,
             .attrs = self.getAttrs(name),
+            .env_previous = env_copy,
         });
         // A local starts without the attributes of the binding it shadows.
         try self.setAttrs(name, .{});

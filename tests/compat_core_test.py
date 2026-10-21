@@ -275,30 +275,31 @@ class CoreCompatTests(unittest.TestCase):
             )
 
     # --- 8. aliases with operators -----------------------------------------
+    # Scripts expand aliases only after `shopt -s expand_aliases`, as in Bash.
 
     def test_alias_with_a_pipeline_runs_whole(self):
-        self.assert_output("alias up = echo abc | tr a-z A-Z\nup", "ABC\n")
-        self.assert_output("alias psg='printf \"%s\\n\" alpha beta gamma | grep'\npsg -v beta", "alpha\ngamma\n")
+        self.assert_output("shopt -s expand_aliases\nalias up = echo abc | tr a-z A-Z\nup", "ABC\n")
+        self.assert_output("shopt -s expand_aliases\nalias psg='printf \"%s\\n\" alpha beta gamma | grep'\npsg -v beta", "alpha\ngamma\n")
 
     def test_operator_alias_redirection_and_pipeline_cover_the_whole_body(self):
         with tempfile.TemporaryDirectory(prefix="wsh-core-") as temp_dir:
             out = pathlib.Path(temp_dir) / "out"
-            self.assert_output(f"alias two = echo one; echo two\ntwo > {out}; /bin/cat {out}", "one\ntwo\n")
-            self.assert_output("alias two = echo one; echo two\ntwo | /usr/bin/wc -l", "2\n")
-            self.assert_output("alias two = echo one; echo two\nWSH_CORE_X=1 two && echo ok", "one\ntwo\nok\n")
+            self.assert_output(f"shopt -s expand_aliases\nalias two = echo one; echo two\ntwo > {out}; /bin/cat {out}", "one\ntwo\n")
+            self.assert_output("shopt -s expand_aliases\nalias two = echo one; echo two\ntwo | /usr/bin/wc -l", "2\n")
+            self.assert_output("shopt -s expand_aliases\nalias two = echo one; echo two\nWSH_CORE_X=1 two && echo ok", "one\ntwo\nok\n")
 
     def test_alias_arguments_are_passed_literally(self):
-        self.assert_output("alias show = echo start | cat; echo\nshow 'a  b' '$HOME' \"it's\"", "start\na  b $HOME it's\n")
+        self.assert_output("shopt -s expand_aliases\nalias show = echo start | cat; echo\nshow 'a  b' '$HOME' \"it's\"", "start\na  b $HOME it's\n")
         # As in bash, arguments after a trailing `;` form a command of their own.
-        self.assert_output("alias first = echo start;\nfirst /bin/echo next", "start\nnext\n")
+        self.assert_output("shopt -s expand_aliases\nalias first = echo start;\nfirst /bin/echo next", "start\nnext\n")
 
     def test_self_referencing_aliases_do_not_recurse(self):
-        result = run_shell("alias greet = echo hi; greet\ngreet", timeout=5)
+        result = run_shell("shopt -s expand_aliases\nalias greet = echo hi; greet\ngreet", timeout=5)
         self.assertEqual(result.stdout, b"hi\n")
         self.assertIn(b"greet: command not found", result.stderr)
-        result = run_shell("alias loop = echo x | loop\nloop | cat", timeout=5)
+        result = run_shell("shopt -s expand_aliases\nalias loop = echo x | loop\nloop | cat", timeout=5)
         self.assertIn(b"loop: command not found", result.stderr)
-        self.assert_output("alias echo = echo prefixed\necho hi", "prefixed hi\n")
+        self.assert_output("shopt -s expand_aliases\nalias echo = echo prefixed\necho hi", "prefixed hi\n")
 
     # --- 9. kill ------------------------------------------------------------
 

@@ -182,6 +182,25 @@ fn functionAttribute(ctx: Ctx, mode: Mode, specs: []const []const u8, exporting:
     return status;
 }
 
+/// `export NAME=value`: the shell variable (when there is one) and the
+/// environment both take the value, so `$NAME` and children agree.
+fn exportValue(ctx: Ctx, name: []const u8, text: []const u8, append: bool) !void {
+    const sh = ctx.sh;
+    var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var assigned = text;
+    if (append) {
+        const old = (try valueOf(ctx, arena, name)) orelse "";
+        assigned = try std.mem.concat(arena, u8, &.{ old, text });
+    }
+    if (!sh.hasVar(name)) return sh.setEnv(name, assigned);
+    // Through `setVar`, so `declare -i/-l/-u` still shape the value.
+    try sh.setVar(name, .{ .string = assigned });
+    const stored = (try valueOf(ctx, arena, name)) orelse assigned;
+    try sh.setEnv(name, stored);
+}
+
 pub fn exportBuiltin(ctx: Ctx) u8 {
     var parser = options.Parser.init(ctx.argv, "pnf");
     const mode = parseMode(ctx, &parser, "wsh: export: usage: export [-fn] [name[=value] ...] or export -p\n") orelse return 2;
@@ -192,7 +211,9 @@ pub fn exportBuiltin(ctx: Ctx) u8 {
     var status: u8 = 0;
     for (specs) |spec| {
         const at = std.mem.indexOfScalar(u8, spec, '=');
-        const name = if (at) |i| spec[0..i] else spec;
+        // `export NAME+=value` appends, as an assignment would.
+        const append = if (at) |i| i > 0 and spec[i - 1] == '+' else false;
+        const name = if (at) |i| spec[0 .. i - @intFromBool(append)] else spec;
         if (!builtins.validName(name)) {
             ctx.errFmt("wsh: export: `{s}': not a valid identifier\n", .{spec});
             status = 1;
@@ -214,7 +235,7 @@ pub fn exportBuiltin(ctx: Ctx) u8 {
             continue;
         }
         if (at) |i| {
-            ctx.sh.setEnv(name, spec[i + 1 ..]) catch return 1;
+            exportValue(ctx, name, spec[i + 1 ..], append) catch return 1;
         } else if (ctx.sh.getVar(name)) |v| {
             // `export NAME` promotes an existing variable.
             const text = v.renderAlloc(ctx.sh.gpa) catch return 1;

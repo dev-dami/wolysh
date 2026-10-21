@@ -32,6 +32,18 @@ pub const Exec = struct {
     shell_argv: ?[*:null]const ?[*:0]const u8 = null,
 };
 
+/// Sets up `exec` so that a file `execve` refuses as not a program
+/// (`ENOEXEC`: a script without `#!`) runs as a shell script instead, the
+/// way Bash runs it in a copy of itself. `shell` is this shell's executable.
+pub fn addScriptFallback(arena: std.mem.Allocator, exec: *Exec, shell: []const u8, resolved: []const u8, argv: []const []const u8) !void {
+    const shell_argv = try arena.alloc([]const u8, argv.len + 1);
+    shell_argv[0] = shell;
+    shell_argv[1] = resolved;
+    for (argv[1..], 0..) |argument, index| shell_argv[index + 2] = argument;
+    exec.shell_path = (try arena.dupeZ(u8, shell)).ptr;
+    exec.shell_argv = try buildArgv(arena, shell_argv);
+}
+
 /// One process in a pipeline. Either exec a program or run shell code in the
 /// forked child (used for builtins that appear inside a pipeline).
 pub const Stage = struct {

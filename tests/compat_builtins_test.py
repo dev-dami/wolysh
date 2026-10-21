@@ -311,7 +311,7 @@ class UlimitTests(unittest.TestCase):
 class TypeTests(unittest.TestCase):
     def test_type_t_matches_bash(self):
         names = "ll if then fi do done case '[[' '{' '!' time in echo cd ls definitely-missing-xyz"
-        wsh = run_shell(f"alias ll='ls -l'; fn f() {{ echo hi }}; type -t f {names}; echo rc=$?")
+        wsh = run_shell(f"shopt -s expand_aliases; alias ll='ls -l'; fn f() {{ echo hi }}; type -t f {names}; echo rc=$?")
         bash = run_bash(f"shopt -s expand_aliases; alias ll='ls -l'; f() {{ echo hi; }}; type -t f {names}; echo rc=$?")
         self.assertEqual(wsh.stdout, bash.stdout, wsh.stderr)
 

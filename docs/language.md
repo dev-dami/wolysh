@@ -213,14 +213,24 @@ keyboard macros are not supported.
 
 ## Known limitations
 
-- `$name` on an indexed array expands to every element, as it does for wsh
-  lists; Bash gives element 0. Write `${name[0]}` in scripts meant for both
-  shells, including for `$BASH_REMATCH`.
+- A list bound with `let` (wsh's own syntax) expands to every element as
+  `$name`; a Bash array gives element 0, as in Bash.
 - Regular expressions with back-references give up (no match) after a fixed
   amount of work instead of running for exponential time.
 - `read -e` uses the terminal driver's line editing, not the line editor.
 - `<` and `>` in `[[ ]]` compare bytes; Bash orders them by the current
   locale's collation.
+- `declare -f` prints a function as it was written, not reformatted.
+- Aliases are expanded when a command runs, not when it is read, so an alias
+  defined on a line applies later on the same line. Scripts expand them only
+  after `shopt -s expand_aliases`, as in Bash.
+- Most `shopt` names that only affect interactive Bash (`cdspell`,
+  `histverify`, the `compat*` levels, ...) are accepted and remembered but
+  change nothing. `set -o` options `verbose`, `keyword`, `monitor`, `notify`,
+  `onecmd`, `posix`, `privileged`, `functrace`, `nolog` and `hashall` are
+  accepted the same way.
+- In scripts `which` is the external program, as under Bash; at the prompt it
+  is a builtin that also names aliases, functions and builtins.
 
 See the [PTY tests](../tests/pty_test.py) and [contributor guide](../CONTRIBUTING.md)
 for verification instructions.
