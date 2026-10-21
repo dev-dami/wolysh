@@ -252,6 +252,39 @@ class RunTests(AgentTestCase):
         self.assertFalse((self.state / "runs" / "group").exists())
         self.assertEqual(self.wsh("run", "status", "group").returncode, 1)
 
+    def test_logs_answer_questions_within_a_budget(self):
+        script = (
+            "echo 'running 300 tests'; "
+            "for i in $(seq 1 300); do echo \"test mod_$i::case ... ok\"; done; "
+            "echo 'test net::refused ... FAILED'; echo; echo 'failures:'; echo '    net::refused'; echo; "
+            "echo 'test result: FAILED. 300 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; exit 101"
+        )
+        self.ok("run", "-d", "--name", "ct", "--", script)
+        self.assertEqual(self.wsh("run", "wait", "ct").returncode, 101)
+
+        failed = self.wsh("run", "logs", "ct", "--failures")
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn(b"FAILED net::refused [cargo]", failed.stdout)
+        self.assertIn(b"300 passed, 1 failed", failed.stdout)
+        records = [json.loads(line) for line in self.wsh("run", "logs", "ct", "--failures", "--json").stdout.splitlines()]
+        self.assertEqual([r["name"] for r in records if r["type"] == "failure"], ["net::refused"])
+
+        summary = self.ok("run", "logs", "ct", "--budget", "400")
+        self.assertLessEqual(len(summary.stdout), 400)
+        self.assertIn(b"test net::refused ... FAILED", summary.stdout)
+        self.assertIn(b"elided", summary.stdout)
+
+        found = self.ok("run", "logs", "ct", "--find", "net refused", "--limit", "1")
+        self.assertIn(b"net::refused", found.stdout.splitlines()[0])
+        grep = self.ok("run", "logs", "ct", "--grep", "FAILED", "--budget", "80")
+        self.assertLessEqual(len(grep.stdout), 80)
+        self.assertIn(b"lines: 307", self.ok("run", "logs", "ct", "--stats").stdout)
+
+        # The builtin form works too, and a byte range cannot be combined with a question.
+        self.assertIn(b"net::refused", self.ok("-c", "run logs ct --failures --json || true").stdout)
+        self.assertEqual(self.wsh("run", "logs", "ct", "--tail", "2", "--failures").returncode, 2)
+        self.assertEqual(self.wsh("run", "logs", "ct", "--find", "a", "--grep", "b").returncode, 2)
+
     def test_logs_since_offsets_head_and_tail(self):
         self.ok("run", "-d", "--name", "poll", "--", "echo one; sleep 0.4; echo two; echo three")
         self.assertEqual(self.wsh("run", "wait", "poll", "--match", "one").returncode, 0)

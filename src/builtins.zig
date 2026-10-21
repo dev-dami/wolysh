@@ -40,6 +40,7 @@ const enable_builtin = @import("builtins/enable.zig");
 const caller_builtin = @import("builtins/caller.zig");
 const fc_builtin = @import("builtins/fc.zig");
 const bind_builtin = @import("builtins/bind.zig");
+const out_builtin = @import("builtins/out.zig");
 
 const Shell = shellmod.Shell;
 
@@ -1084,6 +1085,7 @@ const table = [_]Builtin{
     .{ .name = "parallel", .summary = "run commands with bounded concurrency", .run = builtinParallel },
     .{ .name = "run", .summary = "start, follow and stop background runs", .run = builtinAgent },
     .{ .name = "session", .summary = "keep named shells between calls", .run = builtinAgent },
+    .{ .name = "out", .summary = "summarize, search and check command output within a byte budget", .run = out_builtin.run },
     .{ .name = "fg", .summary = "bring a job to the foreground", .run = builtinFg },
     .{ .name = "bg", .summary = "resume a job in the background", .run = builtinBg },
     .{ .name = "kill", .summary = "send a signal to a process or job", .run = builtinKill },

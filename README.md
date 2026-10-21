@@ -37,6 +37,9 @@ The release archive includes the shell, examples, license, and checksum.
 - Check generated scripts with `wsh --check` before executing them.
 - Keep background commands and all their output with `wsh run -d`, and keep
   named shells between calls with `wsh session`.
+- Ask questions of long output with `out`: a summary within a byte budget,
+  the failed tests, or the lines matching a fuzzy query, with exact line
+  ranges to read next.
 
 ```text
 let workers = 4 * 2

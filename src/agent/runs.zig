@@ -19,6 +19,8 @@ const strict = @import("../strict.zig");
 const state = @import("state.zig");
 const wire = @import("wire.zig");
 const pty = @import("pty.zig");
+const out_builtin = @import("../builtins/out.zig");
+const Shell = @import("../shell.zig").Shell;
 
 const Context = state.Context;
 
@@ -27,6 +29,8 @@ const usage =
     \\       run status [NAME] [--json]
     \\       run wait NAME [--match TEXT] [--regex] [--timeout DURATION]
     \\       run logs NAME [--tail N | --head N | --since OFFSET] [--json]
+    \\       run logs NAME [--budget N] [--find QUERY | --grep TEXT | --failures | --stats]
+    \\                [--limit K] [--context C] [--json]
     \\       run kill NAME [--signal SIG]
     \\       run rm NAME...
     \\
@@ -822,11 +826,16 @@ fn logs(ctx: Context, args: []const []const u8) u8 {
     var name: ?[]const u8 = null;
     var mode: LogsMode = .all;
     var json = false;
+    var query: Query = .{};
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (eql(arg, "--json")) {
             json = true;
+            continue;
+        }
+        if (query.take(args, &index)) |taken| {
+            if (!taken) return usageError(ctx);
             continue;
         }
         const kinds = [_][]const u8{ "--tail", "--head", "--since" };
@@ -855,6 +864,11 @@ fn logs(ctx: Context, args: []const []const u8) u8 {
     const run = loadNamed(ctx, run_name) orelse return 1;
     const arena = ctx.arena;
     const log_path = std.fmt.allocPrintSentinel(arena, "{s}/output.log", .{run.dir}, 0) catch return 1;
+    if (query.wanted()) {
+        // Questions about the whole log; a byte range would cut lines apart.
+        if (std.meta.activeTag(mode) != .all) return usageError(ctx);
+        return query.answer(ctx, log_path, json);
+    }
     const fd = sys.openRead(log_path) orelse {
         ctx.errFmt("wsh: run: {s}: cannot read the output log\n", .{run_name});
         return 1;
@@ -893,6 +907,91 @@ fn logs(ctx: Context, args: []const []const u8) u8 {
     if (std.meta.activeTag(mode) == .since) ctx.errFmt("next_offset={d}\n", .{offset});
     return 0;
 }
+
+/// `run logs --budget/--find/--grep/--failures/--stats`: the log is handed
+/// to the `out` builtin, which answers within a byte budget.
+const Query = struct {
+    budget: ?[]const u8 = null,
+    find: ?[]const u8 = null,
+    grep: ?[]const u8 = null,
+    failures: bool = false,
+    stats: bool = false,
+    limit: ?[]const u8 = null,
+    context: ?[]const u8 = null,
+
+    /// Consumes a query option at `args[index.*]`: null when it is not one,
+    /// false when it is malformed or repeats another question.
+    fn take(self: *Query, args: []const []const u8, index: *usize) ?bool {
+        const arg = args[index.*];
+        if (eql(arg, "--failures") or eql(arg, "--stats")) {
+            if (self.question() != null) return false;
+            if (eql(arg, "--failures")) self.failures = true else self.stats = true;
+            return true;
+        }
+        const options = [_][]const u8{ "--budget", "--find", "--grep", "--limit", "--context" };
+        for (options, 0..) |long, k| {
+            if (!isOption(arg, long)) continue;
+            const value = optionValue(args, index, long) orelse return false;
+            switch (k) {
+                0 => self.budget = value,
+                3 => self.limit = value,
+                4 => self.context = value,
+                1 => {
+                    if (self.question() != null) return false;
+                    self.find = value;
+                },
+                else => {
+                    if (self.question() != null) return false;
+                    self.grep = value;
+                },
+            }
+            return true;
+        }
+        return null;
+    }
+
+    fn question(self: Query) ?[]const u8 {
+        if (self.find != null) return "find";
+        if (self.grep != null) return "grep";
+        if (self.failures) return "failures";
+        if (self.stats) return "stats";
+        return null;
+    }
+
+    fn wanted(self: Query) bool {
+        return self.budget != null or self.question() != null;
+    }
+
+    fn answer(self: Query, ctx: Context, log_path: [:0]const u8, json: bool) u8 {
+        const arena = ctx.arena;
+        var argv: std.ArrayList([]const u8) = .empty;
+        const subcommand = self.question() orelse "budget";
+        argv.appendSlice(arena, &.{ "out", subcommand }) catch return 1;
+        if (self.find) |text| argv.append(arena, text) catch return 1;
+        if (self.grep) |text| argv.append(arena, text) catch return 1;
+        if (self.budget) |size| {
+            if (self.question() == null) {
+                argv.append(arena, size) catch return 1;
+            } else {
+                argv.appendSlice(arena, &.{ "--budget", size }) catch return 1;
+            }
+        }
+        if (self.limit) |n| argv.appendSlice(arena, &.{ "--limit", n }) catch return 1;
+        if (self.context) |n| argv.appendSlice(arena, &.{ "--context", n }) catch return 1;
+        if (json) argv.append(arena, "--json") catch return 1;
+        argv.appendSlice(arena, &.{ "--file", log_path }) catch return 1;
+
+        // On the CLI fast path there is no shell; `out` only needs one for
+        // its allocator and environment, so a bare one will do.
+        var bare: ?Shell = null;
+        defer if (bare) |*sh| sh.deinit();
+        const sh = ctx.sh orelse blk: {
+            bare = Shell.initBare(ctx.gpa) catch return 1;
+            break :blk &bare.?;
+        };
+        return out_builtin.run(.{ .sh = sh, .argv = argv.items, .stdin = ctx.stdin, .stdout = ctx.stdout, .stderr = ctx.stderr });
+    }
+};
 
 fn preadAll(fd: i32, buf: []u8, offset: u64) usize {
     var total: usize = 0;

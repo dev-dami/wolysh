@@ -89,7 +89,12 @@ pub fn sleepMs(ms: u64) void {
 
 /// The state directory path, without creating it.
 pub fn dirPath(arena: std.mem.Allocator, envp: [*:null]const ?[*:0]const u8) ![:0]const u8 {
-    if (envLookup(envp, "XDG_RUNTIME_DIR")) |runtime| {
+    return dirPathFrom(arena, envLookup(envp, "XDG_RUNTIME_DIR"));
+}
+
+/// The state directory for a given `XDG_RUNTIME_DIR` value (null when unset).
+pub fn dirPathFrom(arena: std.mem.Allocator, runtime_dir: ?[]const u8) ![:0]const u8 {
+    if (runtime_dir) |runtime| {
         if (runtime.len != 0) {
             const z = try arena.dupeZ(u8, runtime);
             if (fs.isDir(z)) return std.fmt.allocPrintSentinel(arena, "{s}/wsh", .{runtime}, 0);
