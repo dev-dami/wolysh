@@ -35,6 +35,8 @@ The release archive includes the shell, examples, license, and checksum.
 - Run independent tasks with native `parallel -j N`, fail-fast queueing,
   and JSONL task reports.
 - Check generated scripts with `wsh --check` before executing them.
+- Keep background commands and all their output with `wsh run -d`, and keep
+  named shells between calls with `wsh session`.
 
 ```text
 let workers = 4 * 2
@@ -73,6 +75,13 @@ functions and variables, and refills a slot as soon as a task finishes. Reports
 record task indexes, exit statuses, and elapsed times separately from command
 output. See the [agent workflow guide](docs/agent-workflows.md) for the contract
 and examples.
+
+`wsh run -d --name test -- cargo test` starts a command that outlives the call
+and keeps its output in a log; `run wait`, `run logs --since OFFSET` and
+`run status --json` follow it. `wsh session exec work -- 'cd src'` runs in a
+named shell that keeps its directory, variables and functions. Because `run`
+and `session` are now commands, run a script file with one of those names as
+`wsh ./run`.
 
 <details>
 <summary>Build from source</summary>

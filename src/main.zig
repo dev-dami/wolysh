@@ -18,6 +18,7 @@ const history = @import("history.zig");
 const login = @import("login.zig");
 const stdin_script = @import("stdin_script.zig");
 const histexpand = @import("interactive/histexpand.zig");
+const agent = @import("agent/cli.zig");
 
 const Shell = shellmod.Shell;
 
@@ -29,6 +30,9 @@ const help_text =
     \\usage: wsh [options] [script [arguments...]]
     \\       wsh [options] -c command [name [arguments...]]
     \\       wsh [options] -s [arguments...]
+    \\       wsh run -d [--name NAME] [--tty] -- command...
+    \\       wsh run status|wait|logs|kill|rm ...
+    \\       wsh session new|ls|exec|attach|kill ...
     \\
     \\options:
     \\  -c               run the first argument as a command; the next one is $0
@@ -43,6 +47,12 @@ const help_text =
     \\      --noprofile    skip login initialisation
     \\  -h, --help       show this help
     \\  -v, --version    show the version
+    \\      --daemon     serve sessions (`wsh session` starts it when needed)
+    \\
+    \\`wsh run` keeps background commands and their output after the caller
+    \\exits; `wsh session` keeps named shells. `wsh run --help` and
+    \\`wsh session --help` list the subcommands. Run a script named `run`
+    \\or `session` as `wsh ./run`.
     \\
     \\Short options combine (`-lc`, `-ec`), `+` clears a flag, and `--` or `-`
     \\ends the options.
@@ -71,6 +81,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         sys.writeStr(2, "wsh: cannot read arguments\n");
         return 1;
     };
+
+    // `wsh run ...` and `wsh session ...` skip shell start-up entirely, so an
+    // agent polling a run pays only for the files it reads.
+    if (argv.len >= 2 and (agent.isCommand(argv[1]) or eql(argv[1], "--daemon"))) {
+        return agent.main(gpa, argv[1..], init.environ.block.slice.ptr);
+    }
 
     var options = Options{};
     const parsed = parseArgs(argv, &options) orelse {

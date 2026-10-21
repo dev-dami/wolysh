@@ -21,6 +21,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Back-references (`\1` to `\9`) in `[[ =~ ]]` patterns, matched by a
   backtracking engine that gives up after a fixed amount of work.
 - `BASH_COMMAND` is set while a DEBUG trap runs.
+- `run` and `session`, as builtins and as `wsh run ...` and `wsh session ...`:
+  background runs that outlive the caller and keep their output in
+  `output.log` (`run -d`, `status`, `wait --match`, `logs --since`, `kill`,
+  `rm`), and named shells that keep their state between calls (`session new`,
+  `exec`, `attach`, `ls`, `kill`), served by a per-user `wsh --daemon`.
+  `wsh run` and `wsh session` no longer run a script file with that name; use
+  `wsh ./run`.
 
 ### Fixed
 

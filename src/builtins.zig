@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const agent = @import("agent/cli.zig");
 const arrays = @import("arrays.zig");
 const declare_builtin = @import("builtins/declare.zig");
 const cd = @import("builtins/cd.zig");
@@ -916,6 +917,10 @@ fn builtinBuiltin(ctx: Ctx) u8 {
     return b.run(inner);
 }
 
+fn builtinAgent(ctx: Ctx) u8 {
+    return agent.builtin(ctx.sh, ctx.argv, .{ ctx.stdin, ctx.stdout, ctx.stderr }, ctx.run_source);
+}
+
 fn builtinParallel(ctx: Ctx) u8 {
     const run_source = ctx.run_source orelse {
         ctx.err("wsh: parallel: executor unavailable\n");
@@ -1077,6 +1082,8 @@ const table = [_]Builtin{
     .{ .name = "jobs", .summary = "list background jobs", .run = jobctl_builtin.jobsBuiltin },
     .{ .name = "wait", .summary = "wait for background jobs", .run = builtinWait },
     .{ .name = "parallel", .summary = "run commands with bounded concurrency", .run = builtinParallel },
+    .{ .name = "run", .summary = "start, follow and stop background runs", .run = builtinAgent },
+    .{ .name = "session", .summary = "keep named shells between calls", .run = builtinAgent },
     .{ .name = "fg", .summary = "bring a job to the foreground", .run = builtinFg },
     .{ .name = "bg", .summary = "resume a job in the background", .run = builtinBg },
     .{ .name = "kill", .summary = "send a signal to a process or job", .run = builtinKill },
