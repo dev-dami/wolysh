@@ -99,6 +99,87 @@ leave an incomplete report; the caller must also inspect the shell's exit
 status. Quoted command strings defer their `$variables` and substitutions to
 the task; double quotes can expand them in the parent before scheduling.
 
+## Asking questions about output
+
+A build or test run can print thousands of lines when the question is only
+"what failed?". The `out` builtin answers that kind of question within a byte
+budget, so the agent reads a few kilobytes instead of the whole log:
+
+```sh
+cargo test 2>&1 | wsh --no-config -c 'out budget 4k'
+wsh --no-config -c 'out failures --json --file test.log'
+wsh --no-config -c 'out find connection refused --file test.log'
+wsh --no-config -c 'out lines 41-60 --file test.log'
+```
+
+Input is stdin, `--file FILE`, or `--run NAME` for the log of background run
+`NAME` (`$XDG_RUNTIME_DIR/wsh/runs/NAME/output.log`, or
+`/tmp/wsh-<uid>/runs/NAME/output.log` without a runtime directory). Files are
+memory-mapped and scanned once; a 100 MB log takes well under a second.
+
+| Command | Answer |
+| --- | --- |
+| `out budget [N]` | A summary of at most N bytes (default 4096; `2k`, `64K`, `1M` work) |
+| `out find QUERY...` | The best fuzzy matches (fzf-style), best first; default 20 |
+| `out grep PATTERN` | Lines containing PATTERN, in order; `--regex`, `-i`; default 100 |
+| `out failures` | Failed tests and checks, with the runner's pass/fail/skip counts |
+| `out lines A-B` | Lines A to B exactly (also `A`, `A-`, `A..B`) |
+| `out stats` | Lines, bytes, error/failure/warning lines, test frameworks seen |
+
+`out budget` returns small output unchanged. Otherwise it keeps, in original
+order, the first and last lines, error and failure lines (the first and last of
+them before the ones in between), summary lines such as `test result:`, a few
+lines of context around errors, then warnings. Lines longer than 512 bytes
+(or a quarter of a smaller budget) are cut and marked with the bytes dropped.
+Each run of omitted lines becomes one marker with its exact range:
+
+```text
+[… 9,812 lines (1,203,331 bytes) elided; lines 41–9852 …]
+```
+
+Pass the range back as `out lines 41–9852` (an en dash or `-` both work) to
+read it, or narrow it with `out grep` and `out find`.
+
+`out find` splits the query on spaces; every word must match as a
+subsequence, and consecutive characters and word starts score higher. The
+search ignores case unless the query has an uppercase letter. `--context C`
+(or `-C C`) adds surrounding lines to `find` and `grep`.
+
+`out failures` recognises cargo test, pytest, `go test`, Jest, Vitest, Zig's
+test runner and `zig build test`, unittest, Maven Surefire and Gradle (JUnit),
+Mocha and RSpec. Each failure has the framework, the test name, the line it was
+reported on, and when the output says, a `file:line` location and one line of
+reason. Compiler-style errors that name a location (`file:line: error: ...`,
+rustc's `error[E…]` followed by `--> file:line:col`, TypeScript's
+`file(line,col): error`) and Python tracebacks count as generic failures. The
+exit status is 1 when anything failed, 0 when test output was recognised and
+nothing failed, and 2 when no test output was recognised.
+
+Matching ignores ANSI colour and CRLF line endings, and a line redrawn with
+carriage returns counts as its final text. Output is cleaned the same way;
+`--raw` shows lines as they were written. `--budget N` caps the output of any
+subcommand, dropping whole records and saying how many.
+
+With `--json`, every subcommand prints one JSON object per line, each with a
+`type`:
+
+| `type` | Fields |
+| --- | --- |
+| `line` | `line`, `text` (budget, lines) |
+| `elided` | `from`, `to`, `lines`, `bytes` (budget) |
+| `match` | `line`, `offset`, `text`, and `score` and `positions` (find) or `spans` (grep) |
+| `context` | `line`, `text` (find and grep with `--context`) |
+| `failure` | `framework`, `name`, `line`, `location`, `reason` (null when unknown) |
+| `summary` | find, grep: `matches`, `shown`; failures: `status`, `frameworks`, `passed`, `failed`, `skipped`, `failures`, `omitted` |
+| `stats` | `lines`, `bytes`, `errors`, `failures`, `warnings`, `first_error`, `first_failure`, `first_warning`, `longest_line`, `frameworks` |
+| `truncated` | `omitted`: records dropped by `--budget` |
+
+`offset` is the byte offset of the line in the input. `positions` and `spans`
+index `text`, which is the cleaned line (with `--raw`, `text` is the line as
+written but the indexes still count in the cleaned line); an excerpt of a line
+longer than 1 KiB also has `excerpt_start`. Usage and input errors exit with status 2; `find`
+and `grep` exit 1 when nothing matched.
+
 ## Measure speed
 
 ```sh

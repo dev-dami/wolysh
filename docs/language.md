@@ -164,7 +164,7 @@ Interactive shells define `la` as `ls -A` and `lh` as `ls -lh` by default;
 configuration can override either alias.
 
 Builtins include `cd`, `pwd`, `echo`, `print`, `printf`, `exit`, `export`,
-`unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `parallel`, `history`, `read`,
+`unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `wait`, `parallel`, `out`, `history`, `read`,
 `test`, `source`, `eval`, `shift`, `type`, `command`, `builtin`, `local`,
 `readonly`, `trap`, `umask`, `kill`, `exec`, `pushd`, `popd`, `dirs`, `fc`,
 `enable`, `bind`, `caller`, `compopt`, `suspend`, and `:`.

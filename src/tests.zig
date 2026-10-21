@@ -11,6 +11,7 @@ test {
     _ = @import("command_cache.zig");
     _ = @import("fuzzy.zig");
     _ = @import("output_query.zig");
+    _ = @import("builtins/out.zig");
     _ = @import("command_suggest.zig");
     _ = @import("history.zig");
     _ = @import("shell.zig");

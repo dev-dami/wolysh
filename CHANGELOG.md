@@ -21,6 +21,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Back-references (`\1` to `\9`) in `[[ =~ ]]` patterns, matched by a
   backtracking engine that gives up after a fixed amount of work.
 - `BASH_COMMAND` is set while a DEBUG trap runs.
+- `out`, for asking questions about command output within a byte budget:
+  `out budget N` summarises a log around its errors, failures and summaries
+  with exact `lines A–B` elision markers, `out find` ranks lines fzf-style,
+  `out grep` searches exactly or by regex, `out failures` lists failed tests for
+  cargo, pytest, Go, Jest, Vitest, Zig, unittest, Maven/Gradle, Mocha and RSpec
+  (exit 1 on failures, 2 when no test output is recognised), and `out lines`
+  and `out stats` follow up. Input is stdin, `--file` or a background run's log
+  (`--run`); `--json` gives JSON lines.
 
 ### Fixed
 

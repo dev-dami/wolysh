@@ -4,6 +4,7 @@ const std = @import("std");
 const builtins = @import("../builtins.zig");
 const options = @import("options.zig");
 const describe = @import("describe.zig");
+const out = @import("out.zig");
 
 const Ctx = builtins.Ctx;
 
@@ -85,7 +86,20 @@ const synopses = [_]struct { []const u8, []const u8 }{
     .{ "complete", "complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G pattern] [-W words] [-F function] [-C command] [-X filter] [-P prefix] [-S suffix] [name ...]" },
     .{ "compgen", "compgen [-abcdefgjksuv] [-o option] [-A action] [-G pattern] [-W words] [-F function] [-C command] [-X filter] [-P prefix] [-S suffix] [word]" },
     .{ "parallel", "parallel [-j N] [--fail-fast] [--report file] command ..." },
+    .{ "out", "out budget [N] | find QUERY... | grep PATTERN | failures | lines A-B | stats [--json] [--raw] [--budget N] [--file FILE | --run NAME]" },
 };
+
+/// Longer descriptions, printed after the summary by `help NAME`.
+const details = [_]struct { []const u8, []const u8 }{
+    .{ "out", out.usage },
+};
+
+fn detail(name: []const u8) ?[]const u8 {
+    for (details) |entry| {
+        if (std.mem.eql(u8, entry[0], name)) return entry[1];
+    }
+    return null;
+}
 
 /// Summaries for the builtins the executor runs itself.
 const executor_summaries = [_]struct { []const u8, []const u8 }{
@@ -135,7 +149,13 @@ fn showTopic(query: *Query, topic: Topic) void {
     switch (query.style) {
         .short => ctx.outFmt("{s}: {s}\n", .{ topic.name, usage }),
         .description => ctx.outFmt("{s} - {s}\n", .{ topic.name, topic.summary }),
-        .full => ctx.outFmt("{s}: {s}\n    {s}\n", .{ topic.name, usage, topic.summary }),
+        .full => {
+            ctx.outFmt("{s}: {s}\n    {s}\n", .{ topic.name, usage, topic.summary });
+            if (detail(topic.name)) |text| {
+                ctx.out("\n");
+                ctx.out(text);
+            }
+        },
     }
 }
 
