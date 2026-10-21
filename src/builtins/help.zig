@@ -85,6 +85,8 @@ const synopses = [_]struct { []const u8, []const u8 }{
     .{ "complete", "complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G pattern] [-W words] [-F function] [-C command] [-X filter] [-P prefix] [-S suffix] [name ...]" },
     .{ "compgen", "compgen [-abcdefgjksuv] [-o option] [-A action] [-G pattern] [-W words] [-F function] [-C command] [-X filter] [-P prefix] [-S suffix] [word]" },
     .{ "parallel", "parallel [-j N] [--fail-fast] [--report file] command ..." },
+    .{ "run", "run -d [--name NAME] [--tty] [--] command... | run status [NAME] [--json] | run wait NAME [--match TEXT] [--regex] [--timeout DURATION] | run logs NAME [--tail N | --head N | --since OFFSET] [--json] | run kill NAME [--signal SIG] | run rm NAME..." },
+    .{ "session", "session new NAME | session ls [--json] | session exec NAME [--] command... | session attach NAME | session kill NAME" },
 };
 
 /// Summaries for the builtins the executor runs itself.
