@@ -238,6 +238,7 @@ const hash_usage = "wsh: hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\
 pub fn hashBuiltin(ctx: Ctx) u8 {
     var report = false;
     var forget = false;
+    var forgot_all = false;
     var parser = options.Parser.init(ctx.argv, "dlp:rt");
     while (true) {
         switch (parser.next()) {
@@ -254,7 +255,8 @@ pub fn hashBuiltin(ctx: Ctx) u8 {
             },
             .option => |c| switch (c) {
                 'd' => forget = true,
-                'l', 'r' => {},
+                'l' => {},
+                'r' => forgot_all = true,
                 'p' => {
                     ctx.err("wsh: hash: -p: wsh does not cache command paths; every command is looked up in PATH when it runs\n");
                     return 1;
@@ -270,7 +272,8 @@ pub fn hashBuiltin(ctx: Ctx) u8 {
             ctx.errFmt("wsh: hash: -{c}: option requires an argument\n", .{@as(u8, if (report) 't' else 'd')});
             return 1;
         }
-        ctx.out("hash: hash table empty\n");
+        // `hash -r` forgets and says nothing; plain `hash` reports the empty table.
+        if (!forgot_all) ctx.out("hash: hash table empty\n");
         return 0;
     }
 

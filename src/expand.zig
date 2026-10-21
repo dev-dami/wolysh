@@ -1026,6 +1026,14 @@ pub const Expander = struct {
 
     /// `${!name}`: the parameter that `name`'s value names.
     fn resolveIndirect(self: *Expander, name: []const u8, subscript: ?[]const u8) Error!Param {
+        // A nameref's `${!ref}` is the name it refers to.
+        if (subscript == null and self.sh.isNameref(name)) {
+            if (self.sh.vars.get(name)) |stored| switch (stored) {
+                .string => |target| return .{ .set = true, .text = target },
+                else => {},
+            };
+            return .{ .set = false };
+        }
         const ref = try self.resolve(name, subscript);
         if (!ref.set or ref.list) {
             printError(self.sh, "wsh: {f}: invalid indirect expansion\n", .{Label{ .name = name, .subscript = subscript }});

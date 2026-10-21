@@ -276,7 +276,7 @@ class WshBehaviourTests(unittest.TestCase):
         self.assertEqual(run_shell("declare -f nope").returncode, 1)
 
     def test_unsupported_declare_options_are_errors(self):
-        result = run_shell("declare -n ref=x")
+        result = run_shell("declare -t ref=x")
         self.assertEqual(result.returncode, 2)
         self.assertIn(b"unsupported option", result.stderr)
 

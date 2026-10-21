@@ -105,6 +105,9 @@ pub const Shell = struct {
     readonly: std.StringHashMap(void),
     /// `declare -i/-l/-u` attributes, applied by `setVar` on every assignment.
     attrs: std.StringHashMap(Attrs),
+    /// How many variables carry the `nameref` attribute, so the common case
+    /// of none skips every lookup in `deref`.
+    nameref_count: u32 = 0,
     /// Saved bindings for nested `local` scopes, outermost frame first.
     scopes: std.ArrayList(Scope) = .empty,
     /// Trap handler source per trap id: `exit_trap`, the signal numbers, then
@@ -222,10 +225,12 @@ pub const Shell = struct {
         integer: bool = false,
         lower: bool = false,
         upper: bool = false,
-        _pad: u5 = 0,
+        /// `declare -n`: the value is the name of the variable to use instead.
+        nameref: bool = false,
+        _pad: u4 = 0,
 
         pub fn any(self: Attrs) bool {
-            return self.integer or self.lower or self.upper;
+            return self.integer or self.lower or self.upper or self.nameref;
         }
     };
 
@@ -391,20 +396,78 @@ pub const Shell = struct {
     // --- variables ----------------------------------------------------------
 
     /// A stored variable, else a computed one such as `RANDOM` or `UID`.
-    pub fn getVar(self: *const Shell, name: []const u8) ?value.Value {
+    pub fn getVar(self: *const Shell, name_in: []const u8) ?value.Value {
+        const name = self.deref(name_in);
         return self.vars.get(name) orelse special_vars.get(self, name);
     }
 
     pub fn hasVar(self: *const Shell, name: []const u8) bool {
-        return self.vars.contains(name);
+        return self.vars.contains(self.deref(name));
     }
+
+    /// The variable a name stands for: follows `declare -n` references until
+    /// a name that is not one. A reference to nothing (or to itself, or one
+    /// that loops) is the name itself, so assigning to it sets the reference.
+    pub fn deref(self: *const Shell, name: []const u8) []const u8 {
+        if (self.nameref_count == 0) return name;
+        var current = name;
+        var hops: u8 = 0;
+        while (hops < max_nameref_depth) : (hops += 1) {
+            const attrs = self.attrs.get(current) orelse return current;
+            if (!attrs.nameref) return current;
+            const target = switch (self.vars.get(current) orelse return current) {
+                .string => |text| text,
+                else => return current,
+            };
+            if (target.len == 0 or std.mem.eql(u8, target, current)) return current;
+            current = target;
+        }
+        return name;
+    }
+
+    /// True when `name` itself (not what it refers to) is a nameref.
+    pub fn isNameref(self: *const Shell, name: []const u8) bool {
+        if (self.nameref_count == 0) return false;
+        return (self.attrs.get(name) orelse return false).nameref;
+    }
+
+    /// `declare -n name=target`: stores the reference without following it.
+    pub fn setNameref(self: *Shell, name: []const u8, target: []const u8) !void {
+        var attrs = self.getAttrs(name);
+        attrs.nameref = false;
+        try self.setAttrs(name, attrs);
+        try self.storeVar(name, .{ .string = target });
+        attrs.nameref = true;
+        try self.setAttrs(name, attrs);
+    }
+
+    /// `unset -n name`: removes the reference, not the variable it names.
+    pub fn unsetNameref(self: *Shell, name: []const u8) bool {
+        if (!self.isNameref(name)) return false;
+        var attrs = self.getAttrs(name);
+        attrs.nameref = false;
+        self.setAttrs(name, attrs) catch {};
+        if (self.vars.fetchRemove(name)) |kv| {
+            self.gpa.free(kv.key);
+            freeValue(self.gpa, kv.value);
+        }
+        return true;
+    }
+
+    pub const max_nameref_depth = 16;
 
     /// Stores `val`, deep-copying it so the caller's arena can be reset. The
     /// variable's `declare` attributes apply first; `RANDOM` and `SECONDS`
     /// take the assignment without storing it.
-    pub fn setVar(self: *Shell, name: []const u8, val: value.Value) !void {
+    pub fn setVar(self: *Shell, name_in: []const u8, val: value.Value) !void {
+        const name = self.deref(name_in);
         if (special_vars.assign(self, name, val)) return;
-        const owned = try cloneValue(self.gpa, try arrays.applyAttrs(self, name, val));
+        return self.storeVar(name, try arrays.applyAttrs(self, name, val));
+    }
+
+    /// Stores `val` under exactly `name`, without following references.
+    fn storeVar(self: *Shell, name: []const u8, val: value.Value) !void {
+        const owned = try cloneValue(self.gpa, val);
         errdefer freeValue(self.gpa, owned);
         const gop = try self.vars.getOrPut(name);
         if (gop.found_existing) {
@@ -415,7 +478,8 @@ pub const Shell = struct {
         gop.value_ptr.* = owned;
     }
 
-    pub fn unsetVar(self: *Shell, name: []const u8) bool {
+    pub fn unsetVar(self: *Shell, name_in: []const u8) bool {
+        const name = self.deref(name_in);
         if (self.isReadonly(name)) return false;
         if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
         if (self.vars.fetchRemove(name)) |kv| {
@@ -431,6 +495,12 @@ pub const Shell = struct {
     }
 
     pub fn setAttrs(self: *Shell, name: []const u8, attrs: Attrs) !void {
+        if (self.attrs.get(name)) |old| {
+            if (old.nameref and !attrs.nameref) self.nameref_count -= 1;
+            if (!old.nameref and attrs.nameref) self.nameref_count += 1;
+        } else if (attrs.nameref) {
+            self.nameref_count += 1;
+        }
         if (!attrs.any()) {
             if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
             return;
@@ -447,7 +517,8 @@ pub const Shell = struct {
 
     // --- readonly -----------------------------------------------------------
 
-    pub fn markReadonly(self: *Shell, name: []const u8) !void {
+    pub fn markReadonly(self: *Shell, name_in: []const u8) !void {
+        const name = self.deref(name_in);
         if (self.readonly.contains(name)) return;
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
@@ -455,7 +526,7 @@ pub const Shell = struct {
     }
 
     pub fn isReadonly(self: *const Shell, name: []const u8) bool {
-        return self.readonly.contains(name);
+        return self.readonly.contains(self.deref(name));
     }
 
     /// `setVar` for a name the user asked for: refuses a `readonly` binding.
@@ -685,10 +756,11 @@ pub const Shell = struct {
     // --- environment --------------------------------------------------------
 
     pub fn getEnv(self: *const Shell, name: []const u8) ?[]const u8 {
-        return self.env.get(name);
+        return self.env.get(self.deref(name));
     }
 
-    pub fn setEnv(self: *Shell, name: []const u8, val: []const u8) !void {
+    pub fn setEnv(self: *Shell, name_in: []const u8, val: []const u8) !void {
+        const name = self.deref(name_in);
         const owned_val = try self.gpa.dupe(u8, val);
         errdefer self.gpa.free(owned_val);
         const gop = try self.env.getOrPut(name);
@@ -700,7 +772,8 @@ pub const Shell = struct {
         gop.value_ptr.* = owned_val;
     }
 
-    pub fn unsetEnv(self: *Shell, name: []const u8) bool {
+    pub fn unsetEnv(self: *Shell, name_in: []const u8) bool {
+        const name = self.deref(name_in);
         if (self.env.fetchRemove(name)) |kv| {
             self.gpa.free(kv.key);
             self.gpa.free(kv.value);

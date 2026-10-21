@@ -31,6 +31,7 @@ const dirstack_builtin = @import("builtins/dirstack.zig");
 const exports_builtin = @import("builtins/exports.zig");
 const test_builtin = @import("builtins/test.zig");
 const strict = @import("strict.zig");
+const arith = @import("arith.zig");
 const set_builtin = @import("builtins/set.zig");
 const trap_builtin = @import("builtins/trap.zig");
 const shopt = @import("builtins/shopt.zig");
@@ -238,6 +239,34 @@ fn builtinFalse(_: Ctx) u8 {
     return 1;
 }
 
+/// Bash's `let expr...`: each argument is an arithmetic expression, and the
+/// status is 0 when the last one is non-zero. (`let NAME = value` with spaces
+/// is wsh's own binding statement and never reaches here.)
+fn builtinLet(ctx: Ctx) u8 {
+    if (ctx.argv.len < 2) {
+        ctx.err("wsh: let: expression expected\n");
+        return 1;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var last: i64 = 0;
+    for (ctx.argv[1..]) |expr| {
+        if (ctx.sh.options.xtrace) strict.traceText(ctx.sh, std.fmt.allocPrint(arena, "let {s}", .{expr}) catch expr);
+        last = arith.evaluateExpanded(ctx.sh, arena, expr) catch |err| switch (err) {
+            error.InvalidArithmetic, error.DivisionByZero => {
+                ctx.errFmt("wsh: let: {s}\n", .{arith.takeErrorMessage() orelse "arithmetic syntax error"});
+                return 1;
+            },
+            else => {
+                ctx.err("wsh: let: evaluation failed\n");
+                return 1;
+            },
+        };
+    }
+    return if (last != 0) 0 else 1;
+}
+
 // --- environment and variables ---------------------------------------------
 
 const UnsetMode = enum {
@@ -245,6 +274,8 @@ const UnsetMode = enum {
     either,
     variable,
     function,
+    /// `unset -n`: the reference itself, not what it names.
+    nameref,
 };
 
 /// `unset [-v|-f] [--] NAME...`.
@@ -262,8 +293,9 @@ fn builtinUnset(ctx: Ctx) u8 {
             switch (flag) {
                 'v' => mode = .variable,
                 'f' => mode = .function,
+                'n' => mode = .nameref,
                 else => {
-                    ctx.errFmt("wsh: unset: -{c}: invalid option\nunset: usage: unset [-f] [-v] [name ...]\n", .{flag});
+                    ctx.errFmt("wsh: unset: -{c}: invalid option\nunset: usage: unset [-f] [-v] [-n] [name ...]\n", .{flag});
                     return 2;
                 },
             }
@@ -275,6 +307,7 @@ fn builtinUnset(ctx: Ctx) u8 {
             ctx.sh.getEnv(name) == null and ctx.sh.getFunc(name) != null;
         const ok = switch (mode) {
             .variable => unsetVariable(ctx, name),
+            .nameref => if (ctx.sh.isNameref(name)) ctx.sh.unsetNameref(name) else unsetVariable(ctx, name),
             .function => unsetFunction(ctx, name),
             .either => if (function_only) unsetFunction(ctx, name) else unsetVariable(ctx, name),
         };
@@ -971,6 +1004,7 @@ const table = [_]Builtin{
     .{ .name = "shopt", .summary = "set or list bash-style shell options", .run = shopt.run },
     .{ .name = "test", .summary = "evaluate a condition", .run = test_builtin.run },
     .{ .name = "[", .summary = "evaluate a condition", .run = test_builtin.runBracket },
+    .{ .name = "let", .summary = "evaluate arithmetic expressions", .run = builtinLet },
     .{ .name = "true", .summary = "return success", .run = builtinTrue },
     .{ .name = "false", .summary = "return failure", .run = builtinFalse },
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },

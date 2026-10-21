@@ -315,6 +315,9 @@ fn launchCoproc(
     var pid_name_buf: [256]u8 = undefined;
     const pid_name = std.fmt.bufPrint(&pid_name_buf, "{s}_PID", .{name}) catch return 1;
     closeCoprocDescriptors(sh, name, pid_name);
+    // These two are named by the script (`>&${NAME[1]}`), and redirections
+    // only accept descriptors that are not close-on-exec.
+    for ([_]i32{ from_child[0], to_child[1] }) |fd| _ = linux.fcntl(fd, linux.F.SETFD, 0);
     const fds = [_]value.Value{ .{ .int = from_child[0] }, .{ .int = to_child[1] } };
     sh.setVar(name, .{ .list = &fds }) catch return 1;
     sh.setVar(pid_name, .{ .int = pid }) catch return 1;

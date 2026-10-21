@@ -311,7 +311,9 @@ pub const Parser = struct {
         if (self.tok.tag == .invalid) return self.fail("unexpected character");
         for (keywords) |kw| {
             if (isKeyword(self.tok, kw)) {
-                if (eql(kw, "let")) return self.parseLet();
+                if (eql(kw, "let")) {
+                    if (try self.tryParseLet()) |stmt| return stmt;
+                }
                 if (eql(kw, "fn")) return self.parseFn();
                 if (eql(kw, "return")) return self.parseReturn();
                 if (eql(kw, "alias")) return self.parseAlias();
@@ -360,15 +362,23 @@ pub const Parser = struct {
 
     // --- language constructs -------------------------------------------------
 
-    fn parseLet(self: *Parser) Error!ast.Stmt {
+    /// `let NAME = expression` is the native binding. Anything else, such as
+    /// Bash's `let x=1+2` or `let "i += 1"`, is the `let` builtin, so this
+    /// backtracks to an ordinary command.
+    fn tryParseLet(self: *Parser) Error!?ast.Stmt {
         const line = lineOf(self.tok);
+        const saved = self.save();
         self.advance(); // `let`
         if (self.tok.tag != .word or !isIdentifier(self.tok.text)) {
-            return self.fail("expected a variable name after 'let'");
+            self.restore(saved);
+            return null;
         }
         const name = self.tok.text;
         self.advance();
-        if (!isKeyword(self.tok, "=")) return self.fail("expected '=' after the variable name");
+        if (!isKeyword(self.tok, "=")) {
+            self.restore(saved);
+            return null;
+        }
         self.advance();
         self.setMode(.expr);
         const value = try self.parseExpr();

@@ -30,10 +30,11 @@ const Options = struct {
     integer: ?bool = null,
     lower: ?bool = null,
     upper: ?bool = null,
+    nameref: ?bool = null,
 
     fn filters(self: Options) bool {
         return self.indexed or self.assoc or self.readonly or self.exported == true or
-            self.integer == true or self.lower == true or self.upper == true;
+            self.integer == true or self.lower == true or self.upper == true or self.nameref == true;
     }
 };
 
@@ -75,6 +76,7 @@ fn run(ctx: Ctx, is_local: bool) u8 {
                     opts.upper = on;
                     if (on) opts.lower = false;
                 },
+                'n' => opts.nameref = on,
                 'x' => opts.exported = on,
                 'r' => opts.readonly = true,
                 'g' => opts.global = true,
@@ -161,6 +163,8 @@ fn declareOne(ctx: Ctx, arg: []const u8, opts: Options, is_local: bool) !void {
         try sh.setLocal(name, initial);
     }
 
+    if (opts.nameref) |on| return declareNameref(ctx, spec, on);
+
     // Type conversions, which bash allows only towards an indexed array.
     const existing = sh.vars.get(name);
     if (opts.assoc) {
@@ -224,6 +228,53 @@ fn declareOne(ctx: Ctx, arg: []const u8, opts: Options, is_local: bool) !void {
         }
     }
     if (opts.readonly) try sh.markReadonly(name);
+}
+
+/// `declare -n name[=target]` makes `name` another name for `target`;
+/// `declare +n name` turns it back into an ordinary variable.
+fn declareNameref(ctx: Ctx, spec: Spec, on: bool) !void {
+    const sh = ctx.sh;
+    const name = spec.name;
+    if (!on) {
+        var attrs = sh.getAttrs(name);
+        attrs.nameref = false;
+        try sh.setAttrs(name, attrs);
+        if (spec.assigned) |text| try sh.setVar(name, .{ .string = text });
+        return;
+    }
+    if (spec.list or spec.subscript != null) {
+        ctx.errFmt("wsh: {s}: {s}: reference variable cannot be an array\n", .{ ctx.argv[0], name });
+        return error.Reported;
+    }
+    var target: ?[]const u8 = spec.assigned;
+    if (target == null) {
+        // `declare -n r` on a variable that holds a name makes that name the target.
+        if (sh.vars.get(name)) |v| switch (v) {
+            .string => |text| target = text,
+            else => {},
+        };
+    }
+    const text = target orelse {
+        var attrs = sh.getAttrs(name);
+        attrs.nameref = true;
+        try sh.setAttrs(name, attrs);
+        return;
+    };
+    if (text.len == 0) {
+        var attrs = sh.getAttrs(name);
+        attrs.nameref = true;
+        try sh.setAttrs(name, attrs);
+        return;
+    }
+    if (!builtins.validName(text)) {
+        ctx.errFmt("wsh: {s}: `{s}': invalid variable name for name reference\n", .{ ctx.argv[0], text });
+        return error.Reported;
+    }
+    if (std.mem.eql(u8, text, name)) {
+        ctx.errFmt("wsh: {s}: {s}: nameref variable self references not allowed\n", .{ ctx.argv[0], name });
+        return error.Reported;
+    }
+    try sh.setNameref(name, text);
 }
 
 fn current(sh: *Shell, name: []const u8) ?Value {
@@ -317,6 +368,7 @@ fn matches(sh: *Shell, name: []const u8, opts: Options) bool {
     if (opts.integer == true and !attrs.integer) return false;
     if (opts.lower == true and !attrs.lower) return false;
     if (opts.upper == true and !attrs.upper) return false;
+    if (opts.nameref == true and !attrs.nameref) return false;
     if (opts.readonly and !sh.isReadonly(name)) return false;
     if (opts.exported == true and sh.getEnv(name) == null) return false;
     return true;

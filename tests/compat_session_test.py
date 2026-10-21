@@ -16,6 +16,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHELL = pathlib.Path(os.environ.get("WSH", ROOT / "zig-out/bin/wsh")).resolve()
 TIMEOUT = 8.0
 
+# Bash renders \$ as # for root and $ otherwise; so does wsh.
+PRIVILEGE_MARK = b"#" if os.geteuid() == 0 else b"$"
 PROMPT_END = b"\x1b]133;B\x1b\\"
 OUTPUT_START = b"\x1b]133;C\x1b\\"
 COMMAND_END = re.compile(rb"\x1b\]133;D;(\d+)\x1b\\")
@@ -376,14 +378,14 @@ class SessionTests(unittest.TestCase):
         s = self.start(extra_env={"USER": "tester"}, cwd=workdir)
         start = len(s.buf)
         s.run(r"PS1='[\u \W]\$ '")
-        self.assertIsNotNone(s.read_until(b"[tester proj$(boom)]$ ", start))
+        self.assertIsNotNone(s.read_until(b"[tester proj$(boom)]" + PRIVILEGE_MARK + b" ", start))
 
         s.run(r"PS1='\[\e[1m\]bold>\[\e[0m\] '")
         self.assertIn(b"\x1b[1mbold>\x1b[0m " + PROMPT_END, s.last_prompt())
 
     def test_ps1_and_ps2_from_the_environment(self):
         s = self.start(extra_env={"PS1": r"env-ps1 \$ ", "PS2": "cont> "})
-        self.assertIn(b"env-ps1 $ ", s.buf)
+        self.assertIn(b"env-ps1 " + PRIVILEGE_MARK + b" ", s.buf)
         start = len(s.buf)
         s.send("if true {\r")
         self.assertIsNotNone(s.read_until(b"cont> ", start))

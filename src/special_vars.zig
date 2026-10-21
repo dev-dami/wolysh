@@ -1,6 +1,8 @@
 //! Variables the shell computes when read: `RANDOM`, `SECONDS`,
 //! `EPOCHSECONDS`, `EPOCHREALTIME`, `LINENO`, `PPID`, `UID`, `EUID`,
-//! `HOSTNAME`, `HOSTTYPE`, `OSTYPE` and `WSH_VERSION`.
+//! `HOSTNAME`, `HOSTTYPE`, `OSTYPE`, `WSH_VERSION`, and the Bash identity and
+//! defaults scripts probe: `IFS`, `PS4`, `BASH`, `BASH_VERSION`,
+//! `BASH_VERSINFO`, `BASHPID`, `MACHTYPE`, `SRANDOM` and `SHELLOPTS`.
 //!
 //! A stored variable of the same name wins, as in bash (see `Shell.getVar`).
 //! Assigning `RANDOM` seeds the generator and assigning `SECONDS` restarts the
@@ -15,9 +17,23 @@ const value = @import("value.zig");
 const sys = @import("sys.zig");
 
 pub const names = [_][]const u8{
-    "EPOCHREALTIME", "EPOCHSECONDS", "EUID",   "HOSTNAME", "HOSTTYPE", "LINENO",
-    "OSTYPE",        "PPID",         "RANDOM", "SECONDS",  "UID",      "WSH_VERSION",
+    "BASH",    "BASHPID",  "BASH_VERSINFO", "BASH_VERSION", "EPOCHREALTIME", "EPOCHSECONDS",
+    "EUID",    "HOSTNAME", "HOSTTYPE",      "IFS",          "LINENO",        "MACHTYPE",
+    "OSTYPE",  "PPID",     "PS4",           "RANDOM",       "SECONDS",       "SHELLOPTS",
+    "SRANDOM", "UID",      "WSH_VERSION",
 };
+
+/// The Bash version scripts see. Scripts test the major number or look for
+/// the variable to decide whether Bash features are available; the `wsh`
+/// release suffix keeps the claim honest.
+const bash_version = "5.3.0(1)-wsh";
+const bash_versinfo = [_]value.Value{
+    .{ .string = "5" }, .{ .string = "3" },   .{ .string = "0" },
+    .{ .string = "1" }, .{ .string = "wsh" }, .{ .string = "x86_64-pc-linux-gnu" },
+};
+var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+var exe_len: ?usize = null;
+var options_buf: [256]u8 = undefined;
 
 /// Monotonic time at which `SECONDS` read zero.
 var seconds_origin_ns: ?i64 = null;
@@ -64,7 +80,58 @@ pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
     if (eql(u8, name, "HOSTTYPE")) return if (sh.env.contains(name)) null else .{ .string = @tagName(builtin.cpu.arch) };
     if (eql(u8, name, "OSTYPE")) return if (sh.env.contains(name)) null else .{ .string = "linux-gnu" };
     if (eql(u8, name, "WSH_VERSION")) return .{ .string = build_options.version };
+    // Bash starts with its own IFS and ignores the one it inherits.
+    if (eql(u8, name, "IFS")) return .{ .string = " \t\n" };
+    if (eql(u8, name, "PS4")) return .{ .string = "+ " };
+    if (eql(u8, name, "BASH_VERSION")) return .{ .string = bash_version };
+    if (eql(u8, name, "BASH_VERSINFO")) return .{ .list = &bash_versinfo };
+    if (eql(u8, name, "MACHTYPE")) return .{ .string = @tagName(builtin.cpu.arch) ++ "-pc-linux-gnu" };
+    if (eql(u8, name, "BASHPID")) return .{ .int = sys.getpid() };
+    if (eql(u8, name, "SRANDOM")) return .{ .int = (nextRandom() << 17) ^ (nextRandom() << 2) ^ (nextRandom() & 3) };
+    if (eql(u8, name, "BASH")) return if (shellPath()) |path| .{ .string = path } else null;
+    if (eql(u8, name, "SHELLOPTS")) return .{ .string = shellOptions(sh) };
     return null;
+}
+
+fn shellPath() ?[]const u8 {
+    if (exe_len == null) {
+        const rc = linux.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
+        exe_len = if (linux.errno(rc) == .SUCCESS) rc else 0;
+    }
+    return if (exe_len.? == 0) null else exe_buf[0..exe_len.?];
+}
+
+/// Colon-separated `set -o` options that are on, sorted as Bash sorts them.
+fn shellOptions(sh: *const shell.Shell) []const u8 {
+    const o = sh.options;
+    const flags = [_]struct { name: []const u8, on: bool }{
+        .{ .name = "allexport", .on = o.allexport },
+        .{ .name = "braceexpand", .on = true },
+        .{ .name = "emacs", .on = !o.vi },
+        .{ .name = "errexit", .on = o.errexit },
+        .{ .name = "errtrace", .on = o.errtrace },
+        .{ .name = "hashall", .on = true },
+        .{ .name = "histexpand", .on = o.histexpand },
+        .{ .name = "ignoreeof", .on = o.ignoreeof },
+        .{ .name = "interactive-comments", .on = true },
+        .{ .name = "noclobber", .on = o.noclobber },
+        .{ .name = "noglob", .on = o.noglob },
+        .{ .name = "nounset", .on = o.nounset },
+        .{ .name = "pipefail", .on = o.pipefail },
+        .{ .name = "vi", .on = o.vi },
+        .{ .name = "xtrace", .on = o.xtrace },
+    };
+    var len: usize = 0;
+    for (flags) |flag| {
+        if (!flag.on) continue;
+        if (len > 0) {
+            options_buf[len] = ':';
+            len += 1;
+        }
+        @memcpy(options_buf[len..][0..flag.name.len], flag.name);
+        len += flag.name.len;
+    }
+    return options_buf[0..len];
 }
 
 /// Handles an assignment to `RANDOM` or `SECONDS`. Returns true when the
