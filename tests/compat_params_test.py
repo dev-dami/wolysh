@@ -238,9 +238,10 @@ class WshBehaviourTests(unittest.TestCase):
         result = run_shell(script, *args)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (status, stdout.encode(), b""))
 
-    def test_a_list_without_a_subscript_is_every_element(self):
-        # bash expands `$a` to the first element; wsh keeps its own rule.
-        self.check("a=(x y z); echo $a ${#a[@]}", "x y z 3\n")
+    def test_a_let_list_without_a_subscript_is_every_element(self):
+        # A bash array gives element 0 for `$a`, as bash does; a list made by
+        # `let` is wsh's own and expands in full.
+        self.check("a=(x y z); echo $a ${#a[@]}", "x 3\n")
         self.check('let l = split("a b,c", ","); for i in $l { echo "<$i>" }; echo "$l" ${l[1]} ${#l[@]}',
                    "<a>\n<b>\n<c>\na b c c 2\n")
 

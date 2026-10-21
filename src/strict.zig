@@ -238,7 +238,7 @@ fn dropTrap(sh: *Shell, id: u32) void {
 /// does by default, and traces one level deeper.
 pub fn enterSubstitution(sh: *Shell) void {
     enterSubshell(sh);
-    sh.options.errexit = false;
+    if (!sh.options.inherit_errexit) sh.options.errexit = false;
     trace_level += 1;
 }
 

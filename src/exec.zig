@@ -114,6 +114,12 @@ pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     for (stmts) |stmt| {
         if (sh.interrupted) return 130;
         sh.runPendingTraps();
+        if (sh.coproc_list.items.len != 0) {
+            sh.reapJobs();
+            sh.forgetFinishedCoprocs();
+        }
+        // `set -n`: commands are read but not run (an interactive shell ignores it).
+        if (sh.options.noexec and !sh.interactive) return status;
         status = runStmt(sh, stmt);
         sh.last_status = status;
         session.checkDirectory(sh);
@@ -139,10 +145,11 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
         .var_decl => |decl| {
             setLine(sh, decl.line);
             const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, exprError(sh, err));
-            sh.assignVar(decl.name, v) catch |err| {
-                if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
+            if (sh.isReadonly(decl.name)) {
+                reportReadonly(sh, decl.name);
                 return statementFailed(sh, 1);
-            };
+            }
+            sh.bindNative(decl.name, v) catch return statementFailed(sh, 1);
             return 0;
         },
 
@@ -174,6 +181,7 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
                 return statementFailed(sh, 1);
             };
             sh.setFuncLine(decl.name, decl.line) catch return 1;
+            sh.setFuncFile(decl.name, sh.source_file) catch return 1;
             return 0;
         },
 

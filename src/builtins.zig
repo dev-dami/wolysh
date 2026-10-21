@@ -130,14 +130,11 @@ fn builtinEcho(ctx: Ctx) u8 {
     var newline = true;
     var escapes = false;
 
-    // Leading flags only; `echo -- -n` still prints the literal argument.
+    // Leading flags only. As in Bash, `--` is not special: `echo -- -n`
+    // prints both words.
     var start: usize = 1;
     while (start < ctx.argv.len) {
         const arg = ctx.argv[start];
-        if (std.mem.eql(u8, arg, "--")) {
-            start += 1;
-            break;
-        }
         if (arg.len < 2 or arg[0] != '-' or !validEchoFlags(arg[1..])) break;
         for (arg[1..]) |c| {
             switch (c) {
@@ -193,7 +190,39 @@ fn appendEscaped(out: *sys.StringBuilder, text: []const u8) !bool {
             't' => try out.appendByte('\t'),
             'v' => try out.appendByte(0x0b),
             '\\' => try out.appendByte('\\'),
-            '0'...'7' => {
+            'x', 'u', 'U' => |kind| {
+                const max_digits: usize = switch (kind) {
+                    'x' => 2,
+                    'u' => 4,
+                    else => 8,
+                };
+                var code: u32 = 0;
+                var digits: usize = 0;
+                var j = i + 1;
+                while (digits < max_digits and j < text.len) : (j += 1) {
+                    const digit = std.fmt.charToDigit(text[j], 16) catch break;
+                    code = code *% 16 +% digit;
+                    digits += 1;
+                }
+                if (digits == 0) {
+                    try out.appendByte('\\');
+                    try out.appendByte(kind);
+                } else if (kind == 'x') {
+                    try out.appendByte(@intCast(code));
+                    i = j - 1;
+                } else {
+                    var encoded: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(@min(code, 0x10ffff)), &encoded) catch 0;
+                    if (len == 0) {
+                        try out.appendByte('\\');
+                        try out.appendByte(kind);
+                    } else {
+                        for (encoded[0..len]) |byte| try out.appendByte(byte);
+                        i = j - 1;
+                    }
+                }
+            },
+            '0' => {
                 var octal: u32 = 0;
                 var digits: usize = 0;
                 if (text[i] == '0') i += 1;
@@ -214,6 +243,24 @@ fn appendEscaped(out: *sys.StringBuilder, text: []const u8) !bool {
         i += 1;
     }
     return false;
+}
+
+/// `name[subscript]` as the pieces of an array element reference, or null.
+pub fn splitElementName(text: []const u8) ?struct { name: []const u8, subscript: []const u8 } {
+    const open = std.mem.indexOfScalar(u8, text, '[') orelse return null;
+    if (open == 0 or text.len < open + 3 or text[text.len - 1] != ']') return null;
+    if (!validName(text[0..open])) return null;
+    return .{ .name = text[0..open], .subscript = text[open + 1 .. text.len - 1] };
+}
+
+/// Stores `text` in the variable or array element that `target` names
+/// (`name` or `name[subscript]`).
+pub fn assignText(sh: *Shell, target: []const u8, text: []const u8) !void {
+    if (splitElementName(target)) |element| {
+        if (sh.isReadonly(element.name)) return error.ReadonlyVariable;
+        return arrays.assignElement(sh, sh.scratch(), element.name, element.subscript, text, false);
+    }
+    return sh.assignVar(target, .{ .string = text });
 }
 
 fn builtinPrint(ctx: Ctx) u8 {
@@ -530,13 +577,46 @@ fn finishJob(ctx: Ctx, job: *jobs.Job) u8 {
 fn builtinWait(ctx: Ctx) u8 {
     ctx.sh.reapJobs();
 
+    // `-n` returns the next job to finish; `-p VAR` stores the pid it waited
+    // for; `-f` waits for termination, which is what plain `wait` does here.
     var next = false;
+    var pid_var: ?[]const u8 = null;
     var index: usize = 1;
-    if (ctx.arg(1)) |first| {
-        if (std.mem.eql(u8, first, "-n")) {
-            next = true;
-            index = 2;
+    while (index < ctx.argv.len) {
+        const arg = ctx.argv[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            break;
         }
+        if (arg.len < 2 or arg[0] != '-') break;
+        index += 1;
+        for (arg[1..], 0..) |flag, at| switch (flag) {
+            'n' => next = true,
+            'f' => {},
+            'p' => {
+                if (at + 2 < arg.len) {
+                    pid_var = arg[at + 2 ..];
+                } else if (index < ctx.argv.len) {
+                    pid_var = ctx.argv[index];
+                    index += 1;
+                } else {
+                    ctx.err("wsh: wait: -p: option requires an argument\n");
+                    return 2;
+                }
+                break;
+            },
+            else => {
+                ctx.errFmt("wsh: wait: -{c}: invalid option\nwait: usage: wait [-fn] [-p var] [id ...]\n", .{flag});
+                return 2;
+            },
+        };
+    }
+    if (pid_var) |name| {
+        if (!validName(name)) {
+            ctx.errFmt("wsh: wait: `{s}': not a valid identifier\n", .{name});
+            return 2;
+        }
+        _ = ctx.sh.unsetVar(name);
     }
 
     if (next) {
@@ -562,6 +642,7 @@ fn builtinWait(ctx: Ctx) u8 {
                 if (job.state == .running) running = true;
                 if (job.state != .done) continue;
                 const status = job.status;
+                if (pid_var) |name| ctx.sh.setVar(name, .{ .int = job.last_pid }) catch {};
                 const job_index = ctx.sh.jobs.indexOf(job).?;
                 ctx.sh.jobs.removeAt(ctx.sh.gpa, job_index);
                 return status;
@@ -595,6 +676,7 @@ fn builtinWait(ctx: Ctx) u8 {
                 status = 127;
                 continue;
             }
+            if (pid_var) |name| ctx.sh.setVar(name, .{ .int = number }) catch {};
             if (ctx.sh.jobs.findById(@intCast(number))) |job| {
                 status = finishJob(ctx, job);
                 continue;
@@ -603,7 +685,9 @@ fn builtinWait(ctx: Ctx) u8 {
                 status = finishJob(ctx, job);
                 continue;
             }
-            if (proc.waitPid(number, 0)) |st| {
+            if (ctx.sh.jobs.finishedStatus(number)) |remembered| {
+                status = remembered;
+            } else if (proc.waitPid(number, 0)) |st| {
                 status = st.exitCode();
             } else {
                 ctx.errFmt("wsh: wait: {s}: not a child of this shell\n", .{spec});
@@ -617,6 +701,7 @@ fn builtinWait(ctx: Ctx) u8 {
             status = 127;
             continue;
         };
+        if (pid_var) |name| ctx.sh.setVar(name, .{ .int = job.last_pid }) catch {};
         status = finishJob(ctx, job);
     }
     ctx.sh.jobs.sweep(ctx.sh.gpa);

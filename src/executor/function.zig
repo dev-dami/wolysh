@@ -64,10 +64,8 @@ pub fn run(
         sh.return_code = saved_code;
         sh.current_line = saved_line;
     }
-    sh.pushFrame(name, saved_line) catch return 1;
+    sh.pushFrame(name, saved_line, sh.getFuncFile(name)) catch return 1;
     defer sh.popFrame();
-    // A local binding, so the caller's FUNCNAME comes back on return.
-    sh.setLocal("FUNCNAME", .{ .string = name }) catch return 1;
     // Declared after the block above so it runs first: the RETURN trap still
     // sees the function's parameters.
     const saved_traps = strict.enterFunction(sh);

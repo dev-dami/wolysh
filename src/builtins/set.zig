@@ -12,56 +12,12 @@ const Options = shellmod.Options;
 
 const usage = "wsh: set: usage: set [-aefuxCEH] [-o option-name] [--] [-] [arg ...]\n";
 
-const Option = struct {
-    name: []const u8,
-    letter: u8 = 0,
-    field: []const u8,
-    /// `emacs` is the inverse of `vi`.
-    inverted: bool = false,
-};
-
-/// Alphabetical, the order `set -o` lists them in.
-const options = [_]Option{
-    .{ .name = "allexport", .letter = 'a', .field = "allexport" },
-    .{ .name = "emacs", .field = "vi", .inverted = true },
-    .{ .name = "errexit", .letter = 'e', .field = "errexit" },
-    .{ .name = "errtrace", .letter = 'E', .field = "errtrace" },
-    .{ .name = "histexpand", .letter = 'H', .field = "histexpand" },
-    .{ .name = "ignoreeof", .field = "ignoreeof" },
-    .{ .name = "noclobber", .letter = 'C', .field = "noclobber" },
-    .{ .name = "noglob", .letter = 'f', .field = "noglob" },
-    .{ .name = "nounset", .letter = 'u', .field = "nounset" },
-    .{ .name = "pipefail", .field = "pipefail" },
-    .{ .name = "vi", .field = "vi" },
-    .{ .name = "xtrace", .letter = 'x', .field = "xtrace" },
-};
-
-pub fn get(opts: *const Options, index: usize) bool {
-    inline for (options, 0..) |option, i| {
-        if (i == index) return @field(opts, option.field) != option.inverted;
-    }
-    unreachable;
-}
-
-pub fn put(opts: *Options, index: usize, on: bool) void {
-    inline for (options, 0..) |option, i| {
-        if (i == index) @field(opts, option.field) = on != option.inverted;
-    }
-}
-
-pub fn byName(name: []const u8) ?usize {
-    for (options, 0..) |option, index| {
-        if (std.mem.eql(u8, option.name, name)) return index;
-    }
-    return null;
-}
-
-fn byLetter(letter: u8) ?usize {
-    for (options, 0..) |option, index| {
-        if (option.letter == letter) return index;
-    }
-    return null;
-}
+const option_table = @import("../set_options.zig");
+const options = option_table.options;
+pub const get = option_table.get;
+pub const put = option_table.put;
+pub const byName = option_table.byName;
+const byLetter = option_table.byLetter;
 
 /// How many `set -o` options there are, and the name of each, for `shopt -o`.
 pub const option_count = options.len;

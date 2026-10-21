@@ -156,7 +156,12 @@ fn runStages(
     // mentions its own alias does not expand it again in the child.
     var alias_names: std.ArrayList([]const u8) = .empty;
     var stages: std.ArrayList(proc.Stage) = .empty;
-    for (commands) |original| {
+    // `shopt -s lastpipe`: the final stage runs in this shell, reading the
+    // pipe the others write (bash does so only without job control).
+    const lastpipe = sh.options.lastpipe and !background and !sh.job_control and commands[commands.len - 1].coproc == null;
+    var tail_pipe: [2]i32 = .{ -1, -1 };
+    if (lastpipe and linux.errno(linux.pipe2(&tail_pipe, .{ .CLOEXEC = true })) != .SUCCESS) return 1;
+    for (if (lastpipe) commands[0 .. commands.len - 1] else commands) |original| {
         var cmd = original;
         var resolved: command.Resolved = .{ .words = cmd.words };
         if (cmd.subshell == null and cmd.group == null and cmd.compound == null) {
@@ -198,15 +203,71 @@ fn runStages(
         stages.append(arena, stage) catch return 1;
     }
 
-    if (stages.items.len == 0) return 0;
+    if (stages.items.len == 0 and !lastpipe) return 0;
 
     const mark = command.suppressAliases(alias_names.items) catch return aliasTooDeep(sh);
     defer command.restoreAliases(mark);
     const text = pipelineText(arena, commands) catch "pipeline";
+    if (lastpipe) {
+        return runLastInShell(sh, arena, stages.items, commands[commands.len - 1], text, tail_pipe, &opened, runtime, outcome);
+    }
     if (background) return startBackground(sh, arena, stages.items, text, runtime.expression_error);
     const statuses = arena.alloc(u8, stages.items.len) catch return runtime.expression_error(sh, error.OutOfMemory);
     outcome.statuses = statuses;
     return waitStages(sh, arena, stages.items, text, runtime.expression_error, statuses);
+}
+
+/// The `lastpipe` tail of a pipeline: `stages` are forked with their output
+/// joined to `pipe`, and `last` runs here with the pipe as its input. The
+/// pipeline's status is the last command's.
+fn runLastInShell(
+    sh: *Shell,
+    arena: std.mem.Allocator,
+    stages: []proc.Stage,
+    last: ast.Command,
+    text: []const u8,
+    pipe: [2]i32,
+    opened: *std.ArrayList(i32),
+    runtime: Runtime,
+    outcome: *Outcome,
+) u8 {
+    const interrupted_before = strict.interruptPending();
+    var launched: ?proc.Launched = null;
+    if (stages.len > 0) {
+        stages[stages.len - 1].stdio.out = pipe[1];
+        launched = proc.launch(arena, stages, .{ .new_group = false }) catch |err| {
+            sys.closeFd(pipe[0]);
+            sys.closeFd(pipe[1]);
+            return runtime.expression_error(sh, err);
+        };
+    }
+    sys.closeFd(pipe[1]);
+
+    const saved_in = sh.default_in;
+    sh.default_in = pipe[0];
+    var inner: Outcome = .{};
+    const last_status = runSingle(sh, arena, last, false, opened, runtime, &inner);
+    sh.default_in = saved_in;
+    // A last command that stopped reading must not keep its writers waiting.
+    sys.closeFd(pipe[0]);
+
+    const statuses = arena.alloc(u8, stages.len + 1) catch return runtime.expression_error(sh, error.OutOfMemory);
+    @memset(statuses, 0);
+    statuses[stages.len] = last_status;
+    if (launched) |started| {
+        const job = sh.jobs.add(sh.gpa, started.pgid, started.pids, text, true) catch return 1;
+        const waited = sh.waitForegroundStages(job, statuses[0..stages.len]);
+        if (sh.jobs.indexOf(job)) |index| sh.jobs.removeAt(sh.gpa, index);
+        if (waited.signal) |signal| reportSignal(sh, signal);
+        strict.foregroundDone(waited.signal, interrupted_before);
+    }
+    outcome.statuses = statuses;
+    if (!sh.options.pipefail) return last_status;
+    var status: u8 = 0;
+    for (statuses) |stage_status| {
+        if (stage_status != 0) status = stage_status;
+    }
+    return status;
 }
 
 fn makeStage(
@@ -321,6 +382,7 @@ fn launchCoproc(
     const fds = [_]value.Value{ .{ .int = from_child[0] }, .{ .int = to_child[1] } };
     sh.setVar(name, .{ .list = &fds }) catch return 1;
     sh.setVar(pid_name, .{ .int = pid }) catch return 1;
+    sh.trackCoproc(name, pid) catch return 1;
     return 0;
 }
 

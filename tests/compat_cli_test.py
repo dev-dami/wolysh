@@ -78,7 +78,7 @@ class CommandLineTests(unittest.TestCase):
             (["-q"], b"wsh: unknown option: -q"),
             (["--bogus"], b"wsh: unknown option: --bogus"),
             (["+c", "true"], b"wsh: unknown option: +c"),
-            (["-xv"], b"wsh: unknown option: -xv"),
+            (["-xZ"], b"wsh: unknown option: -xZ"),
             (["-c"], b"wsh: -c: option requires an argument"),
             (["-o"], b"wsh: -o: option requires an argument"),
             (["--rcfile"], b"wsh: --rcfile: option requires an argument"),

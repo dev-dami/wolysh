@@ -71,6 +71,7 @@ pub fn restoreAliases(mark: usize) void {
 pub fn resolveAliases(sh: *Shell, arena: std.mem.Allocator, words: []const []const u8) Error!Resolved {
     var current = words;
     var names: std.ArrayList([]const u8) = .empty;
+    if (!sh.options.expand_aliases) return .{ .words = words };
     while (current.len > 0) {
         const name = current[0];
         if (isSuppressed(name) or contains(names.items, name)) break;
@@ -256,10 +257,16 @@ fn builtinSource(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8
         sh.return_pending = saved_return;
         sh.return_code = saved_code;
     }
+    // `source` shows up in FUNCNAME, and the file in BASH_SOURCE, while it runs.
+    const pushed = if (sh.pushFrame("source", sh.current_line, path)) |_| true else |_| false;
+    const saved_file = sh.source_file;
+    sh.source_file = path;
     strict.traceDeeper();
     const status = run_source(sh, data);
     strict.traceShallower();
     strict.runReturnTrap(sh);
+    sh.source_file = saved_file;
+    if (pushed) sh.popFrame();
     return if (sh.return_pending) sh.return_code else status;
 }
 

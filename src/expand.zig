@@ -22,6 +22,7 @@ const arrays = @import("arrays.zig");
 const compound = @import("compound.zig");
 const param_ops = @import("param_ops.zig");
 const special_vars = @import("special_vars.zig");
+const prompt = @import("interactive/prompt.zig");
 
 pub const Error = error{
     UnterminatedSubstitution,
@@ -427,7 +428,7 @@ pub const Expander = struct {
     }
 
     fn scanBraceWord(self: *Expander, word: []const u8, depth: u32) Error!void {
-        if (depth < max_brace_depth) {
+        if (depth < max_brace_depth and self.sh.options.braceexpand) {
             if (findBrace(word)) |group| {
                 if (try self.expandBrace(word, group, depth)) return;
             }
@@ -958,8 +959,10 @@ pub const Expander = struct {
         }
         const v = variable(sh, name);
         const sub = subscript orelse {
-            // wsh rule: `$list` without a subscript is every element.
             const val = v orelse return .{ .set = false };
+            // A wsh list (made by `let`) is every element; a Bash array or
+            // map is its element 0, as in Bash.
+            if ((val == .list or val == .map) and !sh.isNativeList(name)) return self.element(name, v, "0");
             return .{ .set = true, .text = try self.textOf(val) };
         };
         if (isAllSubscript(sub)) return self.allItems(v, sub[0] == '*');
@@ -1164,6 +1167,10 @@ pub const Expander = struct {
             .transform => switch (b.word[0]) {
                 'Q' => param_ops.quoteSingle(a, text),
                 'E' => param_ops.expandEscapes(a, text),
+                'P' => prompt.render(self.sh, a, text, b.name) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => text,
+                },
                 'U' => param_ops.caseAll(a, text, true),
                 'L' => param_ops.caseAll(a, text, false),
                 'u' => param_ops.capitalize(a, text),
@@ -1554,7 +1561,7 @@ fn parseBraced(inner: []const u8) ?Braced {
             }
         },
         '@' => {
-            if (rest.len != 2 or std.mem.indexOfScalar(u8, "QEULuaAK", rest[1]) == null) return null;
+            if (rest.len != 2 or std.mem.indexOfScalar(u8, "QEPULuaAK", rest[1]) == null) return null;
             b.op = .transform;
             b.word = rest[1..2];
         },
@@ -2503,7 +2510,7 @@ test "list values render in full" {
 
     const items = try arena.alloc(value.Value, 1000);
     for (items, 0..) |*item, index| item.* = .{ .string = try std.fmt.allocPrint(arena, "item{d}", .{index}) };
-    try sh.setVar("parts", .{ .list = items });
+    try sh.bindNative("parts", .{ .list = items });
 
     var fields: std.ArrayList([]const u8) = .empty;
     try expandWord(&sh, arena, "$parts", &fields);
@@ -2736,7 +2743,9 @@ test "arrays expand by element" {
     try testing.expectEqualStrings("2", try expandLiteral(&sh, arena, "${#a[@]}"));
     try testing.expectEqualStrings("0 2", try expandLiteral(&sh, arena, "${!a[@]}"));
     try testing.expectEqualStrings("z", try expandLiteral(&sh, arena, "${a[-1]}"));
-    try testing.expectEqualStrings("x y z", try expandLiteral(&sh, arena, "$a"));
+    // Bash: `$a` is element 0, and `$m` is the element keyed 0 (none here).
+    try testing.expectEqualStrings("x y", try expandLiteral(&sh, arena, "$a"));
+    try testing.expectEqualStrings("", try expandLiteral(&sh, arena, "$m"));
     try testing.expectEqualStrings("v", try expandLiteral(&sh, arena, "${m[k]}"));
     try testing.expectEqualStrings("k j", try expandLiteral(&sh, arena, "${!m[@]}"));
     try testing.expectEqualStrings("x z", try expandLiteral(&sh, arena, "${a[@]% *}"));

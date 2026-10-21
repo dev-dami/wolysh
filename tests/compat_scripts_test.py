@@ -87,6 +87,57 @@ case("bash_path_runs", '"$BASH" -c "echo ok" 2>/dev/null || echo "$BASH" | grep 
 case("bashpid", 'echo $(( BASHPID == $$ )); (echo $(( BASHPID != $$ )))')
 case("shellopts_follow_set", 'set -e; set -u; case $SHELLOPTS in *errexit*nounset*) echo both;; esac')
 
+# --- arrays and the call stack -----------------------------------------------
+case("array_without_subscript_is_element_zero", 'a=(x y z); echo $a "$a" ${#a[@]} ${#a}')
+case("assoc_without_subscript_is_key_zero", 'declare -A m=([0]=zero [k]=v); echo $m')
+case("bash_rematch_without_subscript", '[[ abc =~ b(c) ]]; echo $BASH_REMATCH ${BASH_REMATCH[1]}')
+case("bash_source_is_the_script", 'echo "${BASH_SOURCE[0]##*/} ${#BASH_SOURCE[@]} $0" | sed "s|/[^ ]*/||"')
+case("script_dir_idiom", 'd=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); [[ -f $d/case.sh ]] && echo found')
+case("is_sourced_idiom", '[[ "${BASH_SOURCE[0]}" == "$0" ]] && echo main || echo sourced')
+case("funcname_stack", 'a() { b; }; b() { echo "${FUNCNAME[@]} $FUNCNAME ${FUNCNAME[1]} ${#FUNCNAME[@]}"; }; a; echo "[${FUNCNAME-unset}]"')
+case("bash_lineno", 'f() { echo "${BASH_LINENO[0]}"; }\nf\n\nf')
+case(
+    "source_sets_bash_source_and_funcname",
+    'printf "lib() { echo \\"in lib: \\${FUNCNAME[0]} \\${BASH_SOURCE[0]##*/}\\"; }\n'
+    'echo \\"top of lib: \\${FUNCNAME[0]} \\${BASH_SOURCE[0]##*/} \\${BASH_SOURCE[1]##*/}\\"\n" > lib.sh\n'
+    'source ./lib.sh; lib; echo "after: [${FUNCNAME-unset}]"',
+)
+case("caller_in_function", 'f() { caller; caller 0; }; f')
+
+# --- shell options --------------------------------------------------------------
+case("lastpipe_read", 'shopt -s lastpipe; echo "a b c" | read x y z; echo "$x|$y|$z"')
+case("lastpipe_while_loop", "shopt -s lastpipe; printf '1\\n2\\n3\\n' | while read -r n; do s=$((s+n)); done; echo sum=$s")
+case("lastpipe_mapfile_and_status", 'shopt -s lastpipe; printf "x\\ny\\n" | mapfile -t arr; echo ${#arr[@]}; false | true | cat; echo "${PIPESTATUS[@]}"')
+case("lastpipe_pipefail", "shopt -s lastpipe; set -o pipefail; false | read w; echo $?")
+case("lastpipe_off_by_default", 'echo z | read zz; echo "zz=${zz-unset}"')
+case("inherit_errexit", 'shopt -s inherit_errexit; set -e; x=$(false; echo no); echo "x=$x"')
+case("no_inherit_errexit", 'set -e; x=$(false; echo yes); echo "x=$x"')
+case("braceexpand_off", "set +B; echo {a,b}; set -B; echo {a,b}; set +o braceexpand; echo {1..3}")
+case("noexec", "echo before; set -n; echo never")
+case("physical_cd", "mkdir -p real; ln -sfn real link; set -P; cd link; pwd | sed 's|.*/||'")
+case("shellopts_lists_set_options", 'set -o pipefail -u; echo $SHELLOPTS')
+case("set_o_names_accepted", "set -o posix -o verbose -o monitor -o keyword -o notify +o posix +o verbose +o monitor +o keyword +o notify; echo ok")
+case("shopt_q_known_names", "for o in lastpipe inherit_errexit huponexit checkwinsize histappend; do shopt -q $o; echo $o=$?; done")
+case("shopt_p_default", "shopt -p lastpipe sourcepath")
+case("expand_aliases_off", "alias say='echo aliased'\nshopt -u expand_aliases\nsay hi 2>/dev/null || echo not-alias", stderr=False)
+
+# --- builtins ------------------------------------------------------------------
+case("printf_v_array_element", 'printf -v "arr[2]" %s q; echo "${arr[2]}"; declare -A m; printf -v "m[k]" "%d" 42; echo ${m[k]}')
+case("echo_hex_escapes_and_double_dash", 'echo -e "\\x41\\x4a|\\101|\\0101|\\xZ"; echo -- -n')
+case("prompt_transform", 'x="a b"; echo ${x@P}; p="\\u \\$((1+1))"; USER=me; echo "${p@P}"; shopt -u promptvars; echo "${p@P}"')
+case(
+    "wait_p_and_remembered_status",
+    'sleep 0.3 & a=$!; (sleep 0.05; exit 4) & b=$!; wait -n -p who; echo "rc=$? $(( who == b ))"; '
+    'wait -f $a; echo $?; wait -p w2 $a; echo "rc=$? $(( w2 == a ))"; wait $b; echo "b=$?"; '
+    'wait -n -p none; echo "rc=$? [${none-unset}]"',
+)
+case("readonly_assignment_stops_the_script", "readonly RO=1; RO=2; echo not-reached")
+case("readonly_in_subshell_continues", "readonly RO=1; (RO=3); echo after:$?")
+case(
+    "coproc_variables_go_when_it_exits",
+    'coproc FOO { echo hi; }; read -u ${FOO[0]} l; echo "$l"; wait $FOO_PID; echo "[${FOO[0]-gone}] [${FOO_PID-gone}]"',
+)
+
 # --- hash --------------------------------------------------------------------
 case("hash_r_is_silent", "hash -r; echo ok")
 

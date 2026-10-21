@@ -14,7 +14,7 @@ const Ctx = builtins.Ctx;
 /// `$CDPATH` first. The new directory is printed after `cd -` and after a
 /// `CDPATH` match.
 pub fn builtinCd(ctx: Ctx) u8 {
-    var physical = false;
+    var physical = ctx.sh.options.physical;
     var index: usize = 1;
     while (index < ctx.argv.len) : (index += 1) {
         const arg = ctx.argv[index];
@@ -124,7 +124,7 @@ fn variable(ctx: Ctx, arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
 /// `pwd [-L|-P]`: the logical directory by default, the resolved one with
 /// `-P`. Operands are ignored, as in bash.
 pub fn builtinPwd(ctx: Ctx) u8 {
-    var physical = false;
+    var physical = ctx.sh.options.physical;
     for (ctx.argv[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (arg.len < 2 or arg[0] != '-') break;

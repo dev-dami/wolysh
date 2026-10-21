@@ -215,15 +215,15 @@ class PipefailTests(BashComparison):
 
     def test_pipestatus_holds_every_stage(self):
         self.assert_like_bash(
-            "false | true | (exit 4); echo $PIPESTATUS; ! false | true; echo $PIPESTATUS $?",
+            'false | true | (exit 4); echo "${PIPESTATUS[@]}"; ! false | true; echo "${PIPESTATUS[@]}" $?',
             'false | true | (exit 4); echo "${PIPESTATUS[@]}"; ! false | true; echo "${PIPESTATUS[@]}" $?',
         )
         self.assert_like_bash(
-            "false; echo $PIPESTATUS; (exit 3); echo $PIPESTATUS; x=$(exit 5); echo $PIPESTATUS",
+            'false; echo "${PIPESTATUS[@]}"; (exit 3); echo "${PIPESTATUS[@]}"; x=$(exit 5); echo "${PIPESTATUS[@]}"',
             'false; echo "${PIPESTATUS[@]}"; (exit 3); echo "${PIPESTATUS[@]}"; x=$(exit 5); echo "${PIPESTATUS[@]}"',
         )
         self.assert_like_bash(
-            "set -o pipefail; false | true; echo $PIPESTATUS; { false | true; }; echo $PIPESTATUS",
+            "set -o pipefail; false | true; echo \"${PIPESTATUS[@]}\"; { false | true; }; echo \"${PIPESTATUS[@]}\"",
             'set -o pipefail; false | true; echo "${PIPESTATUS[@]}"; { false | true; }; echo "${PIPESTATUS[@]}"',
         )
 

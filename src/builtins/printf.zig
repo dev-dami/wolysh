@@ -48,7 +48,7 @@ pub fn run(ctx: Ctx) u8 {
         return 2;
     }
     if (target) |name| {
-        if (!builtins.validName(name)) {
+        if (!builtins.validName(name) and builtins.splitElementName(name) == null) {
             ctx.errFmt("wsh: printf: `{s}': not a valid identifier\n", .{name});
             return 2;
         }
@@ -67,7 +67,7 @@ pub fn run(ctx: Ctx) u8 {
     };
 
     if (target) |name| {
-        ctx.sh.assignVar(name, .{ .string = printer.out.items }) catch |err| {
+        builtins.assignText(ctx.sh, name, printer.out.items) catch |err| {
             if (err == error.ReadonlyVariable) {
                 ctx.errFmt("wsh: printf: {s}: readonly variable\n", .{name});
             } else {

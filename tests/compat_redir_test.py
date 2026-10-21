@@ -276,7 +276,7 @@ class RedirectCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout,
-            b"nullglob            \toff\nshopt -s extglob\nshopt -u failglob\nstatus=1\nq=1\nq=0\nboth=1\nbad=2\n",
+            b"nullglob       \toff\nshopt -s extglob\nshopt -u failglob\nstatus=1\nq=1\nq=0\nboth=1\nbad=2\n",
         )
         self.assertEqual(
             result.stderr,
@@ -288,7 +288,10 @@ class RedirectCompatibilityTests(unittest.TestCase):
     def test_shopt_lists_every_option(self):
         result = run_shell("shopt")
         names = [line.split()[0] for line in result.stdout.decode().splitlines()]
-        self.assertEqual(names, ["dotglob", "extglob", "failglob", "globstar", "nocaseglob", "nocasematch", "nullglob"])
+        # Every name Bash lists is accepted, in Bash's order.
+        bash = subprocess.run(["bash", "-c", "shopt"], capture_output=True, check=True)
+        expected = [line.split()[0] for line in bash.stdout.decode().splitlines()]
+        self.assertEqual([name for name in names if name in expected], expected)
 
 
 class Session:

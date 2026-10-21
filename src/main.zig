@@ -106,6 +106,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // go to one, or when `-i` asks for it. Standard output may be a pipe.
     const reads_input = options.command == null and options.script == null;
     sh.interactive = options.interactive or (reads_input and sys.isTty(0) and sys.isTty(2));
+    // As in Bash, line editing and history are interactive features.
+    if (!sh.interactive) {
+        sh.options.emacs = false;
+        sh.options.history = false;
+        sh.options.histexpand = false;
+    }
 
     if (!options.check) {
         if (sh.login) {
@@ -127,6 +133,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (options.script) |script| {
         sh.script_name = script;
+        sh.script_file = script;
+        sh.source_file = script;
         // A script file is parsed as a whole: a syntax error anywhere means
         // none of it runs.
         const data = readWholeFile(gpa, script) orelse {
@@ -530,6 +538,7 @@ fn takeControllingTerminal(sh: *Shell, tty_fd: i32) void {
 
     sh.tty_fd = tty_fd;
     sh.job_control = true;
+    sh.options.monitor = true;
 }
 
 fn setupPaths(sh: *Shell, gpa: std.mem.Allocator) !void {

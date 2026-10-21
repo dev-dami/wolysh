@@ -15,12 +15,17 @@ const build_options = @import("build_options");
 const shell = @import("shell.zig");
 const value = @import("value.zig");
 const sys = @import("sys.zig");
+const set_options = @import("set_options.zig");
 
 pub const names = [_][]const u8{
-    "BASH",    "BASHPID",  "BASH_VERSINFO", "BASH_VERSION", "EPOCHREALTIME", "EPOCHSECONDS",
-    "EUID",    "HOSTNAME", "HOSTTYPE",      "IFS",          "LINENO",        "MACHTYPE",
-    "OSTYPE",  "PPID",     "PS4",           "RANDOM",       "SECONDS",       "SHELLOPTS",
-    "SRANDOM", "UID",      "WSH_VERSION",
+    "BASH_LINENO",  "BASH_SOURCE",   "FUNCNAME",
+    "BASH",         "BASHPID",       "BASH_VERSINFO",
+    "BASH_VERSION", "EPOCHREALTIME", "EPOCHSECONDS",
+    "EUID",         "HOSTNAME",      "HOSTTYPE",
+    "IFS",          "LINENO",        "MACHTYPE",
+    "OSTYPE",       "PPID",          "PS4",
+    "RANDOM",       "SECONDS",       "SHELLOPTS",
+    "SRANDOM",      "UID",           "WSH_VERSION",
 };
 
 /// The Bash version scripts see. Scripts test the major number or look for
@@ -33,7 +38,11 @@ const bash_versinfo = [_]value.Value{
 };
 var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
 var exe_len: ?usize = null;
-var options_buf: [256]u8 = undefined;
+var options_buf: [512]u8 = undefined;
+/// Backing for the call-stack arrays: one entry per active call plus `main`.
+var stack_funcname: [shell.Shell.max_call_depth + 2]value.Value = undefined;
+var stack_source: [shell.Shell.max_call_depth + 2]value.Value = undefined;
+var stack_lineno: [shell.Shell.max_call_depth + 2]value.Value = undefined;
 
 /// Monotonic time at which `SECONDS` read zero.
 var seconds_origin_ns: ?i64 = null;
@@ -80,6 +89,9 @@ pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
     if (eql(u8, name, "HOSTTYPE")) return if (sh.env.contains(name)) null else .{ .string = @tagName(builtin.cpu.arch) };
     if (eql(u8, name, "OSTYPE")) return if (sh.env.contains(name)) null else .{ .string = "linux-gnu" };
     if (eql(u8, name, "WSH_VERSION")) return .{ .string = build_options.version };
+    if (eql(u8, name, "FUNCNAME") or eql(u8, name, "BASH_SOURCE") or eql(u8, name, "BASH_LINENO")) {
+        return callStack(sh, name);
+    }
     // Bash starts with its own IFS and ignores the one it inherits.
     if (eql(u8, name, "IFS")) return .{ .string = " \t\n" };
     if (eql(u8, name, "PS4")) return .{ .string = "+ " };
@@ -93,6 +105,40 @@ pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
     return null;
 }
 
+/// `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO`: one entry per active call,
+/// innermost first, then the top level (`main`, the script, line 0). Outside
+/// any call `FUNCNAME` is unset and the other two describe the script alone.
+fn callStack(sh: *const shell.Shell, name: []const u8) ?value.Value {
+    const frames = sh.call_frames.items;
+    const funcname = std.mem.eql(u8, name, "FUNCNAME");
+    const source = std.mem.eql(u8, name, "BASH_SOURCE");
+    // Bash leaves FUNCNAME unset until a function runs: a sourced file at the
+    // top level is not listed.
+    var in_function = false;
+    for (frames) |frame| {
+        if (!std.mem.eql(u8, frame.name, "source")) in_function = true;
+    }
+    if (funcname and !in_function) return null;
+    if (frames.len == 0) {
+        if (funcname) return null;
+        if (source) {
+            if (sh.script_file.len == 0) return null;
+            stack_source[0] = .{ .string = sh.script_file };
+            return .{ .list = stack_source[0..1] };
+        }
+        stack_lineno[0] = .{ .int = 0 };
+        return .{ .list = stack_lineno[0..1] };
+    }
+    const out = if (funcname) &stack_funcname else if (source) &stack_source else &stack_lineno;
+    const count = @min(frames.len, out.len - 1);
+    for (0..count) |i| {
+        const frame = frames[frames.len - 1 - i];
+        out[i] = if (funcname) .{ .string = frame.name } else if (source) .{ .string = frame.file } else .{ .int = frame.call_line };
+    }
+    out[count] = if (funcname) .{ .string = "main" } else if (source) .{ .string = sh.script_file } else .{ .int = 0 };
+    return .{ .list = out[0 .. count + 1] };
+}
+
 fn shellPath() ?[]const u8 {
     if (exe_len == null) {
         const rc = linux.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
@@ -101,35 +147,17 @@ fn shellPath() ?[]const u8 {
     return if (exe_len.? == 0) null else exe_buf[0..exe_len.?];
 }
 
-/// Colon-separated `set -o` options that are on, sorted as Bash sorts them.
+/// Colon-separated `set -o` options that are on, in `set -o` order.
 fn shellOptions(sh: *const shell.Shell) []const u8 {
-    const o = sh.options;
-    const flags = [_]struct { name: []const u8, on: bool }{
-        .{ .name = "allexport", .on = o.allexport },
-        .{ .name = "braceexpand", .on = true },
-        .{ .name = "emacs", .on = !o.vi },
-        .{ .name = "errexit", .on = o.errexit },
-        .{ .name = "errtrace", .on = o.errtrace },
-        .{ .name = "hashall", .on = true },
-        .{ .name = "histexpand", .on = o.histexpand },
-        .{ .name = "ignoreeof", .on = o.ignoreeof },
-        .{ .name = "interactive-comments", .on = true },
-        .{ .name = "noclobber", .on = o.noclobber },
-        .{ .name = "noglob", .on = o.noglob },
-        .{ .name = "nounset", .on = o.nounset },
-        .{ .name = "pipefail", .on = o.pipefail },
-        .{ .name = "vi", .on = o.vi },
-        .{ .name = "xtrace", .on = o.xtrace },
-    };
     var len: usize = 0;
-    for (flags) |flag| {
-        if (!flag.on) continue;
+    for (set_options.options, 0..) |option, index| {
+        if (!set_options.get(&sh.options, index)) continue;
         if (len > 0) {
             options_buf[len] = ':';
             len += 1;
         }
-        @memcpy(options_buf[len..][0..flag.name.len], flag.name);
-        len += flag.name.len;
+        @memcpy(options_buf[len..][0..option.name.len], option.name);
+        len += option.name.len;
     }
     return options_buf[0..len];
 }

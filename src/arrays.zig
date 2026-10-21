@@ -262,7 +262,7 @@ fn integerOf(sh: *Shell, arena: std.mem.Allocator, v: Value) Error!i64 {
 /// Applies `declare -i/-l/-u` to a value about to be stored under `name`.
 pub fn applyAttrs(sh: *Shell, name: []const u8, val: Value) Error!Value {
     const attrs = sh.getAttrs(name);
-    if (!attrs.any()) return val;
+    if (!attrs.converts()) return val;
     const arena = sh.scratch();
     switch (val) {
         .list => |items| {

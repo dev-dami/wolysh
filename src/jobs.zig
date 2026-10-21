@@ -43,6 +43,28 @@ pub const Job = struct {
 
 pub const Table = struct {
     jobs: std.ArrayList(Job) = .empty,
+    /// Exit statuses of finished jobs already dropped from the table, by the
+    /// pid of their last process, so `wait $pid` can still report one (Bash
+    /// remembers them too). Oldest entries are overwritten.
+    finished: [64]Finished = [_]Finished{.{}} ** 64,
+    finished_next: usize = 0,
+
+    pub const Finished = struct { pid: i32 = 0, status: u8 = 0 };
+
+    /// The remembered status of a finished job's last process.
+    pub fn finishedStatus(self: *const Table, pid: i32) ?u8 {
+        if (pid <= 0) return null;
+        for (self.finished) |entry| {
+            if (entry.pid == pid) return entry.status;
+        }
+        return null;
+    }
+
+    fn remember(self: *Table, job: Job) void {
+        if (job.state != .done or job.last_pid <= 0) return;
+        self.finished[self.finished_next] = .{ .pid = job.last_pid, .status = job.status };
+        self.finished_next = (self.finished_next + 1) % self.finished.len;
+    }
 
     pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
         for (self.jobs.items) |job| {
@@ -113,6 +135,7 @@ pub const Table = struct {
     }
 
     pub fn removeAt(self: *Table, allocator: std.mem.Allocator, index: usize) void {
+        self.remember(self.jobs.items[index]);
         allocator.free(self.jobs.items[index].pids);
         allocator.free(self.jobs.items[index].command);
         _ = self.jobs.orderedRemove(index);
@@ -124,6 +147,7 @@ pub const Table = struct {
         while (i < self.jobs.items.len) {
             const job = &self.jobs.items[i];
             if (job.state == .done and job.notified) {
+                self.remember(job.*);
                 allocator.free(job.pids);
                 allocator.free(job.command);
                 _ = self.jobs.orderedRemove(i);

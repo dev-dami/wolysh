@@ -106,12 +106,25 @@ pub fn textVar(sh: *const Shell, arena: std.mem.Allocator, name: []const u8) !?[
 pub fn render(sh: *Shell, arena: std.mem.Allocator, text: []const u8, name: []const u8) ![]const u8 {
     var decoded: std.ArrayList(u8) = .empty;
     try decode(sh, arena, &decoded, text);
+    if (!sh.options.promptvars) return unquote(arena, decoded.items);
     return expand_mod.expandHereDoc(sh, arena, decoded.items) catch |err| {
         var buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "wsh: {s}: {s}\n", .{ name, @errorName(err) }) catch "wsh: prompt expansion failed\n";
         sys.writeStr(2, message);
         return decoded.items;
     };
+}
+
+/// With `shopt -u promptvars` nothing is expanded: only the quoting that
+/// `appendQuoted` added for the expansion step comes off.
+fn unquote(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\\' and i + 1 < text.len and std.mem.indexOfScalar(u8, "$`\\", text[i + 1]) != null) i += 1;
+        try out.append(arena, text[i]);
+    }
+    return out.items;
 }
 
 /// Appends a value that comes from outside the prompt string (a directory,
