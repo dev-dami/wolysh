@@ -28,7 +28,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `exec`, `attach`, `ls`, `kill`), served by a per-user `wsh --daemon`.
   An attached session keeps its terminal: a foreground command continues
   after a detach, the next attach replays the newest 64 KiB of output, and
-  terminal resizes reach the session. `session ls` shows each session's
+  terminal resizes reach the session. A `session exec` request keeps a line
+  that is partly typed at the attached prompt. A client that stops reading is
+  dropped after about 1 MiB of unread output, and the session continues.
+  `session ls` shows each session's
   current directory.
   `wsh run` and `wsh session` no longer run a script file with that name; use
   `wsh ./run`.

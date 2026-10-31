@@ -140,6 +140,9 @@ pub const Editor = struct {
     command_end_row: usize = 0,
     /// Set when the last line was cancelled with Ctrl-C.
     interrupted: bool = false,
+    /// Set when `term.wake_fd` ended the last edit. The line is kept, and
+    /// the next edit resumes it with the same cursor.
+    woken: bool = false,
 
     prompt_text: []const u8 = "",
     write_continuation: ?WriteContinuationPrompt = null,
@@ -234,7 +237,18 @@ pub const Editor = struct {
         is_complete: ?IsComplete,
         write_continuation: ?WriteContinuationPrompt,
     ) ?[]const u8 {
+        const gpa = self.sh.gpa;
+        var kept: std.ArrayList(u8) = .empty;
+        defer kept.deinit(gpa);
+        const kept_cursor = self.cursor;
+        const resuming = self.woken;
+        self.woken = false;
+        if (resuming) kept.appendSlice(gpa, self.buf.items) catch {};
         self.resetLine();
+        if (resuming) {
+            self.buf.appendSlice(gpa, kept.items) catch {};
+            self.cursor = @min(kept_cursor, self.buf.items.len);
+        }
         self.prompt_text = prompt_text;
         self.write_continuation = write_continuation;
 
@@ -425,7 +439,8 @@ pub const Editor = struct {
             // The terminal is gone or the shell got SIGHUP: no more keys will
             // come, even with text on the line (Ctrl-D arrives as a byte).
             .eof => {
-                self.write("\r\n");
+                // A wake keeps the line on screen; the next edit redraws it.
+                if (!self.woken) self.write("\r\n");
                 return .eof;
             },
             .byte => |b| return self.handleControlOrByte(b),
@@ -822,7 +837,11 @@ pub const Editor = struct {
                     .eof => return .eof,
                     .interrupted => {
                         if (term.takeResize()) return .resize;
-                        if (proc.hangupPending() or term.wakePending()) return .eof;
+                        if (proc.hangupPending()) return .eof;
+                        if (term.wakePending()) {
+                            self.woken = true;
+                            return .eof;
+                        }
                     },
                 }
             }
