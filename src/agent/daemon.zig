@@ -7,6 +7,9 @@
 //! the daemon's children, as panes are a tmux server's, and end with it.
 //! Once a minute it expires finished runs and idle sessions; it exits after
 //! ten minutes with no session, no running run and no client.
+//!
+//! The daemon never blocks on a session: frames for a host or a terminal
+//! relay wait in a queue, and the poll loop sends them as the socket drains.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -48,22 +51,88 @@ pub const Reply = struct {
     sessions: ?[]const SessionInfo = null,
 };
 
+/// A message from a host to the daemon. `done` ends a routed request,
+/// `cwd` reports a new directory, and `relay` brings the socket of the
+/// session's terminal relay, which takes later attaches.
+pub const HostMessage = struct {
+    op: []const u8,
+    cwd: ?[]const u8 = null,
+};
+
 /// Default idle time before the daemon exits: 10 minutes, or
 /// `WSH_DAEMON_IDLE` seconds.
 const default_idle_s: i64 = 600;
 
+/// Frames waiting until a host or relay socket can take them.
+const Queue = struct {
+    items: std.ArrayList(Pending) = .empty,
+
+    const Pending = struct {
+        bytes: []u8,
+        fds: [wire.max_fds]i32,
+        fd_count: usize,
+        sent: usize = 0,
+    };
+
+    /// Queues `body` as a frame. The queue owns `fds` from here on.
+    fn push(self: *Queue, gpa: std.mem.Allocator, body: []const u8, fds: []const i32) !void {
+        var item = Pending{ .bytes = try wire.encodeFrame(gpa, body), .fds = undefined, .fd_count = fds.len };
+        errdefer gpa.free(item.bytes);
+        @memcpy(item.fds[0..fds.len], fds);
+        try self.items.append(gpa, item);
+    }
+
+    /// Sends what the socket takes now. False when the peer is gone.
+    fn drain(self: *Queue, gpa: std.mem.Allocator, fd: i32) bool {
+        while (self.items.items.len != 0) {
+            const item = &self.items.items[0];
+            const fds = if (item.sent == 0) item.fds[0..item.fd_count] else &.{};
+            const n = wire.sendNow(fd, item.bytes[item.sent..], fds) catch |e| return e == error.WouldBlock;
+            item.sent += n;
+            if (item.sent < item.bytes.len) continue;
+            // The receiver has its own copies now.
+            for (item.fds[0..item.fd_count]) |passed| _ = linux.close(passed);
+            gpa.free(item.bytes);
+            _ = self.items.orderedRemove(0);
+        }
+        return true;
+    }
+
+    fn pending(self: *const Queue) bool {
+        return self.items.items.len != 0;
+    }
+
+    /// Drops every frame. Closing a client's connection tells it the
+    /// session went away.
+    fn clear(self: *Queue, gpa: std.mem.Allocator) void {
+        for (self.items.items) |item| {
+            for (item.fds[0..item.fd_count]) |passed| _ = linux.close(passed);
+            gpa.free(item.bytes);
+        }
+        self.items.deinit(gpa);
+        self.items = .empty;
+    }
+};
+
 const Session = struct {
     name: []const u8,
+    /// The host's current directory, as it last reported.
     cwd: []const u8,
     pid: i32,
     /// The daemon's end of the socket pair to the host process.
     ctl: i32,
+    /// The socket to the session's terminal relay, once one was attached.
+    relay: i32 = -1,
+    to_host: Queue = .{},
+    to_relay: Queue = .{},
     /// Requests routed to the host that it has not finished yet.
     busy: u32 = 0,
     created_ms: i64,
     last_used_ms: i64,
     /// Set by `session kill`; the entry goes once the host is reaped.
     dying: bool = false,
+    /// The host is gone; the entry goes at the end of this poll round.
+    ended: bool = false,
 };
 
 const Daemon = struct {
@@ -81,7 +150,7 @@ const Daemon = struct {
 
     fn find(self: *Daemon, name: []const u8) ?*Session {
         for (self.sessions.items) |*session| {
-            if (!session.dying and std.mem.eql(u8, session.name, name)) return session;
+            if (!session.dying and !session.ended and std.mem.eql(u8, session.name, name)) return session;
         }
         return null;
     }
@@ -157,10 +226,15 @@ fn sweepInterval(self: *const Daemon) i64 {
     return std.math.clamp(@divTrunc(@min(self.run_ttl_ms, self.session_ttl_ms), 2), 1000, 60_000);
 }
 
+/// What a polled descriptor belongs to.
+const Target = struct { session: usize, relay: bool };
+
 fn serve(self: *Daemon) void {
     var next_sweep = state.monotonicMs();
     var pollfds: std.ArrayList(linux.pollfd) = .empty;
     defer pollfds.deinit(self.gpa);
+    var targets: std.ArrayList(Target) = .empty;
+    defer targets.deinit(self.gpa);
     while (true) {
         const now = state.monotonicMs();
         if (now >= next_sweep) {
@@ -170,9 +244,17 @@ fn serve(self: *Daemon) void {
         if (self.sessions.items.len == 0 and now - self.last_activity_ms >= self.idle_ms and !anyRunning(self)) return;
 
         pollfds.clearRetainingCapacity();
+        targets.clearRetainingCapacity();
         pollfds.append(self.gpa, .{ .fd = self.listen_fd, .events = linux.POLL.IN, .revents = 0 }) catch return;
-        for (self.sessions.items) |session| {
-            pollfds.append(self.gpa, .{ .fd = session.ctl, .events = linux.POLL.IN, .revents = 0 }) catch return;
+        targets.append(self.gpa, undefined) catch return;
+        for (self.sessions.items, 0..) |session, index| {
+            const host_events: i16 = linux.POLL.IN | (if (session.to_host.pending()) @as(i16, linux.POLL.OUT) else 0);
+            pollfds.append(self.gpa, .{ .fd = session.ctl, .events = host_events, .revents = 0 }) catch return;
+            targets.append(self.gpa, .{ .session = index, .relay = false }) catch return;
+            if (session.relay < 0) continue;
+            const relay_events: i16 = linux.POLL.IN | (if (session.to_relay.pending()) @as(i16, linux.POLL.OUT) else 0);
+            pollfds.append(self.gpa, .{ .fd = session.relay, .events = relay_events, .revents = 0 }) catch return;
+            targets.append(self.gpa, .{ .session = index, .relay = true }) catch return;
         }
         // Past the idle deadline with runs still going, the sweeps recheck.
         var timeout = next_sweep - now;
@@ -181,18 +263,23 @@ fn serve(self: *Daemon) void {
         const rc = linux.poll(pollfds.items.ptr, @intCast(pollfds.items.len), @intCast(@max(timeout, 0)));
         if (linux.errno(rc) != .SUCCESS) continue;
 
-        // Session events first: their indexes still match `pollfds`.
+        // Session events first, so a host's report (a new directory, say)
+        // lands before a client that waited for that host is answered.
+        for (pollfds.items[1..], targets.items[1..]) |polled, target| {
+            if (polled.revents == 0) continue;
+            const session = &self.sessions.items[target.session];
+            if (target.relay) relayEvent(self, session, polled.revents) else hostEvent(self, session, polled.revents);
+        }
         var index = self.sessions.items.len;
         while (index > 0) {
             index -= 1;
-            if (pollfds.items[index + 1].revents != 0) sessionEvent(self, index);
+            if (self.sessions.items[index].ended) endSession(self, index);
         }
         if (pollfds.items[0].revents & linux.POLL.IN != 0) {
             const conn_rc = linux.accept4(self.listen_fd, null, null, linux.SOCK.CLOEXEC);
             if (linux.errno(conn_rc) == .SUCCESS) {
                 const conn: i32 = @intCast(conn_rc);
-                handleClient(self, conn);
-                _ = linux.close(conn);
+                if (!handleClient(self, conn)) _ = linux.close(conn);
                 self.last_activity_ms = state.monotonicMs();
             }
         }
@@ -216,23 +303,69 @@ fn housekeeping(self: *Daemon) void {
     _ = runs.sweep(arena_state.allocator(), self.runs_dir, self.run_ttl_ms, true);
     const now = state.nowMs();
     for (self.sessions.items) |*session| {
-        if (session.dying or session.busy != 0) continue;
+        if (session.dying or session.busy != 0 or session.to_host.pending()) continue;
         if (now - session.last_used_ms >= self.session_ttl_ms) stopSession(self, arena_state.allocator(), session);
     }
 }
 
-/// The host reported finished requests, or closed its socket by exiting.
-fn sessionEvent(self: *Daemon, index: usize) void {
-    const session = &self.sessions.items[index];
-    var buf: [64]u8 = undefined;
-    const rc = linux.read(session.ctl, &buf, buf.len);
-    if (linux.errno(rc) == .SUCCESS and rc > 0) {
-        session.busy -|= @intCast(rc);
-        session.last_used_ms = state.nowMs();
+fn hostEvent(self: *Daemon, session: *Session, revents: i16) void {
+    if (revents & linux.POLL.OUT != 0 and !session.to_host.drain(self.gpa, session.ctl)) {
+        session.ended = true;
         return;
     }
-    if (linux.errno(rc) == .INTR or linux.errno(rc) == .AGAIN) return;
+    if (revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0 and !hostMessage(self, session)) session.ended = true;
+}
+
+/// Reads one report from a host. False when the host closed its socket,
+/// which it does only by exiting.
+fn hostMessage(self: *Daemon, session: *Session) bool {
+    var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var frame = (wire.recv(session.ctl, arena) catch return false) orelse return false;
+    defer frame.closeFds();
+    const message = wire.parseJson(HostMessage, arena, frame.body) orelse return true;
+    if (message.cwd) |cwd| setCwd(self, arena, session, cwd);
+    if (std.mem.eql(u8, message.op, "done")) {
+        session.busy -|= 1;
+        session.last_used_ms = state.nowMs();
+    } else if (std.mem.eql(u8, message.op, "relay") and frame.fd_count == 1) {
+        dropRelay(self, session);
+        session.relay = frame.fds[0];
+        frame.fd_count = 0;
+    }
+    return true;
+}
+
+fn setCwd(self: *Daemon, arena: std.mem.Allocator, session: *Session, cwd: []const u8) void {
+    if (std.mem.eql(u8, session.cwd, cwd)) return;
+    const owned = self.gpa.dupe(u8, cwd) catch return;
+    self.gpa.free(session.cwd);
+    session.cwd = owned;
+    writeSessionMeta(self, arena, session.*);
+}
+
+fn relayEvent(self: *Daemon, session: *Session, revents: i16) void {
+    // A relay never writes to the daemon: readable means it exited.
+    if (revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0) return dropRelay(self, session);
+    if (revents & linux.POLL.OUT != 0 and !session.to_relay.drain(self.gpa, session.relay)) dropRelay(self, session);
+}
+
+fn dropRelay(self: *Daemon, session: *Session) void {
+    if (session.relay < 0) return;
+    session.to_relay.clear(self.gpa);
+    _ = linux.close(session.relay);
+    session.relay = -1;
+}
+
+fn endSession(self: *Daemon, index: usize) void {
+    const session = &self.sessions.items[index];
+    // A host closes its socket only by exiting; make sure of it before the
+    // blocking reap.
+    _ = linux.kill(session.pid, .KILL);
     _ = proc.waitPid(session.pid, 0);
+    dropRelay(self, session);
+    session.to_host.clear(self.gpa);
     _ = linux.close(session.ctl);
     if (!session.dying) {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -257,7 +390,9 @@ fn reply(conn: i32, arena: std.mem.Allocator, value: Reply) void {
     _ = wire.sendJson(conn, arena, value, &.{});
 }
 
-fn handleClient(self: *Daemon, conn: i32) void {
+/// Answers or routes one client request. True when the connection went to
+/// a session, which then owns it.
+fn handleClient(self: *Daemon, conn: i32) bool {
     var arena_state = std.heap.ArenaAllocator.init(self.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -265,54 +400,87 @@ fn handleClient(self: *Daemon, conn: i32) void {
     // even if the directory or socket permissions were loosened.
     if (wire.peerUid(conn) != linux.getuid()) {
         reply(conn, arena, .{ .ok = false, .@"error" = "permission denied" });
-        return;
+        return false;
     }
     wire.setReceiveTimeout(conn, 5000);
-    var frame = (wire.recv(conn, arena) catch return) orelse return;
+    var frame = (wire.recv(conn, arena) catch return false) orelse return false;
     defer frame.closeFds();
     const req = wire.parseJson(Request, arena, frame.body) orelse {
         reply(conn, arena, .{ .ok = false, .@"error" = "malformed request" });
-        return;
+        return false;
     };
-    if (std.mem.eql(u8, req.op, "ping")) return reply(conn, arena, .{ .ok = true });
-    if (std.mem.eql(u8, req.op, "ls")) return listSessions(self, conn, arena);
+    if (std.mem.eql(u8, req.op, "ping")) {
+        reply(conn, arena, .{ .ok = true });
+        return false;
+    }
+    if (std.mem.eql(u8, req.op, "ls")) {
+        listSessions(self, conn, arena);
+        return false;
+    }
 
-    const name = req.name orelse return reply(conn, arena, .{ .ok = false, .@"error" = "missing session name" });
-    if (!state.validName(name)) return reply(conn, arena, .{ .ok = false, .@"error" = "invalid session name" });
-    if (std.mem.eql(u8, req.op, "new")) return newSession(self, conn, arena, name, req);
+    const name = req.name orelse {
+        reply(conn, arena, .{ .ok = false, .@"error" = "missing session name" });
+        return false;
+    };
+    if (!state.validName(name)) {
+        reply(conn, arena, .{ .ok = false, .@"error" = "invalid session name" });
+        return false;
+    }
+    if (std.mem.eql(u8, req.op, "new")) {
+        newSession(self, conn, arena, name, req);
+        return false;
+    }
 
-    const session = self.find(name) orelse return reply(conn, arena, .{ .ok = false, .@"error" = "no such session" });
+    const session = self.find(name) orelse {
+        reply(conn, arena, .{ .ok = false, .@"error" = "no such session" });
+        return false;
+    };
     if (std.mem.eql(u8, req.op, "exec") or std.mem.eql(u8, req.op, "attach")) {
-        // The host gets the client's connection with the request and
-        // answers on it; the daemon is out of the path from here on.
+        // The host, or for a second attach the terminal relay, gets the
+        // client's connection with the request and answers on it; the daemon
+        // is out of the path from here on.
+        const to_relay = std.mem.eql(u8, req.op, "attach") and session.relay >= 0;
         var fds: [wire.max_fds]i32 = undefined;
         fds[0] = conn;
         const passed = frame.passed();
         const count: usize = @min(passed.len, wire.max_fds - 1);
         @memcpy(fds[1 .. 1 + count], passed[0..count]);
-        if (!wire.send(session.ctl, frame.body, fds[0 .. 1 + count])) {
-            return reply(conn, arena, .{ .ok = false, .@"error" = "the session is not responding" });
-        }
-        session.busy += 1;
+        const queue = if (to_relay) &session.to_relay else &session.to_host;
+        queue.push(self.gpa, frame.body, fds[0 .. 1 + count]) catch {
+            reply(conn, arena, .{ .ok = false, .@"error" = "out of memory" });
+            return false;
+        };
+        frame.fd_count = 0;
+        if (!to_relay) session.busy += 1;
         session.last_used_ms = state.nowMs();
-        return;
+        // Whatever the socket does not take now, the poll loop sends later.
+        if (to_relay) {
+            if (!queue.drain(self.gpa, session.relay)) dropRelay(self, session);
+        } else if (!queue.drain(self.gpa, session.ctl)) session.ended = true;
+        return true;
     }
     if (std.mem.eql(u8, req.op, "kill")) {
         stopSession(self, arena, session);
-        return reply(conn, arena, .{ .ok = true });
+        reply(conn, arena, .{ .ok = true });
+        return false;
     }
     if (std.mem.eql(u8, req.op, "signal")) {
-        const sig = proc.signalFromName(req.signal orelse "INT") orelse return reply(conn, arena, .{ .ok = false, .@"error" = "invalid signal" });
+        const sig = proc.signalFromName(req.signal orelse "INT") orelse {
+            reply(conn, arena, .{ .ok = false, .@"error" = "invalid signal" });
+            return false;
+        };
         _ = proc.sendSignal(-session.pid, @intFromEnum(sig));
-        return reply(conn, arena, .{ .ok = true });
+        reply(conn, arena, .{ .ok = true });
+        return false;
     }
     reply(conn, arena, .{ .ok = false, .@"error" = "unknown request" });
+    return false;
 }
 
 fn listSessions(self: *Daemon, conn: i32, arena: std.mem.Allocator) void {
     var infos: std.ArrayList(SessionInfo) = .empty;
     for (self.sessions.items) |session| {
-        if (session.dying) continue;
+        if (session.dying or session.ended) continue;
         infos.append(arena, .{
             .name = session.name,
             .pid = session.pid,
@@ -328,6 +496,13 @@ fn listSessions(self: *Daemon, conn: i32, arena: std.mem.Allocator) void {
         }
     }.lessThan);
     reply(conn, arena, .{ .ok = true, .sessions = infos.items });
+}
+
+fn writeSessionMeta(self: *Daemon, arena: std.mem.Allocator, session: Session) void {
+    const dir = self.sessionDir(arena, session.name) orelse return;
+    const meta_path = std.fmt.allocPrint(arena, "{s}/meta.json", .{dir}) catch return;
+    const meta = std.json.Stringify.valueAlloc(arena, .{ .name = session.name, .pid = session.pid, .cwd = session.cwd, .created_ms = session.created_ms }, .{}) catch return;
+    _ = state.writeAtomic(arena, meta_path, meta);
 }
 
 fn newSession(self: *Daemon, conn: i32, arena: std.mem.Allocator, name: []const u8, req: Request) void {
@@ -371,8 +546,40 @@ fn newSession(self: *Daemon, conn: i32, arena: std.mem.Allocator, name: []const 
         .created_ms = now,
         .last_used_ms = now,
     }) catch return;
-    const meta_path = std.fmt.allocPrint(arena, "{s}/meta.json", .{dir}) catch return;
-    const meta = std.json.Stringify.valueAlloc(arena, .{ .name = name, .pid = @as(i32, @intCast(rc)), .cwd = cwd, .created_ms = now }, .{}) catch return;
-    _ = state.writeAtomic(arena, meta_path, meta);
+    writeSessionMeta(self, arena, self.sessions.items[self.sessions.items.len - 1]);
     reply(conn, arena, .{ .ok = true });
+}
+
+test "a queue sends what a full socket takes and keeps the rest" {
+    const testing = std.testing;
+    var pair: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer _ = linux.close(pair[0]);
+    defer _ = linux.close(pair[1]);
+
+    const body = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+    var queue = Queue{};
+    defer queue.clear(testing.allocator);
+    try queue.push(testing.allocator, body, &.{});
+    try queue.push(testing.allocator, "small", &.{});
+    // Nobody reads yet: the first frame stays partly sent, and nothing blocks.
+    try testing.expect(queue.drain(testing.allocator, pair[0]));
+    try testing.expect(queue.pending());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var received: std.ArrayList(u8) = .empty;
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        try testing.expect(queue.drain(testing.allocator, pair[0]));
+        var fds = [_]linux.pollfd{.{ .fd = pair[1], .events = linux.POLL.IN, .revents = 0 }};
+        if (!queue.pending() and linux.poll(&fds, 1, 0) == 0) break;
+        const n = sys.readSome(pair[1], &buf) orelse break;
+        try received.appendSlice(arena, buf[0..n]);
+    }
+    try testing.expectEqual(@as(usize, 4 + body.len + 4 + 5), received.items.len);
+    try testing.expect(std.mem.endsWith(u8, received.items, "small"));
 }

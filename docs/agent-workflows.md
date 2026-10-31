@@ -176,9 +176,9 @@ wsh session kill work
 | Command | Behavior |
 | --- | --- |
 | `session new NAME` | Start a shell in the caller's directory with the caller's environment |
-| `session ls [--json]` | List the sessions, their host process ids, and whether they are busy |
+| `session ls [--json]` | List the sessions, their host process ids, current directories, and whether they are busy |
 | `session exec NAME [--] command...` | Run a command line in the session and return its exit status |
-| `session attach NAME` | Use the session interactively on a new pseudo-terminal |
+| `session attach NAME` | Use the session interactively on its pseudo-terminal |
 | `session kill NAME` | Hang up the session and everything that it started |
 
 `session exec` gives the session the caller's own stdin, stdout and stderr, so
@@ -191,17 +191,27 @@ job (`cmd &`) that keeps the caller's stdout open also keeps the caller
 waiting for end of output, as with `wsh -c`. Redirect its output, or use
 `run -d`.
 
-`session attach` runs the line editor on a new pseudo-terminal in the session.
+`session attach` runs the line editor on a pseudo-terminal in the session. The
+first attach creates the terminal, and it stays for the life of the session.
 Type Ctrl-\ and then `d` to detach. Type Ctrl-\ twice to send one Ctrl-\.
-Ctrl-D on an empty line also detaches. `exit` ends the session. Detaching
-hangs up a command that is in the foreground. Start long work with `run -d`.
-The terminal size is set when you attach.
+`exit` ends the session. Ctrl-D on an empty line does not end the session.
+A command in the foreground continues after you detach, as in tmux. The
+session keeps the newest 64 KiB of terminal output, and the next attach shows
+it first. A new attach replaces a client that is still attached. When the
+client's terminal changes size, the session's terminal and its foreground
+program get the new size.
+
+`session exec` requests interrupt the attached prompt and run between
+commands. While a foreground command runs on the terminal, they wait. `session
+ls` shows the directory of each session after its last command, from
+`session exec` or from the attached prompt.
 
 ## Daemon and state directory
 
 The first `session new` starts one daemon (`wsh --daemon`) for each user. It
 listens on a Unix socket with mode 0600 and refuses a peer whose uid is not
-the same. A session is a child process of the daemon, as a tmux session is of
+the same. The daemon does not wait for a session: a request for a busy
+session, however large, waits in a queue, and other clients get answers. A session is a child process of the daemon, as a tmux session is of
 the tmux server, and ends with the daemon. Runs do not need the daemon: each
 run has its own small supervisor process that records its exit status.
 `run status`, `run logs` and `run wait` read the files directly.

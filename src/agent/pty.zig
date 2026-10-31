@@ -35,7 +35,7 @@ pub fn open(rows: u16, cols: u16) ?Pair {
     return .{ .master = master, .slave = slave };
 }
 
-fn setSize(fd: i32, rows: u16, cols: u16) void {
+pub fn setSize(fd: i32, rows: u16, cols: u16) void {
     var ws = posix.winsize{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
     _ = linux.ioctl(fd, linux.T.IOCSWINSZ, @intFromPtr(&ws));
 }
