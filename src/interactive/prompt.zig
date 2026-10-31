@@ -306,7 +306,9 @@ test "PS1 escapes decode like bash" {
     const arena = arena_state.allocator();
 
     const text = try render(&sh, arena, "[\\u@\\h \\W]\\[\\e[1m\\]\\101\\q\\\\x \\H \\w", "PS1");
-    try std.testing.expectEqualStrings("[dami@box a$(x)]\x1b[1mA\\q\\x box.example.org ~/a$(x)", text);
+    // `\\u` is the password-file name of the uid running the test, not $USER.
+    const expected = try std.fmt.allocPrint(arena, "[{s}@box a$(x)]\x1b[1mA\\q\\x box.example.org ~/a$(x)", .{try userName(&sh, arena)});
+    try std.testing.expectEqualStrings(expected, text);
 
     command_number = 7;
     const counters = try render(&sh, arena, "\\#|\\!|\\j|\\s", "PS1");
