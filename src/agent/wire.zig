@@ -210,12 +210,43 @@ pub fn parseJson(comptime T: type, arena: std.mem.Allocator, body: []const u8) ?
     return std.json.parseFromSliceLeaky(T, arena, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
 }
 
-fn unixAddress(path: []const u8) ?linux.sockaddr.un {
+/// A socket address for `path`. `sun_path` holds only 107 bytes, so a longer
+/// path (a deep `XDG_RUNTIME_DIR`) is reached through an open descriptor of
+/// its directory as `/proc/self/fd/N/NAME`; the caller closes `dir_fd` once
+/// the socket is bound or connected.
+const UnixAddress = struct {
+    addr: linux.sockaddr.un,
+    dir_fd: ?i32 = null,
+
+    fn release(self: UnixAddress) void {
+        if (self.dir_fd) |fd| _ = linux.close(fd);
+    }
+};
+
+fn unixAddress(path: []const u8) ?UnixAddress {
     var addr = linux.sockaddr.un{ .path = undefined };
-    if (path.len >= addr.path.len) return null;
     @memset(&addr.path, 0);
-    @memcpy(addr.path[0..path.len], path);
-    return addr;
+    if (path.len < addr.path.len) {
+        @memcpy(addr.path[0..path.len], path);
+        return .{ .addr = addr };
+    }
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (slash >= dir_buf.len) return null;
+    @memcpy(dir_buf[0..slash], path[0..slash]);
+    dir_buf[slash] = 0;
+    const rc = linux.openat(linux.AT.FDCWD, @ptrCast(&dir_buf), .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const dir_fd: i32 = @intCast(rc);
+    const short = std.fmt.bufPrint(&addr.path, "/proc/self/fd/{d}/{s}", .{ dir_fd, path[slash + 1 ..] }) catch {
+        _ = linux.close(dir_fd);
+        return null;
+    };
+    if (short.len >= addr.path.len) {
+        _ = linux.close(dir_fd);
+        return null;
+    }
+    return .{ .addr = addr, .dir_fd = dir_fd };
 }
 
 pub const ConnectError = error{ NoDaemon, PathTooLong, SocketFailed };
@@ -223,12 +254,13 @@ pub const ConnectError = error{ NoDaemon, PathTooLong, SocketFailed };
 /// Connects a stream socket to `path`. `NoDaemon` covers a missing socket
 /// file and one nobody listens on.
 pub fn connect(path: []const u8) ConnectError!i32 {
-    const addr = unixAddress(path) orelse return error.PathTooLong;
+    const address = unixAddress(path) orelse return error.PathTooLong;
+    defer address.release();
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
     const fd: i32 = @intCast(rc);
     while (true) {
-        switch (linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un)))) {
+        switch (linux.errno(linux.connect(fd, &address.addr, @sizeOf(linux.sockaddr.un)))) {
             .SUCCESS => return fd,
             .INTR => continue,
             else => {
@@ -242,13 +274,14 @@ pub fn connect(path: []const u8) ConnectError!i32 {
 /// A listening stream socket at `path`, mode 0600. A stale file must be
 /// removed first.
 pub fn listen(path: [:0]const u8) ?i32 {
-    const addr = unixAddress(path) orelse return null;
+    const address = unixAddress(path) orelse return null;
+    defer address.release();
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: i32 = @intCast(rc);
     // The umask decides the socket file's mode at bind time.
     const previous = sys.umask(0o177);
-    const bound = linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) == .SUCCESS;
+    const bound = linux.errno(linux.bind(fd, @ptrCast(&address.addr), @sizeOf(linux.sockaddr.un))) == .SUCCESS;
     _ = sys.umask(previous);
     if (!bound or linux.errno(linux.listen(fd, 64)) != .SUCCESS) {
         _ = linux.close(fd);

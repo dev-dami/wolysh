@@ -170,6 +170,7 @@ case("unterminated_single_quote", "echo 'abc", stderr=False)
 case("unterminated_backquote", "echo `x", stderr=False)
 case("heredoc_ended_by_end_of_file", "cat <<EOF\nbody", stderr=False)
 case("shift_past_the_end_is_quiet", "shift 2; echo $?; shopt -s shift_verbose; shift 2 2>/dev/null; echo $?")
+case("function_defined_after_and_or", "true && f() { echo x; }; f; false || g() { echo y; }; g; true && function m { echo m; }; m; false && n() { :; }; type -t n || echo none")
 case("function_named_fn", 'fn() { echo "args: $#"; }; fn a b c')
 case("xtrace_for_and_case", 'set -x; for i in "a b" c; do :; done; case "x y" in x*) echo m;; esac')
 

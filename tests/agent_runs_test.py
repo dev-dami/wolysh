@@ -255,6 +255,25 @@ class RunTests(AgentTestCase):
         self.assertFalse((self.state / "runs" / "group").exists())
         self.assertEqual(self.wsh("run", "status", "group").returncode, 1)
 
+    def test_sessions_work_under_a_long_state_directory(self):
+        # The socket path is longer than sun_path holds (107 bytes).
+        deep = os.path.join(self.runtime, "d" * 60, "e" * 40)
+        os.makedirs(deep, mode=0o700)
+        env = dict(self.env, XDG_RUNTIME_DIR=deep)
+        self.assertGreater(len(os.path.join(deep, "wsh", "daemon.sock")), 108)
+        try:
+            self.ok("session", "new", "deep", env=env)
+            self.ok("session", "exec", "deep", "--", "cd /tmp; Y=7", env=env)
+            self.assertEqual(self.ok("session", "exec", "deep", "--", "pwd; echo $Y", env=env).stdout, b"/tmp\n7\n")
+            self.assertEqual(os.stat(os.path.join(deep, "wsh", "daemon.sock")).st_mode & 0o777, 0o600)
+        finally:
+            self.wsh("session", "kill", "deep", env=env)
+            try:
+                with open(os.path.join(deep, "wsh", "daemon.pid")) as handle:
+                    os.kill(int(handle.read().strip()), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+
     def test_logs_answer_questions_within_a_budget(self):
         script = (
             "echo 'running 300 tests'; "

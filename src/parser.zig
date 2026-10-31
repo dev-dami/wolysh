@@ -1104,11 +1104,29 @@ pub const Parser = struct {
             const op: ast.ChainOp = if (self.tok.tag == .ampamp) .and_ else .or_;
             self.advance();
             while (self.tok.tag == .newline) self.advance();
-            const p = try self.parsePipeline();
+            // `cd dir && f() { ...; }` defines a function, as in Bash.
+            const p = (try self.tryParseDefinition()) orelse try self.parsePipeline();
             try links.append(self.arena, .{ .op = op, .pipeline = p });
         }
         first.links = try links.toOwnedSlice(self.arena);
         return first;
+    }
+
+    /// A function definition (`name() ...` or `function name ...`) as a
+    /// one-command pipeline, so it can stand where a command does in a list.
+    fn tryParseDefinition(self: *Parser) Error!?ast.Pipeline {
+        self.setMode(.word);
+        const start = self.tok.start;
+        const definition = if (isKeyword(self.tok, "function"))
+            try self.parseFunctionKeyword()
+        else if (self.tok.tag == .word)
+            try self.tryParsePosixFunction()
+        else
+            null;
+        const stmt = definition orelse return null;
+        const commands = try self.arena.alloc(ast.Command, 1);
+        commands[0] = .{ .words = &.{}, .redirects = &.{}, .compound = try self.newCompound(.{ .statement = stmt }, start) };
+        return .{ .commands = commands, .line = stmt.fn_decl.line };
     }
 
     fn parsePipeline(self: *Parser) Error!ast.Pipeline {
