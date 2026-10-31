@@ -89,3 +89,40 @@ speedup for external build tools.
 
 [Raw samples and binary checksums](results-linux-x86_64.json) accompany this
 table so the measurements can be inspected and rerun.
+
+## Recorded agent-feature run
+
+Measured on 2026-10-31 on Linux x86_64 with glibc 2.39, Bash 5.2.21, 15
+interleaved samples, the default workloads and a 20 MB synthetic test log.
+`wsh` is the ReleaseFast build with background runs, sessions and `out`;
+`baseline` is the ReleaseFast build of the commit before them (`b5b8232`),
+which has none of the agent commands. These numbers describe this machine and
+workload only.
+
+| Workload | Wolysh ms | Bash ms | Baseline ms | Bash / Wolysh |
+| --- | ---: | ---: | ---: | ---: |
+| Startup | 1.097 | 2.193 | 1.082 | 2.00x |
+| Arithmetic loop | 6.873 | 30.562 | 6.680 | 4.45x |
+| External commands | 155.171 | 164.671 | 153.183 | 1.06x |
+| Pipelines | 61.936 | 68.122 | 64.281 | 1.10x |
+| Wait next | 136.248 | 168.261 | 136.447 | 1.24x |
+| Parallel arithmetic | 9.536 | 45.916 | unavailable | 4.82x |
+| Parallel external | 15.041 | 39.291 | unavailable | 2.61x |
+| `run -d` | 1.643 | 2.344 | unavailable | 1.43x |
+| `run status` | 0.762 | 3.719 | unavailable | 4.88x |
+| `run logs --tail 50` | 0.861 | 3.257 | unavailable | 3.78x |
+| `session exec` | 1.096 | 1.965 | unavailable | 1.79x |
+| `out failures` | 19.244 | 29.318 | unavailable | 1.52x |
+| `out budget 4k` | 17.586 | 31.860 | unavailable | 1.81x |
+| `out find` | 18.905 | 33.677 | unavailable | 1.78x |
+| `run logs --failures` | 15.800 | - | unavailable | - |
+
+The shared workloads are within noise of the baseline, so the new features
+cost nothing when unused. The read-only `run` commands answer in under a
+millisecond on the fast path, about 4x quicker than the hand-written Bash
+equivalent, which starts a shell and then `wc` or `tail`. The `out` questions
+over 20 MB finish in about 16–19 ms. That is 1.5–1.8x quicker than the
+`grep`-based counterparts while answering more: names, locations, counts or a
+budgeted summary instead of matching lines.
+
+[Raw samples and binary checksums](results-agent-linux-x86_64.json) for this run.
