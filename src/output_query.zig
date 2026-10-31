@@ -441,7 +441,7 @@ fn wordWith(line: []const u8, at: usize, word: []const u8, suffixes: []const []c
 
 /// `kind`, or `.summary` when the keyword at `line[at..end]` is counted as
 /// zero: "0 failed", "no errors", "Failures: 0", "errors=0".
-fn zeroed(line: []const u8, at: usize, end: usize, kind: Kind) Kind {
+noinline fn zeroed(line: []const u8, at: usize, end: usize, kind: Kind) Kind {
     if (at >= 2 and line[at - 1] == ' ' and line[at - 2] == '0' and (at < 3 or !std.ascii.isDigit(line[at - 3]))) return .summary;
     if (at >= 3 and std.ascii.eqlIgnoreCase(line[at - 3 .. at], "no ") and (at < 4 or !word_byte[line[at - 4]])) return .summary;
     var i = end;
@@ -461,7 +461,7 @@ fn countBefore(line: []const u8, at: usize) bool {
 
 /// "exit status 1", "exit code: 2", "exited with code 0", "returned non-zero
 /// exit status 1": an error unless the status is 0.
-fn exitStatusKind(line: []const u8, at: usize) ?Kind {
+noinline fn exitStatusKind(line: []const u8, at: usize) ?Kind {
     var i = at + 4;
     if (std.ascii.startsWithIgnoreCase(line[i..], "ed with")) i += 7;
     if (std.ascii.startsWithIgnoreCase(line[i..], " code")) {
@@ -478,23 +478,32 @@ fn exitStatusKind(line: []const u8, at: usize) ?Kind {
     return if (value == 0) .summary else .@"error";
 }
 
-/// `std.mem.startsWith` for a literal prefix, unrolled: the recognizers
-/// make a dozen such checks per line and nearly all fail on the first byte.
+/// `std.mem.startsWith` for a literal prefix. The recognisers make a dozen
+/// such checks on every line, so the first eight bytes are compared inline
+/// as one integer, which is both fast and compact at each of the hundred
+/// call sites; longer literals compare the rest through one shared call.
 inline fn startsWith(s: []const u8, comptime prefix: []const u8) bool {
+    const n: usize = @min(prefix.len, 8);
+    const T = std.meta.Int(.unsigned, n * 8);
     if (s.len < prefix.len) return false;
-    inline for (prefix, 0..) |byte, i| {
-        if (s[i] != byte) return false;
-    }
-    return true;
+    if (std.mem.readInt(T, s[0..n], .little) != comptime std.mem.readInt(T, prefix[0..n], .little)) return false;
+    return prefix.len <= 8 or sameBytes(s[8..].ptr, prefix[8..]);
 }
 
+/// Like `startsWith`, comparing the last eight bytes, where lines differ.
 inline fn endsWith(s: []const u8, comptime suffix: []const u8) bool {
+    const n: usize = @min(suffix.len, 8);
+    const T = std.meta.Int(.unsigned, n * 8);
     if (s.len < suffix.len) return false;
-    const tail = s[s.len - suffix.len ..];
-    inline for (0..suffix.len) |k| {
-        // From the end, where lines differ first.
-        const i = suffix.len - 1 - k;
-        if (tail[i] != suffix[i]) return false;
+    if (std.mem.readInt(T, s[s.len - n ..][0..n], .little) != comptime std.mem.readInt(T, suffix[suffix.len - n ..][0..n], .little)) return false;
+    return suffix.len <= 8 or sameBytes(s[s.len - suffix.len ..].ptr, suffix[0 .. suffix.len - 8]);
+}
+
+/// Whether the `want.len` bytes at `at` are `want`; the caller has checked
+/// the length.
+noinline fn sameBytes(at: [*]const u8, want: []const u8) bool {
+    for (want, 0..) |byte, i| {
+        if (at[i] != byte) return false;
     }
     return true;
 }
@@ -533,7 +542,11 @@ pub fn writeJsonString(w: *Writer, s: []const u8) Writer.Error!void {
                 '\t' => try w.writeAll("\\t"),
                 0x08 => try w.writeAll("\\b"),
                 0x0c => try w.writeAll("\\f"),
-                0...0x07, 0x0b, 0x0e...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{byte}),
+                0...0x07, 0x0b, 0x0e...0x1f, 0x7f => {
+                    try w.writeAll("\\u00");
+                    try w.writeByte("0123456789abcdef"[byte >> 4]);
+                    try w.writeByte("0123456789abcdef"[byte & 15]);
+                },
                 else => try w.writeByte(byte),
             }
             i += 1;
@@ -588,21 +601,75 @@ fn utf8Length(s: []const u8) usize {
 
 /// The longest prefix of `s` no longer than `max` that does not split a
 /// UTF-8 sequence.
-fn utf8Prefix(s: []const u8, max: usize) []const u8 {
+noinline fn utf8Prefix(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     var cut = max;
     while (cut > 0 and (s[cut] & 0xc0) == 0x80) cut -= 1;
     return s[0..cut];
 }
 
+// Output is assembled from `writeAll` and these number writers rather than
+// `print`: every distinct format string instantiates its own formatting
+// code, and the builtin has dozens of them.
+
+/// `w.writeAll(bytes)` as one call. Writer's fast path would otherwise be
+/// inlined at each of the hundreds of places output is assembled.
+pub noinline fn put(w: *Writer, bytes: []const u8) Writer.Error!void {
+    return w.writeAll(bytes);
+}
+
+/// `w.writeByte(byte)` as one call, for the same reason as `put`.
+pub noinline fn putByte(w: *Writer, byte: u8) Writer.Error!void {
+    return w.writeByte(byte);
+}
+
+/// The decimal digits of `n`, written at the end of `buf`.
+pub fn formatNumber(buf: *[20]u8, n: u64) []const u8 {
+    var i: usize = buf.len;
+    var rest = n;
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(rest % 10));
+        rest /= 10;
+        if (rest == 0) break;
+    }
+    return buf[i..];
+}
+
+/// Writes `n` in decimal.
+pub fn writeNumber(w: *Writer, n: u64) Writer.Error!void {
+    var buf: [20]u8 = undefined;
+    try put(w, formatNumber(&buf, n));
+}
+
+/// Writes `n` in decimal, with a minus sign when negative.
+pub fn writeSigned(w: *Writer, n: i64) Writer.Error!void {
+    if (n < 0) try putByte(w, '-');
+    try writeNumber(w, @abs(n));
+}
+
 /// `n` with thousands separators: 1203331 is "1,203,331".
 pub fn writeGrouped(w: *Writer, n: u64) Writer.Error!void {
-    var digits: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&digits, "{d}", .{n}) catch unreachable;
+    var buf: [20]u8 = undefined;
+    const text = formatNumber(&buf, n);
     for (text, 0..) |digit, i| {
-        if (i != 0 and (text.len - i) % 3 == 0) try w.writeByte(',');
-        try w.writeByte(digit);
+        if (i != 0 and (text.len - i) % 3 == 0) try putByte(w, ',');
+        try putByte(w, digit);
     }
+}
+
+/// `text` as an unsigned decimal number: digits only, no overflow.
+pub fn parseNumber(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+    var n: u64 = 0;
+    for (text) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        const times = @mulWithOverflow(n, 10);
+        const plus = @addWithOverflow(times[0], c - '0');
+        if (times[1] != 0 or plus[1] != 0) return null;
+        n = plus[0];
+    }
+    return n;
 }
 
 fn digitCount(n: u64) usize {
@@ -806,12 +873,18 @@ const Budgeter = struct {
         };
     }
 
+    /// What showing `line` costs, cut to the long-line limit. Selection
+    /// asks this from several places, so it is one shared call.
+    noinline fn shownCost(self: *Budgeter, line: Line) Allocator.Error!usize {
+        return self.lineCost(line.number, try self.shownText(line), true);
+    }
+
     fn shownText(self: *Budgeter, line: Line) Allocator.Error![]const u8 {
         const raw = line.bytes(self.text);
         return if (self.options.raw) raw else self.cleaner.cleanLine(self.text, line);
     }
 
-    fn select(self: *Budgeter) Error!void {
+    noinline fn select(self: *Budgeter) Error!void {
         const n = self.total_lines;
         self.chosen = try std.DynamicBitSetUnmanaged.initEmpty(self.arena, @intCast(n + 2));
         // Virtual lines 0 and n+1 bound the text, so a gap at either end
@@ -835,7 +908,7 @@ const Budgeter = struct {
     }
 
     /// The tier's lines alternately from the front and the back.
-    fn addTier(self: *Budgeter, tier: usize) Error!void {
+    noinline fn addTier(self: *Budgeter, tier: usize) Error!void {
         const lines = try self.tiers[tier].lines(self.arena);
         var front: usize = 0;
         var back = lines.len;
@@ -851,9 +924,9 @@ const Budgeter = struct {
     /// A gap of a few short lines can cost less shown than described: two
     /// blank lines are two bytes, their marker about sixty. Such gaps are
     /// filled in, which only ever lowers the total.
-    fn fillShortGaps(self: *Budgeter) Error!void {
+    noinline fn fillShortGaps(self: *Budgeter) Error!void {
         const kept = try self.arena.dupe(Line, self.selected.items);
-        std.mem.sort(Line, kept, {}, lessByNumber);
+        std.sort.heap(Line, kept, {}, lessByNumber);
         var prev_number: u64 = 0;
         var prev_next: usize = 0;
         for (0..kept.len + 1) |i| {
@@ -862,7 +935,7 @@ const Budgeter = struct {
             if (gap >= 1 and gap <= 4) {
                 var cost: usize = 0;
                 var it = LineIterator.initAt(self.text, prev_next, prev_number);
-                for (0..@intCast(gap)) |_| cost += self.lineCost(it.number + 1, try self.shownText(it.next().?), true);
+                for (0..@intCast(gap)) |_| cost += try self.shownCost(it.next().?);
                 if (cost <= self.marker_max) {
                     it = LineIterator.initAt(self.text, prev_next, prev_number);
                     for (0..@intCast(gap)) |_| {
@@ -881,7 +954,7 @@ const Budgeter = struct {
     }
 
     /// The tail (newest first), then the head, while `used` stays within `limit`.
-    fn addEdges(self: *Budgeter, limit: usize) Error!void {
+    noinline fn addEdges(self: *Budgeter, limit: usize) Error!void {
         const kept = @min(self.tail_count, self.tail.len);
         var i: u64 = 0;
         while (i < kept) : (i += 1) {
@@ -897,7 +970,7 @@ const Budgeter = struct {
     /// so that they stay contiguous.
     fn addEdge(self: *Budgeter, line: Line, limit: usize) Error!bool {
         if (self.chosen.isSet(@intCast(line.number))) return true;
-        if (self.used + self.lineCost(line.number, try self.shownText(line), true) > limit) return false;
+        if (self.used + try self.shownCost(line) > limit) return false;
         _ = try self.tryAdd(line);
         return true;
     }
@@ -907,7 +980,7 @@ const Budgeter = struct {
     fn tryAdd(self: *Budgeter, line: Line) Error!bool {
         const index: usize = @intCast(line.number);
         if (self.chosen.isSet(index)) return true;
-        const cost = self.lineCost(line.number, try self.shownText(line), true);
+        const cost = try self.shownCost(line);
         const left = self.chosen.isSet(index - 1);
         const right = self.chosen.isSet(index + 1);
         // Taking a line out of the middle of a gap splits it in two; taking
@@ -923,7 +996,7 @@ const Budgeter = struct {
     }
 
     /// The longest a marker can be: every number at its largest.
-    fn markerBound(self: *Budgeter) Writer.Error!usize {
+    noinline fn markerBound(self: *Budgeter) Writer.Error!usize {
         var buf: [256]u8 = undefined;
         var w: Writer = .fixed(&buf);
         try self.writeMarker(&w, 1, @max(self.total_lines, 2), self.text.len);
@@ -931,37 +1004,51 @@ const Budgeter = struct {
         return w.end + digitCount(self.total_lines);
     }
 
-    fn writeMarker(self: *const Budgeter, w: *Writer, from: u64, to: u64, bytes: usize) Writer.Error!void {
+    noinline fn writeMarker(self: *const Budgeter, w: *Writer, from: u64, to: u64, bytes: usize) Writer.Error!void {
         const count = to - from + 1;
         switch (self.options.format) {
             .text => {
-                try w.writeAll("[… ");
+                try put(w, "[… ");
                 try writeGrouped(w, count);
-                try w.writeAll(if (count == 1) " line (" else " lines (");
+                try put(w, if (count == 1) " line (" else " lines (");
                 try writeGrouped(w, bytes);
-                try w.writeAll(if (bytes == 1) " byte) elided; " else " bytes) elided; ");
-                if (count == 1) {
-                    try w.print("line {d} …]\n", .{from});
-                } else {
-                    try w.print("lines {d}–{d} …]\n", .{ from, to });
+                try put(w, if (bytes == 1) " byte) elided; " else " bytes) elided; ");
+                try put(w, if (count == 1) "line " else "lines ");
+                try writeNumber(w, from);
+                if (count != 1) {
+                    try put(w, "–");
+                    try writeNumber(w, to);
                 }
+                try put(w, " …]\n");
             },
-            .json => try w.print("{{\"type\":\"elided\",\"from\":{d},\"to\":{d},\"lines\":{d},\"bytes\":{d}}}\n", .{ from, to, count, bytes }),
+            .json => {
+                try put(w, "{\"type\":\"elided\",\"from\":");
+                try writeNumber(w, from);
+                try put(w, ",\"to\":");
+                try writeNumber(w, to);
+                try put(w, ",\"lines\":");
+                try writeNumber(w, count);
+                try put(w, ",\"bytes\":");
+                try writeNumber(w, bytes);
+                try put(w, "}\n");
+            },
         }
     }
 
-    fn writeLine(self: *Budgeter, w: *Writer, line: Line, cut: bool) Error!void {
+    noinline fn writeLine(self: *Budgeter, w: *Writer, line: Line, cut: bool) Error!void {
         const shown = try self.shownText(line);
         const head = if (cut) utf8Prefix(shown, self.max_line) else shown;
         const dropped = shown.len - head.len;
         switch (self.options.format) {
             .text => {
-                try w.writeAll(head);
+                try put(w, head);
                 if (dropped != 0) try writeCutSuffix(w, dropped);
-                try w.writeByte('\n');
+                try putByte(w, '\n');
             },
             .json => {
-                try w.print("{{\"type\":\"line\",\"line\":{d},\"text\":", .{line.number});
+                try put(w, "{\"type\":\"line\",\"line\":");
+                try writeNumber(w, line.number);
+                try put(w, ",\"text\":");
                 if (dropped == 0) {
                     try writeJsonString(w, head);
                 } else {
@@ -973,23 +1060,25 @@ const Budgeter = struct {
                     var tmp: Writer.Allocating = .init(self.arena);
                     try writeJsonString(&tmp.writer, head);
                     const quoted = tmp.written();
-                    try w.writeAll(quoted[0 .. quoted.len - 1]);
-                    try w.writeAll(sw.buffered());
-                    try w.writeByte('"');
+                    try put(w, quoted[0 .. quoted.len - 1]);
+                    try put(w, sw.buffered());
+                    try putByte(w, '"');
                 }
-                try w.writeAll("}\n");
+                try put(w, "}\n");
             },
         }
     }
 
-    fn renderAll(self: *Budgeter, w: *Writer) Error!void {
+    noinline fn renderAll(self: *Budgeter, w: *Writer) Error!void {
         var it = LineIterator.init(self.text);
         while (it.next()) |line| try self.writeLine(w, line, false);
     }
 
-    fn renderSelected(self: *Budgeter, w: *Writer) Error!void {
+    noinline fn renderSelected(self: *Budgeter, w: *Writer) Error!void {
         const lines = self.selected.items;
-        std.mem.sort(Line, lines, {}, lessByNumber);
+        // Heap sort: no extra memory, and a fraction of the code of the
+        // stable block sort behind `std.mem.sort`; line numbers are unique.
+        std.sort.heap(Line, lines, {}, lessByNumber);
         var prev_number: u64 = 0;
         var prev_next: usize = 0;
         for (lines) |line| {
@@ -1012,7 +1101,9 @@ fn cutSuffixLen(dropped: usize) usize {
 }
 
 fn writeCutSuffix(w: *Writer, dropped: usize) Writer.Error!void {
-    try w.print(" … [+{d} bytes]", .{dropped});
+    try put(w, " … [+");
+    try writeNumber(w, dropped);
+    try put(w, " bytes]");
 }
 
 // --- fuzzy find ------------------------------------------------------------------
@@ -1085,7 +1176,7 @@ pub fn fuzzyFind(arena: Allocator, text: []const u8, query: []const u8, limit: u
         const cleaned = try cleanAlloc(arena, candidate.line.bytes(text));
         var positions: std.ArrayList(u32) = .empty;
         for (terms.items) |term| _ = try matcher.match(cleaned, term, case_sensitive, &positions);
-        std.mem.sort(u32, positions.items, {}, std.sort.asc(u32));
+        std.sort.heap(u32, positions.items, {}, std.sort.asc(u32));
         winners[index] = .{
             .line = candidate.line,
             .text = cleaned,
@@ -1320,8 +1411,9 @@ pub fn failures(arena: Allocator, text: []const u8) Allocator.Error!Report {
     var it = LineIterator.init(text);
     while (it.next()) |line| {
         const cleaned = try cleaner.cleanLine(text, line);
-        try r.feed(line.number, cleaned, classify(cleaned));
+        r.feed(line.number, cleaned, classify(cleaned));
     }
+    if (r.out_of_memory) return error.OutOfMemory;
     return r.report();
 }
 
@@ -1365,8 +1457,9 @@ pub fn stats(arena: Allocator, text: []const u8) Allocator.Error!Stats {
             },
             else => {},
         }
-        try r.feed(line.number, cleaned, kind);
+        r.feed(line.number, cleaned, kind);
     }
+    if (r.out_of_memory) return error.OutOfMemory;
     s.lines = it.number;
     s.frameworks = r.frameworks;
     return s;
@@ -1400,7 +1493,10 @@ const Recognizer = struct {
     /// `go test -v`: the test whose `=== RUN` came last, and the first log
     /// line each test printed.
     go_current: ?[]const u8 = null,
-    go_logs: std.StringHashMapUnmanaged(GoLog) = .empty,
+    go_logs: std.ArrayList(GoLog) = .empty,
+    /// Index into `go_logs` by test name. The same map type as `by_name`,
+    /// so its code is shared.
+    go_log_index: std.StringHashMapUnmanaged(u32) = .empty,
     /// Zig's `N/M name...` header, when its result is still to come.
     zig_name: ?[]const u8 = null,
     zig_message: ?[]const u8 = null,
@@ -1417,6 +1513,10 @@ const Recognizer = struct {
     numbered_line: u64 = 0,
     numbered_open: bool = false,
     last_jest_suite: ?u32 = null,
+    /// An allocation failed. Rather than every call returning an error
+    /// union, the recogniser carries on keeping less and `failures` reports
+    /// the failure at the end.
+    out_of_memory: bool = false,
 
     const GoLog = struct { location: []const u8, message: []const u8 };
 
@@ -1433,12 +1533,22 @@ const Recognizer = struct {
         self.frameworks.insert(framework);
     }
 
-    fn dupe(self: *Recognizer, s: []const u8) Allocator.Error![]const u8 {
-        return self.arena.dupe(u8, utf8Prefix(trim(s), max_field));
+    noinline fn dupe(self: *Recognizer, s: []const u8) []const u8 {
+        return self.arena.dupe(u8, utf8Prefix(trim(s), max_field)) catch self.noMemory("");
+    }
+
+    noinline fn concat(self: *Recognizer, parts: []const []const u8) []const u8 {
+        return std.mem.concat(self.arena, u8, parts) catch self.noMemory("");
+    }
+
+    /// Notes an allocation failure and returns `value`.
+    fn noMemory(self: *Recognizer, value: anytype) @TypeOf(value) {
+        self.out_of_memory = true;
+        return value;
     }
 
     /// Records a failure, or returns the one already recorded under `name`.
-    fn add(self: *Recognizer, framework: Framework, name_text: []const u8, line: u64) Allocator.Error!?u32 {
+    noinline fn add(self: *Recognizer, framework: Framework, name_text: []const u8, line: u64) ?u32 {
         self.detect(framework);
         const name = utf8Prefix(trim(name_text), max_field);
         if (self.by_name.get(name)) |index| return index;
@@ -1446,27 +1556,27 @@ const Recognizer = struct {
             self.omitted += 1;
             return null;
         }
-        const owned = try self.arena.dupe(u8, name);
+        const owned = self.arena.dupe(u8, name) catch return self.noMemory(@as(?u32, null));
         const index: u32 = @intCast(self.list.items.len);
-        try self.list.append(self.arena, .{ .framework = framework, .name = owned, .line = line });
-        try self.by_name.put(self.arena, owned, index);
+        self.list.append(self.arena, .{ .framework = framework, .name = owned, .line = line }) catch return self.noMemory(@as(?u32, null));
+        self.by_name.put(self.arena, owned, index) catch return self.noMemory(@as(?u32, index));
         return index;
     }
 
     /// Like `add`, for runners that print a short name first (`✕ adds`) and
     /// the full path later (`● sum › adds`): the full name replaces the
     /// short one instead of making a second entry.
-    fn addNested(self: *Recognizer, framework: Framework, name_text: []const u8, line: u64) Allocator.Error!?u32 {
+    noinline fn addNested(self: *Recognizer, framework: Framework, name_text: []const u8, line: u64) ?u32 {
         const name = utf8Prefix(trim(name_text), max_field);
         if (self.by_name.get(name) == null) {
-            inline for ([_][]const u8{ " › ", " > " }) |separator| {
+            for ([_][]const u8{ " › ", " > " }) |separator| {
                 var from: usize = 0;
                 while (findPos(name, from, separator)) |at| {
                     const suffix = name[at + separator.len ..];
                     if (self.by_name.get(suffix)) |index| {
-                        const owned = try self.arena.dupe(u8, name);
+                        const owned = self.arena.dupe(u8, name) catch return self.noMemory(@as(?u32, index));
                         self.list.items[index].name = owned;
-                        try self.by_name.put(self.arena, owned, index);
+                        self.by_name.put(self.arena, owned, index) catch return self.noMemory(@as(?u32, index));
                         self.detect(framework);
                         return index;
                     }
@@ -1477,26 +1587,26 @@ const Recognizer = struct {
         return self.add(framework, name, line);
     }
 
-    fn setReason(self: *Recognizer, index: ?u32, reason: []const u8) Allocator.Error!void {
+    noinline fn setReason(self: *Recognizer, index: ?u32, reason: []const u8) void {
         const i = index orelse return;
         const text = trim(reason);
         if (text.len == 0 or self.list.items[i].reason != null) return;
-        self.list.items[i].reason = try self.dupe(text);
+        self.list.items[i].reason = self.dupe(text);
     }
 
-    fn setLocation(self: *Recognizer, index: ?u32, location: []const u8) Allocator.Error!void {
+    noinline fn setLocation(self: *Recognizer, index: ?u32, location: []const u8) void {
         const i = index orelse return;
-        self.list.items[i].location = try self.dupe(location);
+        self.list.items[i].location = self.dupe(location);
     }
 
-    fn addCounts(self: *Recognizer, framework: Framework, counts: Counts) void {
+    noinline fn addCounts(self: *Recognizer, framework: Framework, counts: Counts) void {
         self.detect(framework);
         if (counts.passed) |n| self.counts.passed = (self.counts.passed orelse 0) + n;
         if (counts.failed) |n| self.counts.failed = (self.counts.failed orelse 0) + n;
         if (counts.skipped) |n| self.counts.skipped = (self.counts.skipped orelse 0) + n;
     }
 
-    fn feed(self: *Recognizer, number: u64, line: []const u8, kind: Kind) Allocator.Error!void {
+    fn feed(self: *Recognizer, number: u64, line: []const u8, kind: Kind) void {
         const t = trimLeft(line);
         if (t.len == 0) {
             self.cargo_list = false;
@@ -1506,13 +1616,13 @@ const Recognizer = struct {
             };
             return;
         }
-        if (self.pending != null and try self.consumePending(t)) return;
-        if (self.unittest_failure != null and try self.unittestTrace(line, t)) return;
-        if (self.traceback and try self.pythonTrace(number, line, t)) return;
-        if (self.numbered != .none and try self.numberedLine(number, line, t)) return;
+        if (self.pending != null and self.consumePending(t)) return;
+        if (self.unittest_failure != null and self.unittestTrace(line, t)) return;
+        if (self.traceback and self.pythonTrace(number, line, t)) return;
+        if (self.numbered != .none and self.numberedLine(number, line, t)) return;
         if (self.cargo_list) {
             if (startsWith(line, "    ")) {
-                _ = try self.add(.cargo, t, number);
+                _ = self.add(.cargo, t, number);
                 return;
             }
             self.cargo_list = false;
@@ -1520,7 +1630,7 @@ const Recognizer = struct {
         if (self.cargo_section) |index| {
             if (startsWith(t, "thread '")) {
                 if (find(t, "panicked at ")) |at| {
-                    try self.cargoPanic(index, t[at + "panicked at ".len ..]);
+                    self.cargoPanic(index, t[at + "panicked at ".len ..]);
                     return;
                 }
             }
@@ -1529,58 +1639,60 @@ const Recognizer = struct {
         // Maven prefixes its lines with a level.
         var body = t;
         var bracketed = false;
-        inline for ([_][]const u8{ "[ERROR] ", "[INFO] ", "[WARNING] ", "[WARN] " }) |prefix| {
-            if (startsWith(t, prefix)) {
-                body = trimLeft(t[prefix.len..]);
-                bracketed = true;
-                break;
+        if (t[0] == '[') {
+            for ([_][]const u8{ "[ERROR] ", "[INFO] ", "[WARNING] ", "[WARN] " }) |prefix| {
+                if (std.mem.startsWith(u8, t, prefix)) {
+                    body = trimLeft(t[prefix.len..]);
+                    bracketed = true;
+                    break;
+                }
             }
         }
         if (body.len == 0) return;
 
-        if (try self.cargo(number, line, body)) return;
-        if (try self.pytest(number, line, body)) return;
-        if (try self.goTest(number, line, body)) return;
-        if (try self.jest(number, body)) return;
-        if (try self.zigTest(number, body)) return;
-        if (try self.unittest(number, line)) return;
-        if (try self.junit(number, line, body, bracketed)) return;
-        if (try self.mochaOrRspec(number, line, body)) return;
-        if (kind == .@"error") _ = try self.generic(number, line, t);
+        if (self.cargo(number, line, body)) return;
+        if (self.pytest(number, line, body)) return;
+        if (self.goTest(number, line, body)) return;
+        if (self.jest(number, body)) return;
+        if (self.zigTest(number, body)) return;
+        if (self.unittest(number, line)) return;
+        if (self.junit(number, line, body, bracketed)) return;
+        if (self.mochaOrRspec(number, line, body)) return;
+        if (kind == .@"error") _ = self.generic(number, line, t);
     }
 
-    fn consumePending(self: *Recognizer, t: []const u8) Allocator.Error!bool {
+    noinline fn consumePending(self: *Recognizer, t: []const u8) bool {
         const p = self.pending.?;
         self.pending = null;
         switch (p) {
             .reason => |index| {
-                try self.setReason(index, t);
+                self.setReason(index, t);
                 return true;
             },
             .go_log => |index| {
                 const log = parseGoLog(t) orelse return false;
-                try self.setLocation(index, log.location);
-                try self.setReason(index, log.message);
+                self.setLocation(index, log.location);
+                self.setReason(index, log.message);
                 return true;
             },
             .arrow => |index| {
                 if (!startsWith(t, "→ ")) return false;
-                try self.setReason(index, t["→ ".len..]);
+                self.setReason(index, t["→ ".len..]);
                 return true;
             },
             .rust_location => |info| {
                 if (!startsWith(t, "--> ")) return false;
                 const location = trim(t[4..]);
-                const index = try self.add(.generic, location, info.line);
-                try self.setLocation(index, location);
-                try self.setReason(index, info.message);
+                const index = self.add(.generic, location, info.line);
+                self.setLocation(index, location);
+                self.setReason(index, info.message);
                 return true;
             },
         }
     }
 
     // cargo test
-    fn cargo(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    fn cargo(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         switch (t[0]) {
             'r' => if (startsWith(t, "running ") and (endsWith(t, " tests") or endsWith(t, " test"))) {
                 self.detect(.cargo);
@@ -1600,7 +1712,7 @@ const Recognizer = struct {
                     const at = find(line, " ... ") orelse return false;
                     const outcome = line[at + 5 ..];
                     if (startsWith(outcome, "FAILED")) {
-                        _ = try self.add(.cargo, line[5..at], number);
+                        _ = self.add(.cargo, line[5..at], number);
                     } else if (startsWith(outcome, "ok") or startsWith(outcome, "ignored") or startsWith(outcome, "bench")) {
                         self.detect(.cargo);
                     } else return false;
@@ -1609,10 +1721,8 @@ const Recognizer = struct {
             },
             '-' => if (startsWith(t, "---- ") and endsWith(t, " ----") and t.len > 10) {
                 var name = t[5 .. t.len - 5];
-                inline for ([_][]const u8{ " stdout", " stderr" }) |stream| {
-                    if (endsWith(name, stream)) name = name[0 .. name.len - stream.len];
-                }
-                self.cargo_section = try self.add(.cargo, name, number);
+                if (endsWith(name, " stdout") or endsWith(name, " stderr")) name = name[0 .. name.len - " stdout".len];
+                self.cargo_section = self.add(.cargo, name, number);
                 return true;
             },
             'f' => if (std.mem.eql(u8, t, "failures:") and self.frameworks.contains(.cargo)) {
@@ -1627,34 +1737,35 @@ const Recognizer = struct {
 
     /// `thread 'x' panicked at src/lib.rs:6:29:` with the message on the next
     /// line, or the older `panicked at 'message', src/lib.rs:6:29`.
-    fn cargoPanic(self: *Recognizer, index: u32, rest: []const u8) Allocator.Error!void {
+    noinline fn cargoPanic(self: *Recognizer, index: u32, rest: []const u8) void {
         if (rest.len > 0 and rest[0] == '\'') {
             if (findLast(rest, "', ")) |close| {
-                try self.setReason(index, rest[1..close]);
-                try self.setLocation(index, rest[close + 3 ..]);
+                self.setReason(index, rest[1..close]);
+                self.setLocation(index, rest[close + 3 ..]);
                 return;
             }
         }
-        try self.setLocation(index, std.mem.trimEnd(u8, rest, ":"));
+        self.setLocation(index, std.mem.trimEnd(u8, rest, ":"));
         self.pending = .{ .reason = index };
     }
 
     // pytest
-    fn pytest(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    fn pytest(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         // Each recogniser first rules lines out by their first byte, which
         // settles nearly every line of a long log with one comparison.
         switch (t[0]) {
             'F', 'E', 'P', 'S', 'c', '=', '0'...'9' => {},
             else => if (!endsWith(t, "%]")) return false,
         }
-        inline for ([_][]const u8{ "FAILED ", "ERROR " }) |prefix| {
-            if (startsWith(line, prefix) and line.len > prefix.len and line[prefix.len] != '(') {
-                const rest = line[prefix.len..];
-                const dash = find(rest, " - ");
-                const index = try self.add(.pytest, if (dash) |at| rest[0..at] else rest, number);
-                if (dash) |at| try self.setReason(index, rest[at + 3 ..]);
-                return true;
-            }
+        // Each check picks the length of the literal it matched, so the
+        // rule's body exists once rather than once per spelling.
+        const result_len: usize = if (startsWith(line, "FAILED ")) 7 else if (startsWith(line, "ERROR ")) 6 else 0;
+        if (result_len != 0 and line.len > result_len and line[result_len] != '(') {
+            const rest = line[result_len..];
+            const dash = find(rest, " - ");
+            const index = self.add(.pytest, if (dash) |at| rest[0..at] else rest, number);
+            if (dash) |at| self.setReason(index, rest[at + 3 ..]);
+            return true;
         }
         if (startsWith(t, "collected ") or startsWith(t, "collecting ") or
             startsWith(line, "PASSED ") or startsWith(line, "SKIPPED "))
@@ -1664,10 +1775,10 @@ const Recognizer = struct {
         }
         // Verbose and progress lines end with a percentage.
         if (endsWith(t, "%]")) {
-            inline for ([_][]const u8{ " FAILED", " ERROR" }) |word| {
+            for ([_][]const u8{ " FAILED", " ERROR" }) |word| {
                 if (find(t, word)) |at| {
                     if (find(t[0..at], "::") != null) {
-                        _ = try self.add(.pytest, t[0..at], number);
+                        _ = self.add(.pytest, t[0..at], number);
                         return true;
                     }
                 }
@@ -1689,7 +1800,7 @@ const Recognizer = struct {
     }
 
     // go test
-    fn goTest(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    fn goTest(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         switch (t[0]) {
             '=', '-', 'o', 'F', 'P' => {},
             // Otherwise only the indented log lines of a run already seen.
@@ -1697,18 +1808,19 @@ const Recognizer = struct {
         }
         if (startsWith(t, "=== RUN ")) {
             self.detect(.go);
-            self.go_current = try self.arena.dupe(u8, trim(t["=== RUN ".len..]));
+            self.go_current = self.dupe(t["=== RUN ".len..]);
             return true;
         }
         if (startsWith(t, "=== PAUSE ") or startsWith(t, "=== CONT ")) return true;
         if (startsWith(t, "--- FAIL: ")) {
             const rest = t["--- FAIL: ".len..];
             const name = if (findLast(rest, " (")) |at| rest[0..at] else rest;
-            const index = try self.add(.go, name, number);
+            const index = self.add(.go, name, number);
             self.addCounts(.go, .{ .failed = 1 });
-            if (self.go_logs.get(trim(name))) |log| {
-                try self.setLocation(index, log.location);
-                try self.setReason(index, log.message);
+            if (self.go_log_index.get(utf8Prefix(trim(name), max_field))) |log_index| {
+                const log = self.go_logs.items[log_index];
+                self.setLocation(index, log.location);
+                self.setReason(index, log.message);
             } else if (index) |i| {
                 self.pending = .{ .go_log = i };
             }
@@ -1725,8 +1837,8 @@ const Recognizer = struct {
         if (startsWith(line, "ok  \t") or startsWith(line, "FAIL\t")) {
             self.detect(.go);
             if (find(line, " [build failed]") orelse find(line, " [setup failed]")) |at| {
-                const index = try self.add(.go, line[5..at], number);
-                try self.setReason(index, line[at + 2 .. line.len - 1]);
+                const index = self.add(.go, line[5..at], number);
+                self.setReason(index, line[at + 2 .. line.len - 1]);
             }
             return true;
         }
@@ -1735,11 +1847,17 @@ const Recognizer = struct {
             if (line.len > t.len) {
                 if (parseGoLog(t)) |log| {
                     if (self.go_current) |name| {
-                        const entry = try self.go_logs.getOrPut(self.arena, name);
-                        if (!entry.found_existing) entry.value_ptr.* = .{
-                            .location = try self.dupe(log.location),
-                            .message = try self.dupe(log.message),
-                        };
+                        const entry = self.go_log_index.getOrPut(self.arena, name) catch return self.noMemory(true);
+                        if (!entry.found_existing) {
+                            entry.value_ptr.* = @intCast(self.go_logs.items.len);
+                            self.go_logs.append(self.arena, .{
+                                .location = self.dupe(log.location),
+                                .message = self.dupe(log.message),
+                            }) catch {
+                                _ = self.go_log_index.remove(name);
+                                return self.noMemory(true);
+                            };
+                        }
                     }
                     return true;
                 }
@@ -1749,7 +1867,7 @@ const Recognizer = struct {
     }
 
     // Jest and Vitest
-    fn jest(self: *Recognizer, number: u64, t: []const u8) Allocator.Error!bool {
+    fn jest(self: *Recognizer, number: u64, t: []const u8) bool {
         switch (t[0]) {
             // `●`, `✕`, `✗` and `❯` start with 0xe2, `×` with 0xc3.
             'P', 'F', 'T', 0xc3, 0xe2 => {},
@@ -1764,10 +1882,10 @@ const Recognizer = struct {
             const rest = trimLeft(t[5..]);
             if (rest.len == 0 or rest[0] == '(' or !looksLikePath(rest)) return false;
             if (find(rest, " > ") != null) {
-                const index = try self.addNested(.vitest, rest, number);
+                const index = self.addNested(.vitest, rest, number);
                 if (index) |i| self.pending = .{ .reason = i };
             } else {
-                self.last_jest_suite = try self.add(if (vitest_seen) .vitest else .jest, rest, number);
+                self.last_jest_suite = self.add(if (vitest_seen) .vitest else .jest, rest, number);
             }
             return true;
         }
@@ -1778,18 +1896,16 @@ const Recognizer = struct {
                 if (self.last_jest_suite) |i| self.pending = .{ .reason = i };
                 return true;
             }
-            const index = try self.addNested(.jest, name, number);
+            const index = self.addNested(.jest, name, number);
             if (index) |i| self.pending = .{ .reason = i };
             return true;
         }
-        inline for ([_][]const u8{ "✕ ", "✗ " }) |mark| {
-            if (startsWith(t, mark)) {
-                _ = try self.addNested(.jest, stripDuration(t[mark.len..]), number);
-                return true;
-            }
+        if (startsWith(t, "✕ ") or startsWith(t, "✗ ")) {
+            _ = self.addNested(.jest, stripDuration(t["✕ ".len..]), number);
+            return true;
         }
         if (startsWith(t, "× ")) {
-            const index = try self.addNested(.vitest, stripDuration(t["× ".len..]), number);
+            const index = self.addNested(.vitest, stripDuration(t["× ".len..]), number);
             if (index) |i| self.pending = .{ .arrow = i };
             return true;
         }
@@ -1814,7 +1930,7 @@ const Recognizer = struct {
 
     // Zig: the test runner (`2/3 main.test.fails...FAIL (TestExpectedEqual)`)
     // and the build system (`error: 'main.test.fails' failed:`).
-    fn zigTest(self: *Recognizer, number: u64, t: []const u8) Allocator.Error!bool {
+    fn zigTest(self: *Recognizer, number: u64, t: []const u8) bool {
         switch (t[0]) {
             '0'...'9', 'F', 'A', 'e', 'B' => {},
             else => return false,
@@ -1825,14 +1941,14 @@ const Recognizer = struct {
                 self.zig_name = null;
                 if (std.mem.eql(u8, header.rest, "OK") or std.mem.eql(u8, header.rest, "SKIP")) return true;
                 if (startsWith(header.rest, "FAIL (")) {
-                    const index = try self.add(.zig, header.name, number);
-                    try self.setReason(index, parenthesised(header.rest));
+                    const index = self.add(.zig, header.name, number);
+                    self.setReason(index, parenthesised(header.rest));
                     return true;
                 }
                 // The failure message interrupts the header; `FAIL (...)` follows.
-                self.zig_name = try self.dupe(header.name);
+                self.zig_name = self.dupe(header.name);
                 self.zig_line = number;
-                self.zig_message = if (trim(header.rest).len != 0) try self.dupe(header.rest) else null;
+                self.zig_message = if (trim(header.rest).len != 0) self.dupe(header.rest) else null;
                 return true;
             }
             // `1 passed; 1 skipped; 1 failed.`
@@ -1843,23 +1959,23 @@ const Recognizer = struct {
         }
         if (startsWith(t, "FAIL (")) {
             const name = self.zig_name orelse return false;
-            const index = try self.add(.zig, name, self.zig_line);
-            try self.setReason(index, self.zig_message orelse parenthesised(t));
+            const index = self.add(.zig, name, self.zig_line);
+            self.setReason(index, self.zig_message orelse parenthesised(t));
             self.zig_name = null;
             return true;
         }
         if (startsWith(t, "All ") and endsWith(t, " tests passed.")) {
-            const n = std.fmt.parseInt(u64, t[4 .. t.len - " tests passed.".len], 10) catch return false;
+            const n = parseNumber(t[4 .. t.len - " tests passed.".len]) orelse return false;
             self.addCounts(.zig, .{ .passed = n, .failed = 0 });
             return true;
         }
         if (startsWith(t, "error: '")) {
             const rest = t["error: '".len..];
             const close = find(rest, "' failed") orelse return false;
-            const index = try self.add(.zig, rest[0..close], number);
+            const index = self.add(.zig, rest[0..close], number);
             const after = trim(std.mem.trimStart(u8, rest[close + "' failed".len ..], ":"));
             if (after.len != 0) {
-                try self.setReason(index, after);
+                self.setReason(index, after);
             } else if (index) |i| {
                 self.pending = .{ .reason = i };
             }
@@ -1873,7 +1989,7 @@ const Recognizer = struct {
             while (start > 0 and t[start - 1] != ' ' and t[start - 1] != ';') start -= 1;
             const slash = std.mem.indexOfScalar(u8, t[start..at], '/') orelse return true;
             var counts = parseCounts(t[at..]);
-            counts.passed = std.fmt.parseInt(u64, t[start .. start + slash], 10) catch null;
+            counts.passed = parseNumber(t[start .. start + slash]);
             if (counts.failed == null) counts.failed = 0;
             self.addCounts(.zig, counts);
             return true;
@@ -1882,18 +1998,16 @@ const Recognizer = struct {
     }
 
     // Python's unittest
-    fn unittest(self: *Recognizer, number: u64, line: []const u8) Allocator.Error!bool {
-        inline for ([_][]const u8{ "FAIL: ", "ERROR: " }) |prefix| {
-            if (startsWith(line, prefix) and endsWith(line, ")") and find(line, " (") != null) {
-                self.unittest_failure = try self.add(.unittest, line[prefix.len..], number);
-                return true;
-            }
+    fn unittest(self: *Recognizer, number: u64, line: []const u8) bool {
+        const header_len: usize = if (startsWith(line, "FAIL: ")) 6 else if (startsWith(line, "ERROR: ")) 7 else 0;
+        if (header_len != 0 and endsWith(line, ")") and find(line, " (") != null) {
+            self.unittest_failure = self.add(.unittest, line[header_len..], number);
+            return true;
         }
-        inline for ([_][]const u8{ " ... FAIL", " ... ERROR" }) |suffix| {
-            if (endsWith(line, suffix)) {
-                _ = try self.add(.unittest, line[0 .. line.len - suffix.len], number);
-                return true;
-            }
+        const verdict_len: usize = if (endsWith(line, " ... FAIL")) 9 else if (endsWith(line, " ... ERROR")) 10 else 0;
+        if (verdict_len != 0) {
+            _ = self.add(.unittest, line[0 .. line.len - verdict_len], number);
+            return true;
         }
         if (endsWith(line, " ... ok") or endsWith(line, " ... expected failure") or
             (startsWith(line, "test") and find(line, " ... skipped") != null))
@@ -1903,7 +2017,7 @@ const Recognizer = struct {
         }
         if (startsWith(line, "Ran ") and find(line, " test") != null) {
             const end = std.mem.indexOfScalarPos(u8, line, 4, ' ') orelse return false;
-            self.unittest_ran = std.fmt.parseInt(u64, line[4..end], 10) catch return false;
+            self.unittest_ran = parseNumber(line[4..end]) orelse return false;
             self.detect(.unittest);
             return true;
         }
@@ -1926,17 +2040,17 @@ const Recognizer = struct {
 
     /// Inside a unittest failure: the innermost `File` frame is the
     /// location, the exception line that ends the traceback the reason.
-    fn unittestTrace(self: *Recognizer, line: []const u8, t: []const u8) Allocator.Error!bool {
+    noinline fn unittestTrace(self: *Recognizer, line: []const u8, t: []const u8) bool {
         if (startsWith(line, "===") or startsWith(line, "Ran ")) {
             self.unittest_failure = null;
             return false;
         }
         if (startsWith(t, "File \"")) {
-            if (parsePythonFrame(t)) |frame| try self.setLocation(self.unittest_failure, try std.fmt.allocPrint(self.arena, "{s}:{s}", .{ frame.path, frame.line }));
+            if (parsePythonFrame(t)) |frame| self.setLocation(self.unittest_failure, self.concat(&.{ frame.path, ":", frame.line }));
             return true;
         }
         if (line[0] != ' ' and !startsWith(line, "Traceback") and !startsWith(line, "---")) {
-            try self.setReason(self.unittest_failure, line);
+            self.setReason(self.unittest_failure, line);
             self.unittest_failure = null;
         }
         return true;
@@ -1944,22 +2058,22 @@ const Recognizer = struct {
 
     /// A Python traceback outside unittest becomes a generic failure at its
     /// innermost frame.
-    fn pythonTrace(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    noinline fn pythonTrace(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         if (startsWith(t, "File \"")) {
-            if (parsePythonFrame(t)) |frame| self.traceback_location = try std.fmt.allocPrint(self.arena, "{s}:{s}", .{ frame.path, frame.line });
+            if (parsePythonFrame(t)) |frame| self.traceback_location = self.concat(&.{ frame.path, ":", frame.line });
             return true;
         }
         if (line[0] == ' ' or startsWith(line, "Traceback")) return true;
         self.traceback = false;
         const location = self.traceback_location orelse return false;
-        const index = try self.add(.generic, location, number);
-        try self.setLocation(index, location);
-        try self.setReason(index, line);
+        const index = self.add(.generic, location, number);
+        self.setLocation(index, location);
+        self.setReason(index, line);
         return true;
     }
 
     // Maven Surefire and Gradle (JUnit)
-    fn junit(self: *Recognizer, number: u64, line: []const u8, body: []const u8, bracketed: bool) Allocator.Error!bool {
+    fn junit(self: *Recognizer, number: u64, line: []const u8, body: []const u8, bracketed: bool) bool {
         if (startsWith(body, "Tests run: ")) {
             self.detect(.junit);
             // Per-class lines carry a time; the totals line does not.
@@ -1979,7 +2093,7 @@ const Recognizer = struct {
             var name = body[0..marker];
             if (find(name, "Time elapsed")) |at| name = name[0..at];
             name = std.mem.trimEnd(u8, name, " -");
-            const index = try self.add(.junit, name, number);
+            const index = self.add(.junit, name, number);
             if (index) |i| self.pending = .{ .reason = i };
             return true;
         }
@@ -1987,7 +2101,7 @@ const Recognizer = struct {
             endsWith(line, "ED") and find(line, " > ") != null)
         {
             if (endsWith(line, " FAILED")) {
-                const index = try self.add(.junit, line[0 .. line.len - " FAILED".len], number);
+                const index = self.add(.junit, line[0 .. line.len - " FAILED".len], number);
                 if (index) |i| self.pending = .{ .reason = i };
                 return true;
             }
@@ -2004,7 +2118,7 @@ const Recognizer = struct {
         return false;
     }
 
-    fn mochaOrRspec(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    fn mochaOrRspec(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         switch (t[0]) {
             '0'...'9', 'F', 'r' => {},
             else => return false,
@@ -2040,8 +2154,8 @@ const Recognizer = struct {
         }
         if (startsWith(line, "rspec ")) {
             const hash = find(line, " # ") orelse return false;
-            const index = try self.addNested(.rspec, line[hash + 3 ..], number);
-            try self.setLocation(index, line["rspec ".len..hash]);
+            const index = self.addNested(.rspec, line[hash + 3 ..], number);
+            self.setLocation(index, line["rspec ".len..hash]);
             return true;
         }
         if (startsWith(line, "Finished in ") and self.numbered == .rspec) {
@@ -2053,11 +2167,11 @@ const Recognizer = struct {
 
     /// Mocha's `  1) Suite` / `       nested` / `         title:` and RSpec's
     /// `  1) Description`, each followed by the message.
-    fn numberedLine(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    noinline fn numberedLine(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         if (line[0] == ' ') {
             if (numberedEntry(t)) |title| {
                 self.numbered_name.clearRetainingCapacity();
-                try self.numbered_name.appendSlice(self.arena, title);
+                self.numbered_name.appendSlice(self.arena, title) catch return self.noMemory(true);
                 self.numbered_line = number;
                 self.numbered_open = true;
                 if (self.numbered == .rspec) return self.closeNumbered();
@@ -2065,8 +2179,8 @@ const Recognizer = struct {
                 return true;
             }
             if (self.numbered_open and self.numbered == .mocha) {
-                try self.numbered_name.append(self.arena, ' ');
-                try self.numbered_name.appendSlice(self.arena, trim(t));
+                self.numbered_name.append(self.arena, ' ') catch return self.noMemory(true);
+                self.numbered_name.appendSlice(self.arena, trim(t)) catch return self.noMemory(true);
                 if (endsWith(t, ":")) return self.closeNumbered();
                 return true;
             }
@@ -2077,11 +2191,11 @@ const Recognizer = struct {
         return false;
     }
 
-    fn closeNumbered(self: *Recognizer) Allocator.Error!bool {
+    noinline fn closeNumbered(self: *Recognizer) bool {
         self.numbered_open = false;
         const framework: Framework = if (self.numbered == .mocha) .mocha else .rspec;
         const name = std.mem.trimEnd(u8, self.numbered_name.items, ":");
-        const index = try self.addNested(framework, name, self.numbered_line);
+        const index = self.addNested(framework, name, self.numbered_line);
         if (index) |i| self.pending = .{ .reason = i };
         return true;
     }
@@ -2089,33 +2203,32 @@ const Recognizer = struct {
     /// Compiler-style errors with a location: `src/a.c:10:5: error: ...`,
     /// `src/a.ts(3,5): error TS2322: ...`, rustc's `error[E0308]: ...`
     /// followed by `--> src/main.rs:4:5`, and Python tracebacks.
-    fn generic(self: *Recognizer, number: u64, line: []const u8, t: []const u8) Allocator.Error!bool {
+    noinline fn generic(self: *Recognizer, number: u64, line: []const u8, t: []const u8) bool {
         if (startsWith(line, "Traceback (most recent call last)")) {
             self.traceback = true;
             self.traceback_location = null;
             return true;
         }
         if (startsWith(t, "error[") or startsWith(t, "error: ")) {
-            self.pending = .{ .rust_location = .{ .message = try self.dupe(t), .line = number } };
+            self.pending = .{ .rust_location = .{ .message = self.dupe(t), .line = number } };
             return true;
         }
-        inline for ([_][]const u8{ ": error", ": fatal error" }) |marker| {
+        for ([_][]const u8{ ": error", ": fatal error" }) |marker| {
             if (find(t, marker)) |at| {
                 var location = t[0..at];
-                var buf: [max_field]u8 = undefined;
                 // TypeScript: `path(3,5)`.
                 if (endsWith(location, ")")) {
                     if (std.mem.lastIndexOfScalar(u8, location, '(')) |open| {
                         const inside = location[open + 1 .. location.len - 1];
                         if (std.mem.indexOfScalar(u8, inside, ',')) |comma| {
-                            location = std.fmt.bufPrint(&buf, "{s}:{s}:{s}", .{ location[0..open], inside[0..comma], inside[comma + 1 ..] }) catch return false;
+                            location = self.concat(&.{ location[0..open], ":", inside[0..comma], ":", inside[comma + 1 ..] });
                         }
                     }
                 }
                 if (!looksLikeLocation(location)) return false;
-                const index = try self.add(.generic, location, number);
-                try self.setLocation(index, location);
-                try self.setReason(index, t[at + 2 ..]);
+                const index = self.add(.generic, location, number);
+                self.setLocation(index, location);
+                self.setReason(index, t[at + 2 ..]);
                 return true;
             }
         }
@@ -2126,7 +2239,7 @@ const Recognizer = struct {
 /// `N word` pairs anywhere in `text`, mapped onto passed, failed and skipped.
 /// A total ("4 total", "3 examples", "3 tests completed") fills in passed
 /// when no pass count is given.
-fn parseCounts(text: []const u8) Counts {
+noinline fn parseCounts(text: []const u8) Counts {
     var counts = Counts{};
     var total: ?u64 = null;
     var i: usize = 0;
@@ -2174,7 +2287,7 @@ fn inList(word: []const u8, list: []const []const u8) bool {
 }
 
 /// pytest's closing line: counts, then ` in 0.02s`.
-fn isPytestSummary(inner: []const u8) bool {
+noinline fn isPytestSummary(inner: []const u8) bool {
     if (startsWith(inner, "no tests ran in ")) return true;
     const at = findLast(inner, " in ") orelse return false;
     if (at == 0 or !std.ascii.isDigit(inner[0])) return false;
@@ -2185,20 +2298,20 @@ fn isPytestSummary(inner: []const u8) bool {
 }
 
 /// The number after `key` in `text` ("failures=2"), or 0.
-fn keyedCount(text: []const u8, key: []const u8) u64 {
+noinline fn keyedCount(text: []const u8, key: []const u8) u64 {
     const at = find(text, key) orelse return 0;
     return leadingNumber(text[at + key.len ..]) orelse 0;
 }
 
-fn leadingNumber(text: []const u8) ?u64 {
+noinline fn leadingNumber(text: []const u8) ?u64 {
     var end: usize = 0;
     while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
     if (end == 0) return null;
-    return std.fmt.parseInt(u64, text[0..end], 10) catch null;
+    return parseNumber(text[0..end]);
 }
 
 /// `add_test.go:5: expected 4, got 3`.
-fn parseGoLog(t: []const u8) ?struct { location: []const u8, message: []const u8 } {
+noinline fn parseGoLog(t: []const u8) ?struct { location: []const u8, message: []const u8 } {
     const go = find(t, ".go:") orelse return null;
     if (std.mem.indexOfScalar(u8, t[0..go], ' ') != null) return null;
     var i = go + 4;
@@ -2209,7 +2322,7 @@ fn parseGoLog(t: []const u8) ?struct { location: []const u8, message: []const u8
 }
 
 /// `  File "/x/test_mod.py", line 5, in test_add`.
-fn parsePythonFrame(t: []const u8) ?struct { path: []const u8, line: []const u8 } {
+noinline fn parsePythonFrame(t: []const u8) ?struct { path: []const u8, line: []const u8 } {
     const rest = t["File \"".len..];
     const close = find(rest, "\", line ") orelse return null;
     const after = rest[close + "\", line ".len ..];
@@ -2220,7 +2333,7 @@ fn parsePythonFrame(t: []const u8) ?struct { path: []const u8, line: []const u8 
 }
 
 /// `2/3 main.test.fails...FAIL (TestExpectedEqual)`.
-fn parseZigHeader(t: []const u8) ?struct { name: []const u8, rest: []const u8 } {
+noinline fn parseZigHeader(t: []const u8) ?struct { name: []const u8, rest: []const u8 } {
     var i: usize = 0;
     while (i < t.len and std.ascii.isDigit(t[i])) i += 1;
     if (i == 0 or i >= t.len or t[i] != '/') return null;
@@ -2233,14 +2346,14 @@ fn parseZigHeader(t: []const u8) ?struct { name: []const u8, rest: []const u8 } 
     return .{ .name = t[name_start..dots], .rest = t[dots + 3 ..] };
 }
 
-fn parenthesised(t: []const u8) []const u8 {
+noinline fn parenthesised(t: []const u8) []const u8 {
     const open = std.mem.indexOfScalar(u8, t, '(') orelse return t;
     const close = std.mem.lastIndexOfScalar(u8, t, ')') orelse return t[open + 1 ..];
     return if (close > open) t[open + 1 .. close] else t[open + 1 ..];
 }
 
 /// `  1) Array` → `Array`.
-fn numberedEntry(t: []const u8) ?[]const u8 {
+noinline fn numberedEntry(t: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < t.len and std.ascii.isDigit(t[i])) i += 1;
     if (i == 0 or !startsWith(t[i..], ") ")) return null;
@@ -2248,7 +2361,7 @@ fn numberedEntry(t: []const u8) ?[]const u8 {
 }
 
 /// Drops a trailing duration: ` (5 ms)`, ` (5ms)`, ` 15ms`, ` 1.2s`.
-fn stripDuration(name: []const u8) []const u8 {
+noinline fn stripDuration(name: []const u8) []const u8 {
     const t = trim(name);
     if (endsWith(t, ")")) {
         if (findLast(t, " (")) |open| {
@@ -2270,14 +2383,14 @@ fn isDuration(s: []const u8) bool {
 }
 
 /// A test file path: something with a slash or an extension.
-fn looksLikePath(s: []const u8) bool {
+noinline fn looksLikePath(s: []const u8) bool {
     const word_end = std.mem.indexOfScalar(u8, s, ' ') orelse s.len;
     const word = s[0..word_end];
     return word.len > 0 and (std.mem.indexOfScalar(u8, word, '/') != null or std.mem.indexOfScalar(u8, word, '.') != null);
 }
 
 /// `path:line` or `path:line:column`, without spaces.
-fn looksLikeLocation(s: []const u8) bool {
+noinline fn looksLikeLocation(s: []const u8) bool {
     if (s.len < 3 or std.mem.indexOfAny(u8, s, " \t") != null) return false;
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
     if (colon == 0) return false;
