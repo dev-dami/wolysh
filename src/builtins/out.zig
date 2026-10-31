@@ -13,6 +13,8 @@ const fs = @import("../fs.zig");
 const proc = @import("../proc.zig");
 const regex = @import("../regex.zig");
 const oq = @import("../output_query.zig");
+const put = oq.put;
+const putByte = oq.putByte;
 
 const Ctx = builtins.Ctx;
 const Allocator = std.mem.Allocator;
@@ -98,7 +100,7 @@ pub fn run(ctx: Ctx) u8 {
             return 1;
         },
         else => {
-            ctx.errFmt("wsh: out: {s}\n", .{regex.errorMessage(@errorCast(err))});
+            fail(ctx, &.{regex.errorMessage(@errorCast(err))});
             return 2;
         },
     };
@@ -109,18 +111,32 @@ pub fn run(ctx: Ctx) u8 {
     return status;
 }
 
-fn usageError(ctx: Ctx, comptime fmt: []const u8, args: anytype) error{Usage} {
-    ctx.errFmt("wsh: out: " ++ fmt ++ "\n", args);
+/// Writes `wsh: out: `, then `parts`, as one line on stderr. Messages are
+/// pieced together rather than formatted so that each one does not
+/// instantiate its own formatting code.
+noinline fn fail(ctx: Ctx, parts: []const []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    put(&w, "wsh: out: ") catch {};
+    for (parts) |part| put(&w, part) catch {};
+    putByte(&w, '\n') catch {
+        buf[buf.len - 1] = '\n';
+    };
+    ctx.err(w.buffered());
+}
+
+fn usageError(ctx: Ctx, parts: []const []const u8) error{Usage} {
+    fail(ctx, parts);
     ctx.err("wsh: out: usage: out budget|find|grep|failures|lines|stats [options] [--file FILE | --run NAME]; see `out --help`\n");
     return error.Usage;
 }
 
-fn parseArgs(ctx: Ctx, arena: Allocator) error{ Help, Usage, OutOfMemory }!Options {
+noinline fn parseArgs(ctx: Ctx, arena: Allocator) error{ Help, Usage, OutOfMemory }!Options {
     const argv = ctx.argv;
-    if (argv.len < 2) return usageError(ctx, "expected a subcommand", .{});
+    if (argv.len < 2) return usageError(ctx, &.{"expected a subcommand"});
     if (std.mem.eql(u8, argv[1], "--help") or std.mem.eql(u8, argv[1], "-h") or std.mem.eql(u8, argv[1], "help")) return error.Help;
     var opts = Options{ .command = std.meta.stringToEnum(Command, argv[1]) orelse
-        return usageError(ctx, "{s}: unknown subcommand", .{argv[1]}) };
+        return usageError(ctx, &.{ argv[1], ": unknown subcommand" }) };
 
     var i: usize = 2;
     var operands_only = false;
@@ -147,7 +163,7 @@ fn parseArgs(ctx: Ctx, arena: Allocator) error{ Help, Usage, OutOfMemory }!Optio
         };
         const flag = for (flags) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break entry[1];
-        } else return usageError(ctx, "{s}: unknown option", .{arg});
+        } else return usageError(ctx, &.{ arg, ": unknown option" });
         const takes_value = switch (flag) {
             .file, .run, .budget, .limit, .context => true,
             else => false,
@@ -158,39 +174,39 @@ fn parseArgs(ctx: Ctx, arena: Allocator) error{ Help, Usage, OutOfMemory }!Optio
                 value = arg[at + 1 ..];
             } else {
                 i += 1;
-                if (i >= argv.len) return usageError(ctx, "{s}: option requires an argument", .{arg});
+                if (i >= argv.len) return usageError(ctx, &.{ arg, ": option requires an argument" });
                 value = argv[i];
             }
-        } else if (eq != null) return usageError(ctx, "{s}: option takes no argument", .{name});
+        } else if (eq != null) return usageError(ctx, &.{ name, ": option takes no argument" });
         switch (flag) {
             .file => opts.file = value,
             .run => opts.run = value,
             .json => opts.json = true,
             .raw => opts.raw = true,
-            .budget => opts.budget = parseSize(value) orelse return usageError(ctx, "{s}: invalid size", .{value}),
-            .limit => opts.limit = std.fmt.parseInt(usize, value, 10) catch return usageError(ctx, "{s}: invalid count", .{value}),
-            .context => opts.context = std.fmt.parseInt(usize, value, 10) catch return usageError(ctx, "{s}: invalid count", .{value}),
+            .budget => opts.budget = parseSize(value) orelse return usageError(ctx, &.{ value, ": invalid size" }),
+            .limit => opts.limit = parseCount(value) orelse return usageError(ctx, &.{ value, ": invalid count" }),
+            .context => opts.context = parseCount(value) orelse return usageError(ctx, &.{ value, ": invalid count" }),
             .regex => opts.regex = true,
             .ignore_case => opts.ignore_case = true,
             .help => return error.Help,
         }
     }
-    if (opts.file != null and opts.run != null) return usageError(ctx, "--file and --run are exclusive", .{});
+    if (opts.file != null and opts.run != null) return usageError(ctx, &.{"--file and --run are exclusive"});
 
     const n = opts.operands.items.len;
     switch (opts.command) {
         .budget => {
-            if (n > 1) return usageError(ctx, "budget: expected at most one size", .{});
+            if (n > 1) return usageError(ctx, &.{"budget: expected at most one size"});
             if (n == 1) opts.budget = parseSize(opts.operands.items[0]) orelse
-                return usageError(ctx, "{s}: invalid size", .{opts.operands.items[0]});
+                return usageError(ctx, &.{ opts.operands.items[0], ": invalid size" });
         },
-        .find => if (n == 0) return usageError(ctx, "find: expected a query", .{}),
-        .grep => if (n != 1) return usageError(ctx, "grep: expected one pattern", .{}),
+        .find => if (n == 0) return usageError(ctx, &.{"find: expected a query"}),
+        .grep => if (n != 1) return usageError(ctx, &.{"grep: expected one pattern"}),
         .lines => {
-            if (n != 1) return usageError(ctx, "lines: expected a range such as 41-60", .{});
-            if (parseRange(opts.operands.items[0]) == null) return usageError(ctx, "{s}: invalid range", .{opts.operands.items[0]});
+            if (n != 1) return usageError(ctx, &.{"lines: expected a range such as 41-60"});
+            if (parseRange(opts.operands.items[0]) == null) return usageError(ctx, &.{ opts.operands.items[0], ": invalid range" });
         },
-        .failures, .stats => if (n != 0) return usageError(ctx, "{s}: unexpected argument {s}", .{ @tagName(opts.command), opts.operands.items[0] }),
+        .failures, .stats => if (n != 0) return usageError(ctx, &.{ @tagName(opts.command), ": unexpected argument ", opts.operands.items[0] }),
     }
     return opts;
 }
@@ -205,28 +221,32 @@ pub fn parseSize(text: []const u8) ?usize {
         else => 1,
     };
     const digits = if (unit == 1) text else text[0 .. text.len - 1];
-    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
+    const n = parseCount(digits) orelse return null;
     return std.math.mul(usize, n, unit) catch null;
+}
+
+fn parseCount(text: []const u8) ?usize {
+    return std.math.cast(usize, oq.parseNumber(text) orelse return null);
 }
 
 const Range = struct { from: u64, to: ?u64 };
 
 /// `41-60`, `41–60` (as printed in elision markers), `41..60`, `41,60`,
 /// `41` and `41-` (to the end).
-fn parseRange(text: []const u8) ?Range {
+noinline fn parseRange(text: []const u8) ?Range {
     const separators = [_][]const u8{ "–", "..", "-", "," };
     for (separators) |sep| {
         if (std.mem.indexOf(u8, text, sep)) |at| {
-            const from = std.fmt.parseInt(u64, text[0..at], 10) catch return null;
+            const from = oq.parseNumber(text[0..at]) orelse return null;
             const rest = text[at + sep.len ..];
             if (from == 0) return null;
             if (rest.len == 0) return .{ .from = from, .to = null };
-            const to = std.fmt.parseInt(u64, rest, 10) catch return null;
+            const to = oq.parseNumber(rest) orelse return null;
             if (to < from) return null;
             return .{ .from = from, .to = to };
         }
     }
-    const line = std.fmt.parseInt(u64, text, 10) catch return null;
+    const line = oq.parseNumber(text) orelse return null;
     if (line == 0) return null;
     return .{ .from = line, .to = line };
 }
@@ -240,7 +260,7 @@ fn parseRange(text: []const u8) ?Range {
 /// run's output is `<state>/runs/<name>/output.log`.
 pub fn runLogPath(arena: Allocator, runtime_dir: ?[]const u8, name: []const u8) Allocator.Error![:0]u8 {
     const dir = try agent_state.dirPathFrom(arena, runtime_dir);
-    return std.fmt.allocPrintSentinel(arena, "{s}/runs/{s}/output.log", .{ dir, name }, 0);
+    return std.mem.concatWithSentinel(arena, u8, &.{ dir, "/runs/", name, "/output.log" }, 0);
 }
 
 const Input = struct {
@@ -254,15 +274,15 @@ const Input = struct {
     }
 };
 
-fn loadInput(ctx: Ctx, arena: Allocator, opts: Options) ?Input {
+noinline fn loadInput(ctx: Ctx, arena: Allocator, opts: Options) ?Input {
     if (opts.run) |name| {
         if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
-            ctx.errFmt("wsh: out: {s}: invalid run name\n", .{name});
+            fail(ctx, &.{ name, ": invalid run name" });
             return null;
         }
         const path = runLogPath(arena, ctx.sh.getEnv("XDG_RUNTIME_DIR"), name) catch return null;
         if (!fs.exists(path)) {
-            ctx.errFmt("wsh: out: {s}: no such run (no log at {s})\n", .{ name, path });
+            fail(ctx, &.{ name, ": no such run (no log at ", path, ")" });
             return null;
         }
         return loadPath(ctx, path, name);
@@ -278,11 +298,11 @@ fn loadInput(ctx: Ctx, arena: Allocator, opts: Options) ?Input {
     return loadFd(ctx, ctx.stdin, "standard input");
 }
 
-fn loadPath(ctx: Ctx, path: [:0]const u8, label: []const u8) ?Input {
+noinline fn loadPath(ctx: Ctx, path: [:0]const u8, label: []const u8) ?Input {
     const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     const err = linux.errno(rc);
     if (err != .SUCCESS) {
-        ctx.errFmt("wsh: out: {s}: {s}\n", .{ label, proc.errorText(err) });
+        fail(ctx, &.{ label, ": ", proc.errorText(err) });
         return null;
     }
     const fd: i32 = @intCast(rc);
@@ -292,12 +312,12 @@ fn loadPath(ctx: Ctx, path: [:0]const u8, label: []const u8) ?Input {
 
 /// Maps a regular file (from the descriptor's current offset) and reads
 /// anything else, such as a pipe.
-fn loadFd(ctx: Ctx, fd: i32, label: []const u8) ?Input {
+noinline fn loadFd(ctx: Ctx, fd: i32, label: []const u8) ?Input {
     var st: linux.Statx = undefined;
     if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true, .SIZE = true }, &st)) == .SUCCESS) {
         const kind = st.mode & linux.S.IFMT;
         if (kind == linux.S.IFDIR) {
-            ctx.errFmt("wsh: out: {s}: Is a directory\n", .{label});
+            fail(ctx, &.{ label, ": Is a directory" });
             return null;
         }
         if (kind == linux.S.IFREG and st.size > 0) {
@@ -330,7 +350,7 @@ fn loadFd(ctx: Ctx, fd: i32, label: []const u8) ?Input {
         if (err == .INTR) continue;
         if (err != .SUCCESS) {
             data.deinit(ctx.sh.gpa);
-            ctx.errFmt("wsh: out: {s}: {s}\n", .{ label, proc.errorText(err) });
+            fail(ctx, &.{ label, ": ", proc.errorText(err) });
             return null;
         }
         if (rc == 0) break;
@@ -381,23 +401,79 @@ const FdWriter = struct {
     }
 };
 
+/// Output under construction. Writes return nothing: the first failure is
+/// remembered and checked once with `check`, which spares each of the many
+/// writes its own error test, and a label with its number is one call.
+const Out = struct {
+    w: *Writer,
+    failed: bool = false,
+
+    noinline fn str(o: *Out, bytes: []const u8) void {
+        o.w.writeAll(bytes) catch {
+            o.failed = true;
+        };
+    }
+
+    noinline fn byte(o: *Out, c: u8) void {
+        o.w.writeByte(c) catch {
+            o.failed = true;
+        };
+    }
+
+    noinline fn num(o: *Out, n: u64) void {
+        oq.writeNumber(o.w, n) catch {
+            o.failed = true;
+        };
+    }
+
+    /// `label` then `n`: `,"line":42`, `] line 42`.
+    noinline fn field(o: *Out, label: []const u8, n: u64) void {
+        o.str(label);
+        o.num(n);
+    }
+
+    /// `label` then `n`, or `null`.
+    noinline fn optField(o: *Out, label: []const u8, n: ?u64) void {
+        o.str(label);
+        if (n) |v| o.num(v) else o.str("null");
+    }
+
+    /// `label` then `text` as a JSON string, or `null`.
+    noinline fn json(o: *Out, label: []const u8, text: ?[]const u8) void {
+        o.str(label);
+        const v = text orelse return o.str("null");
+        oq.writeJsonString(o.w, v) catch {
+            o.failed = true;
+        };
+    }
+
+    fn check(o: Out) Writer.Error!void {
+        if (o.failed) return error.WriteFailed;
+    }
+};
+
 /// Output collected as separate records, so `--budget` can drop whole
 /// records and say how many.
 const Records = struct {
     arena: Allocator,
     items: std.ArrayList([]const u8) = .empty,
     current: Writer.Allocating,
+    o: Out = .{ .w = undefined },
 
     fn init(arena: Allocator) Records {
         return .{ .arena = arena, .current = .init(arena) };
     }
 
-    fn writer(self: *Records) *Writer {
-        return &self.current.writer;
+    /// Where the current record is written.
+    fn out(self: *Records) *Out {
+        self.o = .{ .w = &self.current.writer, .failed = self.o.failed };
+        return &self.o;
     }
 
     /// Ends the record written so far.
     fn finish(self: *Records) Allocator.Error!void {
+        // Writing into memory fails only for want of it.
+        if (self.o.failed) return error.OutOfMemory;
         const bytes = try self.current.toOwnedSlice();
         if (bytes.len != 0) try self.items.append(self.arena, bytes);
     }
@@ -405,40 +481,43 @@ const Records = struct {
 
 /// Writes `records` then `footer`, dropping trailing records that would
 /// take the total past `max` and noting how many were dropped.
-fn emitCapped(w: *Writer, records: []const []const u8, footer: []const u8, max: ?usize, json: bool) Writer.Error!void {
+noinline fn emitCapped(o: *Out, records: []const []const u8, footer: []const u8, max: ?usize, json: bool) void {
     const limit = max orelse {
-        for (records) |record| try w.writeAll(record);
-        try w.writeAll(footer);
+        for (records) |record| o.str(record);
+        o.str(footer);
         return;
     };
     var note_buf: [128]u8 = undefined;
-    const reserve = footer.len + if (noteText(&note_buf, records.len, json)) |note| note.len else |_| 0;
+    const reserve = footer.len + noteText(&note_buf, records.len, json).len;
     var used: usize = 0;
     var kept: usize = 0;
     for (records) |record| {
         if (used + record.len + reserve > limit) break;
-        try w.writeAll(record);
+        o.str(record);
         used += record.len;
         kept += 1;
     }
     if (kept < records.len) {
-        const note: []const u8 = noteText(&note_buf, records.len - kept, json) catch "";
+        const note = noteText(&note_buf, records.len - kept, json);
         if (used + note.len <= limit) {
-            try w.writeAll(note);
+            o.str(note);
             used += note.len;
         }
     }
-    if (used + footer.len <= limit) try w.writeAll(footer);
+    if (used + footer.len <= limit) o.str(footer);
 }
 
-fn noteText(buf: []u8, omitted: usize, json: bool) ![]const u8 {
-    if (json) return std.fmt.bufPrint(buf, "{{\"type\":\"truncated\",\"omitted\":{d}}}\n", .{omitted});
-    return std.fmt.bufPrint(buf, "[… {d} more not shown; raise --budget …]\n", .{omitted});
+noinline fn noteText(buf: *[128]u8, omitted: usize, json: bool) []const u8 {
+    var w: Writer = .fixed(buf);
+    var o: Out = .{ .w = &w };
+    o.field(if (json) "{\"type\":\"truncated\",\"omitted\":" else "[… ", omitted);
+    o.str(if (json) "}\n" else " more not shown; raise --budget …]\n");
+    return w.buffered();
 }
 
 /// The part of `line` to show: all of it, or `max_shown` bytes starting a
 /// little before `focus` when it is longer.
-fn excerpt(line: []const u8, focus: usize) struct { start: usize, end: usize } {
+noinline fn excerpt(line: []const u8, focus: usize) struct { start: usize, end: usize } {
     if (line.len <= max_shown) return .{ .start = 0, .end = line.len };
     var start = if (focus > 64) focus - 64 else 0;
     if (start + max_shown > line.len) start = line.len - max_shown;
@@ -448,11 +527,30 @@ fn excerpt(line: []const u8, focus: usize) struct { start: usize, end: usize } {
     return .{ .start = start, .end = end };
 }
 
-/// Writes `line[span]`, marking cut ends with how many bytes were left out.
-fn writeExcerptText(w: *Writer, line: []const u8, start: usize, end: usize) Writer.Error!void {
-    if (start > 0) try w.print("[+{d} bytes] … ", .{start});
-    try w.writeAll(line[start..end]);
-    if (end < line.len) try w.print(" … [+{d} bytes]", .{line.len - end});
+/// `N:text` for a match or `N-text` for context, as grep prints them, with
+/// cut ends marked with how many bytes were left out.
+noinline fn writeNumbered(o: *Out, number: u64, mark: u8, line: []const u8, start: usize, end: usize) void {
+    o.num(number);
+    o.byte(mark);
+    if (start > 0) {
+        o.field("[+", start);
+        o.str(" bytes] … ");
+    }
+    o.str(line[start..end]);
+    if (end < line.len) {
+        o.field(" … [+", line.len - end);
+        o.str(" bytes]");
+    }
+    o.byte('\n');
+}
+
+/// `{"type":"match","line":N,"offset":O,"text":"…"` and, for an excerpt,
+/// where it starts.
+noinline fn writeMatchHead(o: *Out, line: oq.Line, display: []const u8, start: usize, end: usize) void {
+    o.field("{\"type\":\"match\",\"line\":", line.number);
+    o.field(",\"offset\":", line.start);
+    o.json(",\"text\":", display[start..end]);
+    if (start != 0 or end != display.len) o.field(",\"excerpt_start\":", start);
 }
 
 fn shown(opts: Options, text: []const u8, line: oq.Line, cleaned: []const u8) []const u8 {
@@ -462,95 +560,103 @@ fn shown(opts: Options, text: []const u8, line: oq.Line, cleaned: []const u8) []
 // --- subcommands -----------------------------------------------------------------
 
 fn execute(ctx: Ctx, arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
-    return switch (opts.command) {
-        .budget => {
-            const summary = try oq.budget(arena, text, opts.budget orelse 4096, .{
+    var o: Out = .{ .w = w };
+    const status = switch (opts.command) {
+        .budget => blk: {
+            o.str(try oq.budget(arena, text, opts.budget orelse 4096, .{
                 .format = if (opts.json) .json else .text,
                 .raw = opts.raw,
-            });
-            try w.writeAll(summary);
-            return 0;
+            }));
+            break :blk 0;
         },
-        .find => find(arena, opts, text, w),
-        .grep => grep(arena, opts, text, w),
-        .failures => failures(arena, opts, text, w),
-        .lines => lines(ctx, arena, opts, text, w),
-        .stats => stats(arena, opts, text, w),
+        .find => try find(arena, opts, text, &o),
+        .grep => try grep(arena, opts, text, &o),
+        .failures => try failures(arena, opts, text, &o),
+        .lines => try lines(ctx, arena, opts, text, &o),
+        .stats => try stats(arena, opts, text, &o),
     };
+    try o.check();
+    return status;
 }
 
-fn find(arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
+fn find(arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
     const query = try std.mem.join(arena, " ", opts.operands.items);
     const result = try oq.fuzzyFind(arena, text, query, opts.limit orelse 20);
     var records = Records.init(arena);
     for (result.matches) |match| {
-        const rw = records.writer();
-        if (opts.context > 0) try writeContext(rw, arena, opts, text, match.line, .before);
+        const r = records.out();
+        if (opts.context > 0) try writeContext(r, arena, opts, text, match.line, .before);
         const focus = if (match.positions.len != 0) match.positions[0] else 0;
         const display = shown(opts, text, match.line, match.text);
         const cut = excerpt(display, if (opts.raw) 0 else focus);
         if (opts.json) {
-            try rw.print("{{\"type\":\"match\",\"line\":{d},\"offset\":{d},\"score\":{d},\"text\":", .{ match.line.number, match.line.start, match.score });
-            try oq.writeJsonString(rw, display[cut.start..cut.end]);
-            if (cut.start != 0 or cut.end != display.len) try rw.print(",\"excerpt_start\":{d}", .{cut.start});
-            try rw.writeAll(",\"positions\":[");
+            writeMatchHead(r, match.line, display, cut.start, cut.end);
+            r.str(",\"score\":");
+            if (match.score < 0) r.byte('-');
+            r.num(@abs(match.score));
+            r.str(",\"positions\":[");
             var first = true;
             for (match.positions) |pos| {
                 if (pos < cut.start or pos >= cut.end) continue;
-                if (!first) try rw.writeByte(',');
+                if (!first) r.byte(',');
                 first = false;
-                try rw.print("{d}", .{pos - cut.start});
+                r.num(pos - cut.start);
             }
-            try rw.writeAll("]}\n");
+            r.str("]}\n");
         } else {
-            try rw.print("{d}:", .{match.line.number});
-            try writeExcerptText(rw, display, cut.start, cut.end);
-            try rw.writeByte('\n');
+            writeNumbered(r, match.line.number, ':', display, cut.start, cut.end);
         }
         if (opts.context > 0) {
-            try writeContext(rw, arena, opts, text, match.line, .after);
-            if (!opts.json) try rw.writeAll("--\n");
+            try writeContext(r, arena, opts, text, match.line, .after);
+            if (!opts.json) r.str("--\n");
         }
         try records.finish();
     }
-    const footer = try matchFooter(arena, opts, result.total, result.matches.len);
-    try emitCapped(w, records.items.items, footer, opts.budget, opts.json);
+    emitCapped(o, records.items.items, try matchFooter(arena, opts, result.total, result.matches.len), opts.budget, opts.json);
     return if (result.total == 0) 1 else 0;
 }
 
 /// How many lines matched in all; in text form only when some are not shown.
-fn matchFooter(arena: Allocator, opts: Options, total: u64, kept: usize) ![]const u8 {
-    if (opts.json) return std.fmt.allocPrint(arena, "{{\"type\":\"summary\",\"matches\":{d},\"shown\":{d}}}\n", .{ total, kept });
+noinline fn matchFooter(arena: Allocator, opts: Options, total: u64, kept: usize) ![]const u8 {
     const more = total - kept;
-    if (more == 0) return "";
-    return std.fmt.allocPrint(arena, "[… {d} more matching line{s}; raise --limit …]\n", .{ more, if (more == 1) "" else "s" });
+    if (!opts.json and more == 0) return "";
+    var buf: [128]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    var o: Out = .{ .w = &w };
+    if (opts.json) {
+        o.field("{\"type\":\"summary\",\"matches\":", total);
+        o.field(",\"shown\":", kept);
+        o.str("}\n");
+    } else {
+        o.field("[… ", more);
+        o.str(if (more == 1) " more matching line; raise --limit …]\n" else " more matching lines; raise --limit …]\n");
+    }
+    return arena.dupe(u8, w.buffered());
 }
 
 const Side = enum { before, after };
 
-fn writeContext(w: *Writer, arena: Allocator, opts: Options, text: []const u8, line: oq.Line, side: Side) !void {
+noinline fn writeContext(o: *Out, arena: Allocator, opts: Options, text: []const u8, line: oq.Line, side: Side) !void {
     const around = try oq.context(arena, text, line, if (side == .before) opts.context else 0, if (side == .after) opts.context else 0);
     for (around) |l| {
         if (l.number == line.number) continue;
-        try writeContextLine(w, arena, opts, text, l);
+        try writeContextLine(o, arena, opts, text, l);
     }
 }
 
-fn writeContextLine(w: *Writer, arena: Allocator, opts: Options, text: []const u8, l: oq.Line) !void {
+noinline fn writeContextLine(o: *Out, arena: Allocator, opts: Options, text: []const u8, l: oq.Line) !void {
     const display = if (opts.raw) l.bytes(text) else try oq.cleanAlloc(arena, l.bytes(text));
     const cut = excerpt(display, 0);
     if (opts.json) {
-        try w.print("{{\"type\":\"context\",\"line\":{d},\"text\":", .{l.number});
-        try oq.writeJsonString(w, display[cut.start..cut.end]);
-        try w.writeAll("}\n");
+        o.field("{\"type\":\"context\",\"line\":", l.number);
+        o.json(",\"text\":", display[cut.start..cut.end]);
+        o.str("}\n");
     } else {
-        try w.print("{d}-", .{l.number});
-        try writeExcerptText(w, display, cut.start, cut.end);
-        try w.writeByte('\n');
+        writeNumbered(o, l.number, '-', display, cut.start, cut.end);
     }
 }
 
-fn grep(arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
+fn grep(arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
     const result = try oq.grep(arena, text, opts.operands.items[0], .{
         .regex = opts.regex,
         .ignore_case = opts.ignore_case,
@@ -560,35 +666,33 @@ fn grep(arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
     // As in grep, context windows that touch merge and others are separated.
     var printed: u64 = 0;
     for (result.matches) |match| {
-        const rw = records.writer();
+        const r = records.out();
         if (opts.context > 0) {
             const before = try oq.context(arena, text, match.line, opts.context, 0);
-            if (printed != 0 and before[0].number > printed + 1 and !opts.json) try rw.writeAll("--\n");
+            if (printed != 0 and before[0].number > printed + 1 and !opts.json) r.str("--\n");
             for (before) |l| {
                 if (l.number == match.line.number or l.number <= printed) continue;
-                try writeContextLine(rw, arena, opts, text, l);
+                try writeContextLine(r, arena, opts, text, l);
             }
         }
         const display = shown(opts, text, match.line, match.text);
         const focus = if (match.spans.len != 0) match.spans[0].start else 0;
         const cut = excerpt(display, if (opts.raw) 0 else focus);
         if (opts.json) {
-            try rw.print("{{\"type\":\"match\",\"line\":{d},\"offset\":{d},\"text\":", .{ match.line.number, match.line.start });
-            try oq.writeJsonString(rw, display[cut.start..cut.end]);
-            if (cut.start != 0 or cut.end != display.len) try rw.print(",\"excerpt_start\":{d}", .{cut.start});
-            try rw.writeAll(",\"spans\":[");
+            writeMatchHead(r, match.line, display, cut.start, cut.end);
+            r.str(",\"spans\":[");
             var first = true;
             for (match.spans) |span| {
                 if (span.start < cut.start or span.end > cut.end) continue;
-                if (!first) try rw.writeByte(',');
+                r.str(if (first) "[" else ",[");
                 first = false;
-                try rw.print("[{d},{d}]", .{ span.start - cut.start, span.end - cut.start });
+                r.field("", span.start - cut.start);
+                r.field(",", span.end - cut.start);
+                r.byte(']');
             }
-            try rw.writeAll("]}\n");
+            r.str("]}\n");
         } else {
-            try rw.print("{d}:", .{match.line.number});
-            try writeExcerptText(rw, display, cut.start, cut.end);
-            try rw.writeByte('\n');
+            writeNumbered(r, match.line.number, ':', display, cut.start, cut.end);
         }
         printed = @max(printed, match.line.number);
         if (opts.context > 0) {
@@ -597,18 +701,17 @@ fn grep(arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
                 if (l.number <= printed) continue;
                 // A later match inside this window prints itself.
                 if (isMatchLine(result.matches, l.number)) break;
-                try writeContextLine(rw, arena, opts, text, l);
+                try writeContextLine(r, arena, opts, text, l);
                 printed = l.number;
             }
         }
         try records.finish();
     }
-    const footer = try matchFooter(arena, opts, result.total, result.matches.len);
-    try emitCapped(w, records.items.items, footer, opts.budget, opts.json);
+    emitCapped(o, records.items.items, try matchFooter(arena, opts, result.total, result.matches.len), opts.budget, opts.json);
     return if (result.total == 0) 1 else 0;
 }
 
-fn isMatchLine(matches: []const oq.GrepMatch, number: u64) bool {
+noinline fn isMatchLine(matches: []const oq.GrepMatch, number: u64) bool {
     for (matches) |m| {
         if (m.line.number == number) return true;
         if (m.line.number > number) return false;
@@ -616,168 +719,182 @@ fn isMatchLine(matches: []const oq.GrepMatch, number: u64) bool {
     return false;
 }
 
-fn failures(arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
+fn failures(arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
     const report = try oq.failures(arena, text);
     var records = Records.init(arena);
     for (report.failures) |f| {
-        const rw = records.writer();
+        const r = records.out();
         if (opts.json) {
-            try rw.print("{{\"type\":\"failure\",\"framework\":\"{s}\",\"name\":", .{@tagName(f.framework)});
-            try oq.writeJsonString(rw, f.name);
-            try rw.print(",\"line\":{d},\"location\":", .{f.line});
-            try writeJsonOptional(rw, f.location);
-            try rw.writeAll(",\"reason\":");
-            try writeJsonOptional(rw, f.reason);
-            try rw.writeAll("}\n");
+            r.str("{\"type\":\"failure\",\"framework\":\"");
+            r.str(@tagName(f.framework));
+            r.json("\",\"name\":", f.name);
+            r.field(",\"line\":", f.line);
+            r.json(",\"location\":", f.location);
+            r.json(",\"reason\":", f.reason);
+            r.str("}\n");
         } else {
-            try rw.print("FAILED {s} [{s}] line {d}", .{ f.name, @tagName(f.framework), f.line });
+            r.str("FAILED ");
+            r.str(f.name);
+            r.str(" [");
+            r.str(@tagName(f.framework));
+            r.field("] line ", f.line);
             if (f.location) |location| {
-                if (!std.mem.eql(u8, location, f.name)) try rw.print(" at {s}", .{location});
+                if (!std.mem.eql(u8, location, f.name)) {
+                    r.str(" at ");
+                    r.str(location);
+                }
             }
-            if (f.reason) |reason| try rw.print(": {s}", .{reason});
-            try rw.writeByte('\n');
+            if (f.reason) |reason| {
+                r.str(": ");
+                r.str(reason);
+            }
+            r.byte('\n');
         }
         try records.finish();
     }
 
-    var footer: Writer.Allocating = .init(arena);
-    const fw = &footer.writer;
+    const r = records.out();
     const status = report.status();
+    const listed = report.failures.len + report.omitted;
     if (opts.json) {
-        const word = switch (status) {
+        r.str("{\"type\":\"summary\",\"status\":\"");
+        r.str(switch (status) {
             0 => "passed",
             1 => "failed",
             else => "unrecognized",
-        };
-        try fw.print("{{\"type\":\"summary\",\"status\":\"{s}\",\"frameworks\":[", .{word});
-        try writeFrameworksJson(fw, report.frameworks);
-        try fw.writeAll("],\"passed\":");
-        try writeOptionalNumber(fw, report.counts.passed);
-        try fw.writeAll(",\"failed\":");
-        try writeOptionalNumber(fw, report.counts.failed);
-        try fw.writeAll(",\"skipped\":");
-        try writeOptionalNumber(fw, report.counts.skipped);
-        try fw.print(",\"failures\":{d},\"omitted\":{d}}}\n", .{ report.failures.len + report.omitted, report.omitted });
+        });
+        r.str("\",\"frameworks\":[");
+        writeFrameworks(r, report.frameworks, true);
+        r.optField("],\"passed\":", report.counts.passed);
+        r.optField(",\"failed\":", report.counts.failed);
+        r.optField(",\"skipped\":", report.counts.skipped);
+        r.field(",\"failures\":", listed);
+        r.field(",\"omitted\":", report.omitted);
+        r.str("}\n");
     } else if (status == 2) {
-        try fw.writeAll("no recognizable test output\n");
+        r.str("no recognizable test output\n");
     } else {
-        const listed = report.failures.len + report.omitted;
         if (listed == 0) {
-            try fw.writeAll("no failures");
+            r.str("no failures");
         } else {
-            try fw.print("{d} failure{s}", .{ listed, if (listed == 1) "" else "s" });
+            r.num(listed);
+            r.str(if (listed == 1) " failure" else " failures");
         }
-        if (report.omitted != 0) try fw.print(" ({d} not listed)", .{report.omitted});
+        if (report.omitted != 0) {
+            r.field(" (", report.omitted);
+            r.str(" not listed)");
+        }
         var sep: []const u8 = "; ";
         const fields = [_]struct { ?u64, []const u8 }{
-            .{ report.counts.passed, "passed" },
-            .{ report.counts.failed, "failed" },
-            .{ report.counts.skipped, "skipped" },
+            .{ report.counts.passed, " passed" },
+            .{ report.counts.failed, " failed" },
+            .{ report.counts.skipped, " skipped" },
         };
         for (fields) |field| {
             if (field[0]) |n| {
-                try fw.print("{s}{d} {s}", .{ sep, n, field[1] });
+                r.field(sep, n);
+                r.str(field[1]);
                 sep = ", ";
             }
         }
-        try fw.writeAll(" [");
-        try writeFrameworksText(fw, report.frameworks);
-        try fw.writeAll("]\n");
+        r.str(" [");
+        writeFrameworks(r, report.frameworks, false);
+        r.str("]\n");
     }
-    try emitCapped(w, records.items.items, footer.written(), opts.budget, opts.json);
+    if (r.failed) return error.OutOfMemory;
+    emitCapped(o, records.items.items, records.current.written(), opts.budget, opts.json);
     return status;
 }
 
-fn writeJsonOptional(w: *Writer, value: ?[]const u8) Writer.Error!void {
-    if (value) |v| try oq.writeJsonString(w, v) else try w.writeAll("null");
-}
-
-fn writeOptionalNumber(w: *Writer, value: ?u64) Writer.Error!void {
-    if (value) |v| try w.print("{d}", .{v}) else try w.writeAll("null");
-}
-
-fn writeFrameworksJson(w: *Writer, set: oq.FrameworkSet) Writer.Error!void {
+/// The frameworks seen: `"cargo","go"` for JSON, `cargo, go` (or `none`)
+/// for text.
+noinline fn writeFrameworks(o: *Out, set: oq.FrameworkSet, json: bool) void {
     var it = set.iterator();
     var first = true;
     while (it.next()) |framework| {
-        if (!first) try w.writeByte(',');
+        if (!first) o.str(if (json) "," else ", ");
         first = false;
-        try w.print("\"{s}\"", .{@tagName(framework)});
+        if (json) o.byte('"');
+        o.str(@tagName(framework));
+        if (json) o.byte('"');
     }
+    if (first and !json) o.str("none");
 }
 
-fn writeFrameworksText(w: *Writer, set: oq.FrameworkSet) Writer.Error!void {
-    var it = set.iterator();
-    var first = true;
-    while (it.next()) |framework| {
-        if (!first) try w.writeAll(", ");
-        first = false;
-        try w.writeAll(@tagName(framework));
-    }
-    if (first) try w.writeAll("none");
-}
-
-fn lines(ctx: Ctx, arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
+fn lines(ctx: Ctx, arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
     const range = parseRange(opts.operands.items[0]).?;
     const first = oq.lineAt(text, range.from) orelse {
-        ctx.errFmt("wsh: out: lines: line {d} is past the end ({d} lines)\n", .{ range.from, oq.countLines(text) });
+        var from_buf: [20]u8 = undefined;
+        var count_buf: [20]u8 = undefined;
+        fail(ctx, &.{ "lines: line ", oq.formatNumber(&from_buf, range.from), " is past the end (", oq.formatNumber(&count_buf, oq.countLines(text)), " lines)" });
         return 1;
     };
     var it = oq.LineIterator.initAt(text, first.start, first.number - 1);
     var cleaner = oq.Cleaner.init(arena);
     // Without a budget, lines stream straight out.
     var records = Records.init(arena);
-    const target = if (opts.budget != null) records.writer() else w;
     while (it.next()) |line| {
         if (range.to) |to| {
             if (line.number > to) break;
         }
+        const target = if (opts.budget != null) records.out() else o;
         const display = if (opts.raw) line.bytes(text) else try cleaner.cleanLine(text, line);
         if (opts.json) {
-            try target.print("{{\"type\":\"line\",\"line\":{d},\"text\":", .{line.number});
-            try oq.writeJsonString(target, display);
-            try target.writeAll("}\n");
+            target.field("{\"type\":\"line\",\"line\":", line.number);
+            target.json(",\"text\":", display);
+            target.str("}\n");
         } else {
-            try target.writeAll(display);
-            try target.writeByte('\n');
+            target.str(display);
+            target.byte('\n');
         }
         if (opts.budget != null) try records.finish();
     }
-    if (opts.budget != null) try emitCapped(w, records.items.items, "", opts.budget, opts.json);
+    if (opts.budget != null) emitCapped(o, records.items.items, "", opts.budget, opts.json);
     return 0;
 }
 
-fn stats(arena: Allocator, opts: Options, text: []const u8, w: *Writer) !u8 {
+fn stats(arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
     const s = try oq.stats(arena, text);
-    var body: Writer.Allocating = .init(arena);
-    const bw = &body.writer;
+    var records = Records.init(arena);
+    const r = records.out();
     if (opts.json) {
-        try bw.print("{{\"type\":\"stats\",\"lines\":{d},\"bytes\":{d},\"errors\":{d},\"failures\":{d},\"warnings\":{d},\"first_error\":", .{ s.lines, s.bytes, s.error_lines, s.failure_lines, s.warning_lines });
-        try writeOptionalNumber(bw, s.first_error);
-        try bw.writeAll(",\"first_failure\":");
-        try writeOptionalNumber(bw, s.first_failure);
-        try bw.writeAll(",\"first_warning\":");
-        try writeOptionalNumber(bw, s.first_warning);
-        try bw.print(",\"longest_line\":{d},\"frameworks\":[", .{s.longest_line});
-        try writeFrameworksJson(bw, s.frameworks);
-        try bw.writeAll("]}\n");
+        const fields = [_]struct { []const u8, ?u64 }{
+            .{ "{\"type\":\"stats\",\"lines\":", s.lines },
+            .{ ",\"bytes\":", s.bytes },
+            .{ ",\"errors\":", s.error_lines },
+            .{ ",\"failures\":", s.failure_lines },
+            .{ ",\"warnings\":", s.warning_lines },
+            .{ ",\"first_error\":", s.first_error },
+            .{ ",\"first_failure\":", s.first_failure },
+            .{ ",\"first_warning\":", s.first_warning },
+            .{ ",\"longest_line\":", s.longest_line },
+        };
+        for (fields) |field| r.optField(field[0], field[1]);
+        r.str(",\"frameworks\":[");
+        writeFrameworks(r, s.frameworks, true);
+        r.str("]}\n");
     } else {
-        try bw.print("lines: {d}\nbytes: {d}\n", .{ s.lines, s.bytes });
+        r.field("lines: ", s.lines);
+        r.field("\nbytes: ", s.bytes);
         const rows = [_]struct { []const u8, u64, ?u64 }{
-            .{ "errors", s.error_lines, s.first_error },
-            .{ "failures", s.failure_lines, s.first_failure },
-            .{ "warnings", s.warning_lines, s.first_warning },
+            .{ "\nerrors: ", s.error_lines, s.first_error },
+            .{ "\nfailures: ", s.failure_lines, s.first_failure },
+            .{ "\nwarnings: ", s.warning_lines, s.first_warning },
         };
         for (rows) |row| {
-            try bw.print("{s}: {d}", .{ row[0], row[1] });
-            if (row[2]) |first| try bw.print(" (first at line {d})", .{first});
-            try bw.writeByte('\n');
+            r.field(row[0], row[1]);
+            if (row[2]) |at| {
+                r.field(" (first at line ", at);
+                r.byte(')');
+            }
         }
-        try bw.print("longest line: {d} bytes\nframeworks: ", .{s.longest_line});
-        try writeFrameworksText(bw, s.frameworks);
-        try bw.writeByte('\n');
+        r.field("\nlongest line: ", s.longest_line);
+        r.str(" bytes\nframeworks: ");
+        writeFrameworks(r, s.frameworks, false);
+        r.byte('\n');
     }
-    try emitCapped(w, &.{}, body.written(), opts.budget, opts.json);
+    if (r.failed) return error.OutOfMemory;
+    emitCapped(o, &.{}, records.current.written(), opts.budget, opts.json);
     return 0;
 }
 
