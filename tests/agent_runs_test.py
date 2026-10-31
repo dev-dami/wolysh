@@ -542,14 +542,46 @@ class SessionTests(AgentTestCase):
         self.assertIn(b"\npartial\r", re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", screen))
         self.detach_client(pid, fd)
 
+    def test_a_fast_producer_slows_down_for_a_reading_client(self):
+        self.ok("session", "new", "fast")
+        pid, fd = self.attach_client("fast")
+        self.read_until(fd, b"[fast]")
+        total = 20_000_000
+        os.write(fd, b"head -c %d /dev/zero | tr '\\0' x; echo; echo FAST$((1+1))DONE\r" % total)
+        # Read everything, as a terminal would. The relay must wait for this
+        # client, not drop it, so every byte arrives.
+        screen = bytearray()
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 1 << 20)
+            except OSError:
+                break
+            if not chunk:
+                break
+            screen += chunk
+            if b"FAST2DONE" in screen[-4096:]:
+                break
+        end = screen.find(b"FAST2DONE")
+        self.assertGreater(end, 0, bytes(screen[-300:]))
+        self.assertNotIn(b"left session", screen)
+        # The command line has no run of 16 x's, so the output starts there.
+        start = screen.find(b"x" * 16)
+        self.assertEqual(screen[start:end].count(b"x"), total)
+        self.detach_client(pid, fd)
+
     def test_a_client_that_stops_reading_does_not_stall_the_session(self):
-        self.ok("session", "new", "s")
+        # The stall time is short here; it is 5 seconds by default.
+        self.ok("session", "new", "s", env=dict(self.env, WSH_ATTACH_STALL_MS="500"))
         pid, fd = self.attach_client("s")
         self.read_until(fd, b"[s]")
         os.write(fd, b"head -c 5000000 /dev/zero | tr '\\0' x; echo; echo BIG$((1+1))DONE\r")
         # Once the output starts, this client never reads again: its
-        # terminal fills, then the socket, and the relay must drop it rather
-        # than stop reading the session's output.
+        # terminal fills, then the socket. The relay waits for it only for
+        # the stall time, then drops it and lets the session's output drain.
         self.read_until(fd, b"xxxxxxxx")
         # The request waits for the foreground command, so it answers only
         # once the 5 MB were written.

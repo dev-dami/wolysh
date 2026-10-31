@@ -199,9 +199,12 @@ A command in the foreground continues after you detach, as in tmux. The
 session keeps the newest 64 KiB of terminal output, and the next attach shows
 it first. A new attach replaces a client that is still attached. When the
 client's terminal changes size, the session's terminal and its foreground
-program get the new size. The session never waits for a client: when a client
-falls more than about 1 MiB behind the output, the session drops it. Attach
-again to get the replay buffer.
+program get the new size. When a client falls more than 1 MiB behind the
+output, the session stops reading its terminal until the client has caught
+up, so a fast program waits for its output, as under tmux. A client that
+accepts no output for 5 seconds (`WSH_ATTACH_STALL_MS` milliseconds) while
+output waits is dropped, and the session continues. Attach again to get the
+replay buffer.
 
 `session exec` requests interrupt the attached prompt and run between
 commands. A line that is partly typed stays, with its cursor, and you can
