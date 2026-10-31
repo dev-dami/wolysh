@@ -822,7 +822,7 @@ pub const Editor = struct {
                     .eof => return .eof,
                     .interrupted => {
                         if (term.takeResize()) return .resize;
-                        if (proc.hangupPending()) return .eof;
+                        if (proc.hangupPending() or term.wakePending()) return .eof;
                     },
                 }
             }

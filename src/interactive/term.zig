@@ -45,6 +45,18 @@ pub fn takeResize() bool {
 
 pub const ReadResult = union(enum) { byte: u8, eof, interrupted };
 
+/// A descriptor whose readability also ends a key wait, or -1. A session
+/// host sets it to its daemon socket, so a request can interrupt the
+/// attached prompt.
+pub var wake_fd: i32 = -1;
+
+/// True when `wake_fd` has something to read.
+pub fn wakePending() bool {
+    if (wake_fd < 0) return false;
+    var fds = [_]linux.pollfd{.{ .fd = wake_fd, .events = linux.POLL.IN, .revents = 0 }};
+    return linux.poll(&fds, 1, 0) == 1;
+}
+
 /// Reads one byte, reporting EINTR instead of retrying it. SIGHUP and SIGWINCH
 /// stay blocked until `ppoll` unblocks them atomically, so one that arrived
 /// while the prompt was drawn interrupts the wait instead of being missed.
@@ -56,8 +68,12 @@ pub fn readByteInterruptible(fd: i32) ReadResult {
     _ = linux.sigprocmask(linux.SIG.BLOCK, &watched, &previous);
     defer _ = linux.sigprocmask(linux.SIG.SETMASK, &previous, null);
     if (proc.hangupPending() or resized.load(.monotonic)) return .interrupted;
-    var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    var fds = [_]linux.pollfd{
+        .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = wake_fd, .events = linux.POLL.IN, .revents = 0 },
+    };
     if (linux.errno(linux.ppoll(&fds, fds.len, null, &previous)) == .INTR) return .interrupted;
+    if (fds[1].revents != 0) return .interrupted;
 
     var b: [1]u8 = undefined;
     const rc = linux.read(fd, &b, 1);

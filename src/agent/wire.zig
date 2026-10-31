@@ -50,14 +50,7 @@ pub fn send(fd: i32, body: []const u8, fds: []const i32) bool {
         .controllen = 0,
         .flags = 0,
     };
-    if (fds.len != 0) {
-        const data_len = fds.len * @sizeOf(i32);
-        const cmsg: *linux.cmsghdr = @ptrCast(&control);
-        cmsg.* = .{ .len = cmsg_header_len + data_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
-        @memcpy(control[cmsg_header_len..][0..data_len], std.mem.sliceAsBytes(fds));
-        msg.control = &control;
-        msg.controllen = cmsg_header_len + std.mem.alignForward(usize, data_len, @sizeOf(usize));
-    }
+    attachRights(&msg, &control, fds);
     var sent: usize = 0;
     while (true) {
         const rc = linux.sendmsg(fd, &msg, linux.MSG.NOSIGNAL);
@@ -78,6 +71,53 @@ pub fn send(fd: i32, body: []const u8, fds: []const i32) bool {
     }
     if (sent < total) return sys.writeAll(fd, body[sent - head.len ..]) == .ok;
     return true;
+}
+
+fn attachRights(msg: *linux.msghdr_const, control: *align(@alignOf(linux.cmsghdr)) [control_len]u8, fds: []const i32) void {
+    if (fds.len == 0) return;
+    const data_len = fds.len * @sizeOf(i32);
+    const cmsg: *linux.cmsghdr = @ptrCast(control);
+    cmsg.* = .{ .len = cmsg_header_len + data_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
+    @memcpy(control[cmsg_header_len..][0..data_len], std.mem.sliceAsBytes(fds));
+    msg.control = control;
+    msg.controllen = cmsg_header_len + std.mem.alignForward(usize, data_len, @sizeOf(usize));
+}
+
+/// A whole frame, header and body, for callers that send it in pieces.
+pub fn encodeFrame(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    if (body.len > max_frame) return error.FrameTooLarge;
+    const bytes = try allocator.alloc(u8, 4 + body.len);
+    bytes[0..4].* = header(body.len);
+    @memcpy(bytes[4..], body);
+    return bytes;
+}
+
+/// One `sendmsg` that never blocks: returns how many bytes the socket took,
+/// with `fds` riding on the first of them. `WouldBlock` means the socket is
+/// full; `Failed` means the peer is gone.
+pub fn sendNow(fd: i32, bytes: []const u8, fds: []const i32) error{ WouldBlock, Failed }!usize {
+    std.debug.assert(fds.len <= max_fds);
+    const iov = [_]std.posix.iovec_const{.{ .base = bytes.ptr, .len = bytes.len }};
+    var control: [control_len]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var msg = linux.msghdr_const{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = iov.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    attachRights(&msg, &control, fds);
+    while (true) {
+        const rc = linux.sendmsg(fd, &msg, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.Failed,
+        }
+    }
 }
 
 pub const Frame = struct {

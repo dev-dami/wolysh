@@ -2,6 +2,7 @@
 """End-to-end checks for background runs (`wsh run`), persistent sessions
 (`wsh session`) and the per-user daemon. Each test uses its own
 `XDG_RUNTIME_DIR`, so tests share no state, and stops its daemon and runs."""
+import fcntl
 import json
 import os
 import pathlib
@@ -13,6 +14,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 
@@ -430,53 +432,131 @@ class SessionTests(AgentTestCase):
         self.assertTrue(wait_until(lambda: not pid_alive(daemon), timeout=8))
         self.assertFalse((self.state / "daemon.sock").exists())
 
-    def test_attach_and_detach(self):
-        self.ok("session", "new", "a")
+    def attach_client(self, name, rows=24, cols=80):
+        pid, fd = pty.fork()
+        if pid == 0:
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            os.execve(str(SHELL), [str(SHELL), "session", "attach", name], self.env)
+        return pid, fd
 
-        def attach():
-            pid, fd = pty.fork()
-            if pid == 0:
-                os.execve(str(SHELL), [str(SHELL), "session", "attach", "a"], self.env)
-            return pid, fd
+    def read_until(self, fd, needle, timeout=10):
+        data = b""
+        deadline = time.time() + timeout
+        while needle not in data and time.time() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+        return data
 
-        def read_until(fd, needle, timeout=10):
-            data = b""
-            deadline = time.time() + timeout
-            while needle not in data and time.time() < deadline:
-                ready, _, _ = select.select([fd], [], [], 0.1)
-                if ready:
-                    try:
-                        chunk = os.read(fd, 65536)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    data += chunk
-            return data
-
-        pid, fd = attach()
-        self.assertIn(b"[a]", read_until(fd, b"[a]"))
-        os.write(fd, b"cd /tmp; y=5; echo value=$y\r")
-        self.assertIn(b"value=5", read_until(fd, b"value=5"))
+    def detach_client(self, pid, fd):
         os.write(fd, b"\x1cd")
-        self.assertIn(b"detached from session a", read_until(fd, b"detached"))
+        self.assertIn(b"detached from session", self.read_until(fd, b"detached"))
         _, status = os.waitpid(pid, 0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 0)
         os.close(fd)
 
+    def session_info(self, name):
+        for line in self.ok("session", "ls", "--json").stdout.splitlines():
+            info = json.loads(line)
+            if info["name"] == name:
+                return info
+        return None
+
+    def test_attach_and_detach(self):
+        self.ok("session", "new", "a")
+        pid, fd = self.attach_client("a")
+        self.assertIn(b"[a]", self.read_until(fd, b"[a]"))
+        os.write(fd, b"cd /tmp; y=5; echo value=$y\r")
+        self.assertIn(b"value=5", self.read_until(fd, b"value=5"))
+        self.detach_client(pid, fd)
+        # A directory change at the prompt reaches `session ls` too.
+        self.assertTrue(wait_until(lambda: self.session_info("a")["cwd"] == "/tmp"))
+
         self.assertEqual(self.ok("session", "exec", "a", "pwd; echo $y").stdout, b"/tmp\n5\n")
 
-        # A second attach gets a new terminal; `exit` there ends the session.
-        pid, fd = attach()
-        self.assertIn(b"[a]", read_until(fd, b"[a]"))
+        # A second attach reaches the same terminal; `exit` there ends the session.
+        pid, fd = self.attach_client("a")
+        self.assertIn(b"[a]", self.read_until(fd, b"[a]"))
         os.write(fd, b"exit\r")
-        read_until(fd, b"left session")
+        self.read_until(fd, b"left session")
         os.waitpid(pid, 0)
         os.close(fd)
         self.assertTrue(wait_until(lambda: self.ok("session", "ls").stdout == b""))
 
         no_tty = self.wsh("session", "attach", "a")
         self.assertEqual(no_tty.returncode, 1)
+
+    def test_attach_forwards_resizes(self):
+        self.ok("session", "new", "r")
+        pid, fd = self.attach_client("r", rows=24, cols=80)
+        self.read_until(fd, b"[r]")
+        os.write(fd, b"stty size\r")
+        self.assertIn(b"24 80", self.read_until(fd, b"24 80"))
+        # Resizing the client's terminal sends it SIGWINCH; the size must
+        # reach the session's terminal and its foreground program.
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 132, 0, 0))
+        time.sleep(0.3)
+        os.write(fd, b"stty size\r")
+        self.assertIn(b"40 132", self.read_until(fd, b"40 132"))
+        self.detach_client(pid, fd)
+
+    def test_detach_keeps_the_foreground_command(self):
+        self.ok("session", "new", "f")
+        pid, fd = self.attach_client("f")
+        self.read_until(fd, b"[f]")
+        os.write(fd, b"for i in 1 2 3 4 5; do echo tick $i; sleep 0.3; done; echo DONE\r")
+        self.detach_client(pid, fd)
+        time.sleep(2.2)
+
+        # The loop was not hung up: its output, written while nobody was
+        # attached, comes back on the next attach.
+        pid, fd = self.attach_client("f")
+        replay = self.read_until(fd, b"\nDONE")
+        self.assertIn(b"\nDONE", replay)
+        for i in range(1, 6):
+            self.assertIn(b"tick %d" % i, replay)
+        os.write(fd, b"echo $((40+2))\r")
+        self.assertIn(b"42", self.read_until(fd, b"\n42"))
+        self.detach_client(pid, fd)
+        # The session still answers requests between attaches.
+        self.assertEqual(self.ok("session", "exec", "f", "echo ok").stdout, b"ok\n")
+
+    def test_daemon_does_not_wait_for_a_busy_session(self):
+        self.ok("session", "new", "A")
+        self.ok("session", "new", "B")
+        busy = subprocess.Popen([str(SHELL), "session", "exec", "A", "--", "sleep 4; echo slept"],
+                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        script = pathlib.Path(self.runtime) / "big.wsh"
+        script.write_text(("# " + "x" * 1000 + "\n") * 1000 + "echo big-ok\n")
+        time.sleep(0.3)
+        # About 1 MB: far more than a socket buffer, for a host that is busy.
+        big = subprocess.Popen([str(SHELL), "-c", f's=$(cat {script}); session exec A -- "$s"'],
+                               env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.8)
+        begin = time.monotonic()
+        self.assertIn(b"A", self.ok("session", "ls").stdout)
+        self.assertEqual(self.ok("session", "exec", "B", "echo from-b").stdout, b"from-b\n")
+        self.assertLess(time.monotonic() - begin, 1.0)
+        self.assertIsNone(busy.poll())
+        self.assertIsNone(big.poll())
+        out, err = big.communicate(timeout=30)
+        self.assertEqual((big.returncode, out), (0, b"big-ok\n"), err)
+        self.assertEqual(busy.communicate(timeout=10)[0], b"slept\n")
+
+    def test_ls_shows_the_current_directory(self):
+        self.ok("session", "new", "w")
+        self.assertEqual(self.session_info("w")["cwd"], self.runtime)
+        self.ok("session", "exec", "w", "--", "cd /tmp")
+        self.assertEqual(self.session_info("w")["cwd"], "/tmp")
+        self.assertRegex(self.ok("session", "ls").stdout.decode(), r"\nw +\d+ +idle +\S+ +/tmp\n")
+        meta = json.loads((self.state / "sessions" / "w" / "meta.json").read_text())
+        self.assertEqual(meta["cwd"], "/tmp")
 
 
 @unittest.skipUnless(os.geteuid() == 0, "needs root to act as another user")
