@@ -29,8 +29,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   An attached session keeps its terminal: a foreground command continues
   after a detach, the next attach replays the newest 64 KiB of output, and
   terminal resizes reach the session. A `session exec` request keeps a line
-  that is partly typed at the attached prompt. A client that stops reading is
-  dropped after about 1 MiB of unread output, and the session continues.
+  that is partly typed at the attached prompt. A client more than 1 MiB
+  behind slows the session's output down, as under tmux; a client that reads
+  nothing for 5 seconds (`WSH_ATTACH_STALL_MS`) is dropped, and the session
+  continues.
   `session ls` shows each session's
   current directory.
   `wsh run` and `wsh session` no longer run a script file with that name; use

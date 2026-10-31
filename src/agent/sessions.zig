@@ -595,10 +595,12 @@ fn openTerminal(sh: *Shell, arena: std.mem.Allocator, ctl: i32, conn: i32, rows:
         _ = linux.close(pair.slave);
         return -1;
     }
+    const stall_text = std.mem.trim(u8, sh.getEnv("WSH_ATTACH_STALL_MS") orelse "", " ");
+    const stall_ms = @max(std.fmt.parseInt(i64, stall_text, 10) catch default_stall_ms, 0);
     const rc = linux.fork();
     if (rc == 0) {
         // A grandchild nobody has to reap.
-        if (linux.fork() == 0) relay(channel[1], pair.master, conn);
+        if (linux.fork() == 0) relay(channel[1], pair.master, conn, stall_ms);
         linux.exit(0);
     }
     if (linux.errno(rc) == .SUCCESS) _ = proc.waitPid(@intCast(rc), 0);
@@ -723,23 +725,31 @@ const Backlog = struct {
     }
 };
 
-/// Output an attached client has not read yet. Past this the client is
-/// dropped rather than let the session wait; it can attach again and gets
-/// the replay buffer.
-const max_client_backlog = 1 << 20;
+/// Unread client output above which the relay stops reading the terminal
+/// until the client has caught up to half of it. The session's programs then
+/// wait on their output, as under tmux.
+const pause_backlog = 1 << 20;
 
-/// The terminal relay's state. Nothing in it blocks: the client and the
-/// master side are written without waiting, so the session's programs
-/// always have somewhere to put their output.
+/// How long a client may accept nothing while output waits for it before
+/// it is dropped: 5 seconds, or `WSH_ATTACH_STALL_MS`.
+const default_stall_ms: i64 = 5000;
+
+/// The terminal relay's state. The relay itself never blocks: it writes to
+/// the client and the terminal without waiting and uses poll for the rest.
 const Relay = struct {
     gpa: std.mem.Allocator,
     channel: i32,
     master: i32,
     client: i32,
+    stall_ms: i64,
     ring: Ring = .{},
     parser: InputParser = .{},
     /// Output for the client.
     out: Backlog = .{},
+    /// When the client last accepted bytes, or when output began to wait.
+    progress_ms: i64 = 0,
+    /// Set while the client is too far behind: the terminal is not read.
+    paused: bool = false,
     /// Keystrokes for the terminal. While any wait, the relay stops reading
     /// the client, so a program that does not read its input slows the
     /// client down instead of filling memory.
@@ -749,6 +759,8 @@ const Relay = struct {
         if (self.client >= 0) _ = linux.close(self.client);
         self.client = -1;
         self.out.clear();
+        // Nobody to wait for: the terminal drains into the replay buffer.
+        self.paused = false;
     }
 
     /// Sends `data` to the client after what is already waiting.
@@ -761,20 +773,31 @@ const Relay = struct {
                 error.Failed => return self.dropClient(),
             };
             rest = rest[n..];
+            // The stall clock starts when output begins to wait.
+            self.progress_ms = state.monotonicMs();
         }
         if (rest.len == 0) return;
-        if (self.out.len() + rest.len > max_client_backlog) return self.dropClient();
-        self.out.push(self.gpa, rest) catch self.dropClient();
+        self.out.push(self.gpa, rest) catch return self.dropClient();
+        if (self.out.len() > pause_backlog) self.paused = true;
     }
 
     fn flushClient(self: *Relay) void {
         while (self.client >= 0 and self.out.len() != 0) {
             const n = wire.sendNow(self.client, self.out.pending(), &.{}) catch |e| switch (e) {
-                error.WouldBlock => return,
+                error.WouldBlock => break,
                 error.Failed => return self.dropClient(),
             };
             self.out.consume(n);
+            self.progress_ms = state.monotonicMs();
         }
+        if (self.paused and self.out.len() < pause_backlog / 2) self.paused = false;
+    }
+
+    /// Milliseconds until a client that accepts nothing is dropped; -1 when
+    /// no output waits.
+    fn stallTimeout(self: *const Relay) i32 {
+        if (self.client < 0 or self.out.len() == 0) return -1;
+        return @intCast(std.math.clamp(self.progress_ms + self.stall_ms - state.monotonicMs(), 0, std.math.maxInt(i32)));
     }
 
     fn flushInput(self: *Relay) void {
@@ -840,7 +863,7 @@ const Relay = struct {
 /// resizes to the terminal, and takes new clients from the daemon on
 /// `channel`; a new client replaces the old one. The relay exits with the
 /// host, which hangs up its session, or when the daemon goes away.
-fn relay(channel: i32, master: i32, first: i32) noreturn {
+fn relay(channel: i32, master: i32, first: i32, stall_ms: i64) noreturn {
     proc.resetSignals();
     var ignore = std.mem.zeroes(linux.Sigaction);
     ignore.handler = .{ .handler = linux.SIG.IGN };
@@ -854,21 +877,25 @@ fn relay(channel: i32, master: i32, first: i32) noreturn {
     const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
     _ = linux.fcntl(master, linux.F.SETFL, flags | nonblock);
 
-    var self = Relay{ .gpa = std.heap.page_allocator, .channel = channel, .master = master, .client = first };
+    var self = Relay{ .gpa = std.heap.page_allocator, .channel = channel, .master = master, .client = first, .stall_ms = stall_ms };
     var buf: [65536]u8 = undefined;
     while (true) {
         const polled_client = self.client;
         const waiting_input = self.input.len() != 0;
         var fds = [_]linux.pollfd{
             .{ .fd = channel, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = master, .events = linux.POLL.IN | (if (waiting_input) @as(i16, linux.POLL.OUT) else 0), .revents = 0 },
+            .{
+                .fd = master,
+                .events = (if (self.paused) 0 else @as(i16, linux.POLL.IN)) | (if (waiting_input) @as(i16, linux.POLL.OUT) else 0),
+                .revents = 0,
+            },
             .{
                 .fd = self.client,
                 .events = (if (waiting_input) 0 else @as(i16, linux.POLL.IN)) | (if (self.out.len() != 0) @as(i16, linux.POLL.OUT) else 0),
                 .revents = 0,
             },
         };
-        const rc = linux.poll(&fds, fds.len, -1);
+        const rc = linux.poll(&fds, fds.len, self.stallTimeout());
         if (linux.errno(rc) == .INTR) continue;
         if (linux.errno(rc) != .SUCCESS) break;
         if (fds[0].revents != 0) {
@@ -879,11 +906,16 @@ fn relay(channel: i32, master: i32, first: i32) noreturn {
         }
         if (fds[1].revents & linux.POLL.OUT != 0) self.flushInput();
         if (fds[1].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0 and !self.readMaster(&buf)) break;
-        if (self.client < 0 or self.client != polled_client) continue;
-        const client_events = fds[2].revents;
-        if (client_events & linux.POLL.OUT != 0) self.flushClient();
-        if (self.client < 0 or client_events & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) == 0) continue;
-        if (self.input.len() == 0) self.readClient(&buf) else if (client_events & linux.POLL.IN == 0) self.dropClient();
+        if (self.client >= 0 and self.client == polled_client) {
+            const client_events = fds[2].revents;
+            if (client_events & linux.POLL.OUT != 0) self.flushClient();
+            if (self.client >= 0 and client_events & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0) {
+                if (self.input.len() == 0) self.readClient(&buf) else if (client_events & linux.POLL.IN == 0) self.dropClient();
+            }
+        }
+        // A client that took nothing for the whole stall time goes, so the
+        // session is never stuck behind it.
+        if (self.stallTimeout() == 0) self.dropClient();
     }
     linux.exit(0);
 }
