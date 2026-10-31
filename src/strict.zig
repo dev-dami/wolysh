@@ -162,8 +162,12 @@ pub fn exitTrapStatus() ?u8 {
 /// that has not changed any trap, the parent's.
 pub fn listedTrap(sh: *const Shell, id: u32) ?[]const u8 {
     if (sh.getTrap(id)) |handler| return handler;
-    const inherited = inherited_traps orelse return null;
-    return if (id < inherited.len) inherited[id] else null;
+    if (inherited_traps) |inherited| {
+        if (id < inherited.len) if (inherited[id]) |text| return text;
+    }
+    // A script lists the signals it inherited as ignored, as Bash does.
+    if (!sh.interactive and id >= 1 and id <= Shell.max_signal and proc.ignoredOnEntry(id)) return "";
+    return null;
 }
 
 /// Call after `trap` changes anything.

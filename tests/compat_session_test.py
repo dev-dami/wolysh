@@ -319,7 +319,11 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(status, 0)
         tail = strip_ansi(s.buf[start:])
         self.assertIn(b"<ps0 42>", tail)
-        self.assertLess(tail.find(b"<ps0 42>"), tail.find(b"body\r\n"))
+        # PS0 comes after the echoed command line and before its output.
+        ps0 = tail.find(b"<ps0 42>")
+        self.assertGreater(tail.find(b"echo body"), -1)
+        self.assertLess(tail.find(b"echo body"), ps0)
+        self.assertGreater(tail.find(b"body\r\n", ps0), ps0)
         self.assertIsNotNone(s.read_until(b"PC-TWO", start))
         self.assertLess(s.buf.find(b"PC-ONE", start), s.buf.find(b"PC-TWO", start))
 

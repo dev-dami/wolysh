@@ -641,9 +641,6 @@ const ReplEnd = enum { request, hangup };
 fn repl(sh: *Shell, editor: *editor_mod.Editor, tty: i32, name: []const u8, ctl: i32) ReplEnd {
     var prompt_text: std.Io.Writer.Allocating = .init(sh.gpa);
     defer prompt_text.deinit();
-    var reported_cwd: std.ArrayList(u8) = .empty;
-    defer reported_cwd.deinit(sh.gpa);
-    reported_cwd.appendSlice(sh.gpa, sh.cwd) catch {};
     while (!sh.should_exit) {
         sh.resetLineArena();
         sh.reapJobs();
@@ -667,18 +664,17 @@ fn repl(sh: *Shell, editor: *editor_mod.Editor, tty: i32, name: []const u8, ctl:
         sh.interrupted = false;
         if (editor.interrupted or source.len == 0) continue;
         _ = sh.hist.record(sh.gpa, source, .{}) catch null;
+        // A command typed at the terminal keeps the session busy, so idle
+        // cleanup never stops it, even after the client detaches.
+        var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
+        defer arena_state.deinit();
+        _ = wire.sendJson(ctl, arena_state.allocator(), daemon.HostMessage{ .op = "busy" }, &.{});
         _ = exec.runSource(sh, source);
         if (sh.interrupted) {
             sh.last_status = 130;
             sys.writeStr(2, "\n");
         }
-        if (!std.mem.eql(u8, reported_cwd.items, sh.cwd)) {
-            reported_cwd.clearRetainingCapacity();
-            reported_cwd.appendSlice(sh.gpa, sh.cwd) catch {};
-            var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
-            defer arena_state.deinit();
-            _ = wire.sendJson(ctl, arena_state.allocator(), daemon.HostMessage{ .op = "cwd", .cwd = sh.cwd }, &.{});
-        }
+        _ = wire.sendJson(ctl, arena_state.allocator(), daemon.HostMessage{ .op = "done", .cwd = sh.cwd }, &.{});
     }
     _ = strict.finish(sh, sh.exit_code);
     return .request;

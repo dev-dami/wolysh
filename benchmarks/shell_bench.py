@@ -80,18 +80,36 @@ class AgentFixture:
         self.wsh = str(wsh)
         self.dir = tempfile.mkdtemp(prefix="wsh-bench-")
         self.runtime = os.path.join(self.dir, "runtime")
-        os.mkdir(self.runtime, 0o700)
         self.log = os.path.join(self.dir, "test.log")
-        write_test_log(self.log, megabytes)
         self.env = {"XDG_RUNTIME_DIR": self.runtime, "BENCH_LOG": self.log, "BENCH_DIR": self.dir}
-        environment = dict(os.environ, **self.env)
-        subprocess.run([self.wsh, "run", "-d", "--name", "bench", "--", f"cat {shlex.quote(self.log)}"], env=environment, check=True, capture_output=True)
-        subprocess.run([self.wsh, "run", "wait", "bench"], env=environment, check=True, capture_output=True)
-        subprocess.run([self.wsh, "session", "new", "bench"], env=environment, check=True, capture_output=True)
+        try:
+            os.mkdir(self.runtime, 0o700)
+            write_test_log(self.log, megabytes)
+            self.wsh_run("run", "-d", "--name", "bench", "--", f"cat {shlex.quote(self.log)}")
+            self.wsh_run("run", "wait", "bench")
+            self.wsh_run("session", "new", "bench")
+        except BaseException:
+            self.close()
+            raise
+
+    def wsh_run(self, *args, check=True, timeout=60):
+        return subprocess.run([self.wsh, *args], env=dict(os.environ, **self.env), check=check, capture_output=True, timeout=timeout)
+
+    def forget_extra_runs(self):
+        """Removes the runs a `run_start` sample made, outside the timing, so
+        each sample starts from the same state directory."""
+        listing = self.wsh_run("run", "status", "--json", check=False).stdout.decode()
+        for line in listing.splitlines():
+            name = json.loads(line).get("name")
+            if name and name != "bench":
+                self.wsh_run("run", "wait", name, check=False)
+                self.wsh_run("run", "rm", name, check=False)
 
     def close(self):
-        environment = dict(os.environ, **self.env)
-        subprocess.run([self.wsh, "session", "kill", "bench"], env=environment, capture_output=True, check=False)
+        try:
+            self.wsh_run("session", "kill", "bench", check=False, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         pid_file = os.path.join(self.runtime, "wsh", "daemon.pid")
         try:
             os.kill(int(open(pid_file).read().strip()), 15)
@@ -106,7 +124,7 @@ def agent_workloads():
     path without shell start-up); strings run with `-c`."""
     log = '"$BENCH_LOG"'
     return {
-        "run_start": {"wsh": ["run", "-d", "--", "/bin/true"], "bash": 'nohup /bin/true > "$BENCH_DIR/nohup.log" 2>&1 &'},
+        "run_start": {"wsh": ["run", "-d", "--", "/bin/true"], "bash": 'nohup /bin/true > "$BENCH_DIR/nohup.log" 2>&1 &', "after": "forget_extra_runs"},
         "run_status": {"wsh": ["run", "status", "bench"], "bash": f'kill -0 1 2>/dev/null; wc -c < {log}'},
         "run_logs_tail": {"wsh": ["run", "logs", "bench", "--tail", "50"], "bash": f"tail -n 50 {log}"},
         "session_exec": {"wsh": ["session", "exec", "bench", "--", "true"], "bash": "true"},
@@ -141,7 +159,7 @@ def agent_names():
     return set(agent_workloads())
 
 
-def run_workload(output, rng, shells, runs, name, work, extra_env):
+def run_workload(output, rng, shells, runs, name, work, extra_env, fixture=None):
     # A previous release has none of the agent commands; Bash only runs a
     # workload that has a Bash form.
     participants = [
@@ -154,13 +172,17 @@ def run_workload(output, rng, shells, runs, name, work, extra_env):
     def source_for(shell):
         return work["bash"] if shell == "bash" else work["wsh"]
 
+    # Cleanup between samples (outside the timing) keeps each one alike.
+    after = getattr(fixture, work["after"]) if fixture and "after" in work else (lambda: None)
     samples = {shell: [] for shell in participants}
     for shell in participants:
         measure(shells[shell], source_for(shell), shell == "bash", extra_env, statuses)
+        after()
     for _ in range(runs):
         rng.shuffle(participants)
         for shell in participants:
             samples[shell].append(measure(shells[shell], source_for(shell), shell == "bash", extra_env, statuses))
+            after()
     medians = {shell: round(statistics.median(values), 3) for shell, values in samples.items()}
     output["results"][name] = {
         "median_ms": medians,
@@ -216,7 +238,8 @@ def main():
         table.update(agent_workloads())
     try:
         for name, work in table.items():
-            run_workload(output, rng, shells, args.runs, name, work, fixture.env if fixture and name in agent_names() else None)
+            is_agent = fixture is not None and name in agent_names()
+            run_workload(output, rng, shells, args.runs, name, work, fixture.env if is_agent else None, fixture if is_agent else None)
     finally:
         if fixture:
             fixture.close()

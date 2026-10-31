@@ -161,6 +161,12 @@ fn runStages(
     const lastpipe = sh.options.lastpipe and !background and !sh.job_control and commands[commands.len - 1].coproc == null;
     var tail_pipe: [2]i32 = .{ -1, -1 };
     if (lastpipe and linux.errno(linux.pipe2(&tail_pipe, .{ .CLOEXEC = true })) != .SUCCESS) return 1;
+    // Closed here on any early return; `runLastInShell` takes them over.
+    var tail_owned = lastpipe;
+    defer if (tail_owned) {
+        sys.closeFd(tail_pipe[0]);
+        sys.closeFd(tail_pipe[1]);
+    };
     for (if (lastpipe) commands[0 .. commands.len - 1] else commands) |original| {
         var cmd = original;
         var resolved: command.Resolved = .{ .words = cmd.words };
@@ -216,6 +222,7 @@ fn runStages(
     defer command.restoreAliases(mark);
     const text = pipelineText(arena, commands) catch "pipeline";
     if (lastpipe) {
+        tail_owned = false;
         return runLastInShell(sh, arena, stages.items, commands[commands.len - 1], text, tail_pipe, &opened, runtime, outcome);
     }
     if (background) return startBackground(sh, arena, stages.items, text, runtime.expression_error);

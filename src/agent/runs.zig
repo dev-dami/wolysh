@@ -689,9 +689,10 @@ const LineScanner = struct {
                 if (matcher.matches(line)) return arena.dupe(u8, line) catch line;
                 self.partial.clearRetainingCapacity();
             }
+            // Only whole lines match, so the line printed is the one the
+            // program wrote (`READY on 8080`, not `READY on `); a last line
+            // without a newline is tried once the run has ended.
             if (self.partial.items.len + rest.len <= max_partial) self.partial.appendSlice(arena, rest) catch {};
-            // A plain substring is already visible in an unfinished line.
-            if (matcher.compiled == null and matcher.matches(self.partial.items)) return arena.dupe(u8, self.partial.items) catch null;
         }
         if (at_end and self.partial.items.len != 0 and matcher.matches(self.partial.items)) return self.partial.items;
         return null;

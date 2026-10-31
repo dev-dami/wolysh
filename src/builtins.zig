@@ -356,7 +356,7 @@ fn builtinUnset(ctx: Ctx) u8 {
             ctx.sh.getEnv(name) == null and ctx.sh.getFunc(name) != null;
         const ok = switch (mode) {
             .variable => unsetVariable(ctx, name),
-            .nameref => if (ctx.sh.isNameref(name)) ctx.sh.unsetNameref(name) else unsetVariable(ctx, name),
+            .nameref => if (ctx.sh.isNameref(name)) unsetNameref(ctx, name) else unsetVariable(ctx, name),
             .function => unsetFunction(ctx, name),
             .either => if (function_only) unsetFunction(ctx, name) else unsetVariable(ctx, name),
         };
@@ -380,6 +380,15 @@ fn unsetVariable(ctx: Ctx, name: []const u8) bool {
     _ = ctx.sh.unsetVar(name);
     _ = ctx.sh.unsetEnv(name);
     return true;
+}
+
+/// `unset -n NAME`: the reference itself, unless `declare -rn` locked it.
+fn unsetNameref(ctx: Ctx, name: []const u8) bool {
+    if (ctx.sh.readonly.contains(name)) {
+        ctx.errFmt("wsh: unset: {s}: cannot unset: readonly variable\n", .{name});
+        return false;
+    }
+    return ctx.sh.unsetNameref(name);
 }
 
 fn unsetFunction(ctx: Ctx, name: []const u8) bool {

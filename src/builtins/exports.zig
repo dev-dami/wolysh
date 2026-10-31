@@ -4,6 +4,9 @@ const std = @import("std");
 const builtins = @import("../builtins.zig");
 const options = @import("options.zig");
 const printf = @import("printf.zig");
+const arrays = @import("../arrays.zig");
+const special_vars = @import("../special_vars.zig");
+const value = @import("../value.zig");
 
 const Ctx = builtins.Ctx;
 const Allocator = std.mem.Allocator;
@@ -189,15 +192,22 @@ fn exportValue(ctx: Ctx, name: []const u8, text: []const u8, append: bool) !void
     var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var assigned = text;
-    if (append) {
-        const old = (try valueOf(ctx, arena, name)) orelse "";
-        assigned = try std.mem.concat(arena, u8, &.{ old, text });
+    if (!sh.hasVar(name)) {
+        var assigned = text;
+        if (append) assigned = try std.mem.concat(arena, u8, &.{ sh.getEnv(name) orelse "", text });
+        // `IFS`, `PS4` and the other computed names read their shell
+        // variable before any default, so an explicit export must set it.
+        if (special_vars.isSpecial(name)) try sh.setVar(name, .{ .string = assigned });
+        return sh.setEnv(name, assigned);
     }
-    if (!sh.hasVar(name)) return sh.setEnv(name, assigned);
-    // Through `setVar`, so `declare -i/-l/-u` still shape the value.
-    try sh.setVar(name, .{ .string = assigned });
-    const stored = (try valueOf(ctx, arena, name)) orelse assigned;
+    const current = sh.getVar(name).?;
+    // As an assignment: an array takes the value as element 0 (and, as in
+    // Bash, is not put in the environment); a scalar goes through
+    // `declare -i/-l/-u`, so `export n+=3` adds when `n` is an integer.
+    if (current == .list or current == .map) return arrays.assignElement(sh, arena, name, "0", text, append);
+    const old: ?value.Value = if (current == .none) null else current;
+    try sh.setVar(name, try arrays.combine(sh, arena, sh.getAttrs(name), old, text, append));
+    const stored = (try valueOf(ctx, arena, name)) orelse text;
     try sh.setEnv(name, stored);
 }
 

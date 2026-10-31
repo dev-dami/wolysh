@@ -452,6 +452,22 @@ class SessionTests(AgentTestCase):
         self.assertTrue(wait_until(lambda: not pid_alive(daemon), timeout=8))
         self.assertFalse((self.state / "daemon.sock").exists())
 
+    def test_idle_cleanup_spares_a_command_typed_at_the_terminal(self):
+        env = dict(self.env, WSH_SESSION_TTL="2")
+        self.ok("session", "new", "longjob", env=env)
+        pid, fd = self.attach_client("longjob")
+        self.read_until(fd, b"[longjob]")
+        # The markers are computed, so the echoed command line cannot match.
+        os.write(fd, b"echo STAR$((1+1))TED; sleep 6; echo SURVIVED$((1+1))\r")
+        self.assertIn(b"STAR2TED", self.read_until(fd, b"STAR2TED"))
+        self.detach_client(pid, fd)
+        # Well past the 2 s TTL, but the command is still running.
+        time.sleep(4)
+        self.assertIn(b"longjob", self.ok("session", "ls").stdout)
+        pid, fd = self.attach_client("longjob")
+        self.assertIn(b"SURVIVED2", self.read_until(fd, b"SURVIVED2", timeout=10))
+        self.detach_client(pid, fd)
+
     def attach_client(self, name, rows=24, cols=80):
         pid, fd = pty.fork()
         if pid == 0:
@@ -558,6 +574,21 @@ class SessionTests(AgentTestCase):
         os.write(fd, b"tial\r")
         screen = self.read_until(fd, b"partial\r\r\n")
         # The output line, once the editor's escape sequences are gone.
+        self.assertIn(b"\npartial\r", re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", screen))
+        self.detach_client(pid, fd)
+
+    def test_request_keeps_the_line_in_vi_normal_mode(self):
+        self.ok("session", "new", "vi")
+        self.ok("session", "exec", "vi", "set -o vi")
+        pid, fd = self.attach_client("vi")
+        self.read_until(fd, b"[vi]")
+        os.write(fd, b"echo par")
+        self.read_until(fd, b"echo par")
+        os.write(fd, b"\x1b")  # normal mode, where a stray key would edit the line
+        time.sleep(0.2)
+        self.assertEqual(self.ok("session", "exec", "vi", "echo from-exec").stdout, b"from-exec\n")
+        os.write(fd, b"Atial\r")
+        screen = self.read_until(fd, b"partial\r\r\n")
         self.assertIn(b"\npartial\r", re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", screen))
         self.detach_client(pid, fd)
 

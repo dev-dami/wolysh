@@ -51,9 +51,11 @@ pub const Reply = struct {
     sessions: ?[]const SessionInfo = null,
 };
 
-/// A message from a host to the daemon. `done` ends a routed request,
-/// `cwd` reports a new directory, and `relay` brings the socket of the
-/// session's terminal relay, which takes later attaches.
+/// A message from a host to the daemon. `done` ends a routed request or a
+/// command typed at the attached terminal (which `busy` starts), `cwd`
+/// reports a new directory, and `relay` brings the socket of the session's
+/// terminal relay, which takes later attaches. Every message refreshes the
+/// session's idle clock.
 pub const HostMessage = struct {
     op: []const u8,
     cwd: ?[]const u8 = null,
@@ -326,9 +328,12 @@ fn hostMessage(self: *Daemon, session: *Session) bool {
     defer frame.closeFds();
     const message = wire.parseJson(HostMessage, arena, frame.body) orelse return true;
     if (message.cwd) |cwd| setCwd(self, arena, session, cwd);
+    // Any report shows the session in use.
+    session.last_used_ms = state.nowMs();
     if (std.mem.eql(u8, message.op, "done")) {
         session.busy -|= 1;
-        session.last_used_ms = state.nowMs();
+    } else if (std.mem.eql(u8, message.op, "busy")) {
+        session.busy += 1;
     } else if (std.mem.eql(u8, message.op, "relay") and frame.fd_count == 1) {
         dropRelay(self, session);
         session.relay = frame.fds[0];

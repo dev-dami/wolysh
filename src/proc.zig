@@ -90,6 +90,27 @@ var original_actions: [linux.NSIG]?linux.Sigaction = [_]?linux.Sigaction{null} *
 /// Signals a `trap '' SIG` ignores. Children keep ignoring them.
 var trap_ignored: u64 = 0;
 
+/// Signals already ignored when the shell started. Bash lists them in `trap`
+/// output (`trap -- '' SIGTSTP`), so a script sees what it inherited.
+var entry_ignored: u64 = 0;
+
+/// Notes which signals the shell inherited as ignored. Call once at start-up,
+/// before the shell changes any disposition.
+pub fn recordEntryDispositions() void {
+    var sig: u32 = 1;
+    while (sig <= 64) : (sig += 1) {
+        var current: linux.Sigaction = undefined;
+        if (linux.errno(linux.sigaction(@enumFromInt(sig), null, &current)) != .SUCCESS) continue;
+        const handler = current.handler.handler orelse continue;
+        if (@intFromPtr(handler) == @intFromPtr(linux.SIG.IGN.?)) entry_ignored |= @as(u64, 1) << @intCast(sig - 1);
+    }
+}
+
+pub fn ignoredOnEntry(sig: u32) bool {
+    if (sig < 1 or sig > 64) return false;
+    return entry_ignored & (@as(u64, 1) << @intCast(sig - 1)) != 0;
+}
+
 fn signalBit(sig: linux.SIG) u64 {
     return @as(u64, 1) << @intCast(@intFromEnum(sig) - 1);
 }

@@ -198,6 +198,21 @@ class OutTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertEqual(missing.stdout, b"")
 
+    def test_raw_json_offsets_index_the_text_they_come_with(self):
+        (self.dir / "ansi.log").write_bytes(b"plain FAILED here\n\x1b[31mred FAILED\x1b[0m\n")
+        for source, key in (("out grep FAILED --json --raw --file ansi.log", "spans"),
+                            ("out find FAILED --json --raw --file ansi.log", "positions")):
+            records = [json.loads(line) for line in self.wsh(source).stdout.decode().splitlines()]
+            plain, colored = records[0], records[1]
+            # A plain line keeps offsets that slice its text; a coloured one
+            # gets none, since cleaned-line offsets would not index it.
+            if key == "spans":
+                self.assertEqual([plain["text"][a:b] for a, b in plain[key]], ["FAILED"])
+            else:
+                self.assertEqual("".join(plain["text"][p] for p in plain[key]), "FAILED")
+            self.assertIn("\x1b", colored["text"])
+            self.assertEqual(colored[key], [])
+
     def test_find_is_smart_case_and_shows_context(self):
         (self.dir / "case.log").write_text("Error here\nerror there\nfine\n")
         upper = self.wsh("out find Error --file case.log")

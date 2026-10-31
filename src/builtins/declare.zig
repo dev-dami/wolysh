@@ -163,7 +163,14 @@ fn declareOne(ctx: Ctx, arg: []const u8, opts: Options, is_local: bool) !void {
         try sh.setLocal(name, initial);
     }
 
-    if (opts.nameref) |on| return declareNameref(ctx, spec, on);
+    if (opts.nameref) |on| {
+        try declareNameref(ctx, spec, on);
+        // `declare -rn ref=target` locks the reference, as in Bash: writes
+        // still reach the target, but the reference cannot be pointed
+        // elsewhere.
+        if (opts.readonly) try sh.markReadonlyRaw(name);
+        return;
+    }
 
     // Type conversions, which bash allows only towards an indexed array.
     const existing = sh.vars.get(name);
@@ -235,6 +242,7 @@ fn declareOne(ctx: Ctx, arg: []const u8, opts: Options, is_local: bool) !void {
 fn declareNameref(ctx: Ctx, spec: Spec, on: bool) !void {
     const sh = ctx.sh;
     const name = spec.name;
+    if (sh.readonly.contains(name) and (spec.assigned != null or !on)) return error.ReadonlyVariable;
     if (!on) {
         var attrs = sh.getAttrs(name);
         attrs.nameref = false;

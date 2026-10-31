@@ -56,14 +56,18 @@ fn run(sh: *Shell, hook: Hook, args: []const []const u8) void {
         .PROMPT_COMMAND => blk: {
             // Bash 5.1: an array runs each element in turn.
             if (sh.getVar("PROMPT_COMMAND")) |v| if (v == .list) {
+                // Copied first: an element may unset or replace the array,
+                // which frees the stored list while the loop still runs.
                 const arena = sh.scratch();
-                var last: u8 = 0;
+                var commands: std.ArrayList([]const u8) = .empty;
                 for (v.list) |item| {
                     if (item == .none) continue;
                     const text = item.renderAlloc(arena) catch continue;
                     if (std.mem.trim(u8, text, " \t\n").len == 0) continue;
-                    last = exec.runSource(sh, arena.dupe(u8, text) catch continue);
+                    commands.append(arena, text) catch continue;
                 }
+                var last: u8 = 0;
+                for (commands.items) |text| last = exec.runSource(sh, text);
                 break :blk last;
             };
             const text = (prompt.textVar(sh, sh.scratch(), "PROMPT_COMMAND") catch null) orelse return;

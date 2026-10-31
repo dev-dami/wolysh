@@ -241,13 +241,16 @@ pub const Editor = struct {
         var kept: std.ArrayList(u8) = .empty;
         defer kept.deinit(gpa);
         const kept_cursor = self.cursor;
+        const kept_vi = self.vi;
         const resuming = self.woken;
         self.woken = false;
         if (resuming) kept.appendSlice(gpa, self.buf.items) catch {};
         self.resetLine();
         if (resuming) {
+            // The same line, cursor and vi mode the request interrupted.
             self.buf.appendSlice(gpa, kept.items) catch {};
             self.cursor = @min(kept_cursor, self.buf.items.len);
+            self.vi = kept_vi;
         }
         self.prompt_text = prompt_text;
         self.write_continuation = write_continuation;
@@ -397,6 +400,9 @@ pub const Editor = struct {
             self.updateWidth();
             return .handled;
         }
+        // A session request ended the key wait: leave the line exactly as it
+        // is (vi's normal mode would otherwise treat the end as a key).
+        if (key == .eof and self.woken) return .eof;
         self.before.clearRetainingCapacity();
         self.before.appendSlice(self.sh.gpa, self.buf.items) catch {};
         const before_cursor = self.cursor;

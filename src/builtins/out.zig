@@ -596,7 +596,10 @@ fn find(arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
             r.num(@abs(match.score));
             r.str(",\"positions\":[");
             var first = true;
-            for (match.positions) |pos| {
+            // Positions index the cleaned line; with --raw they are left out
+            // when the raw line differs (escapes), as they would be wrong.
+            const positions = if (std.mem.eql(u8, display, match.text)) match.positions else &.{};
+            for (positions) |pos| {
                 if (pos < cut.start or pos >= cut.end) continue;
                 if (!first) r.byte(',');
                 first = false;
@@ -682,7 +685,9 @@ fn grep(arena: Allocator, opts: Options, text: []const u8, o: *Out) !u8 {
             writeMatchHead(r, match.line, display, cut.start, cut.end);
             r.str(",\"spans\":[");
             var first = true;
-            for (match.spans) |span| {
+            // As for `find`: spans index the cleaned line.
+            const spans = if (std.mem.eql(u8, display, match.text)) match.spans else &.{};
+            for (spans) |span| {
                 if (span.start < cut.start or span.end > cut.end) continue;
                 r.str(if (first) "[" else ",[");
                 first = false;

@@ -72,6 +72,7 @@ const help_text =
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     const gpa = std.heap.smp_allocator;
+    proc.recordEntryDispositions();
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -399,8 +400,15 @@ const ScriptProblem = struct { text: []const u8, status: u8 };
 fn scriptProblem(gpa: std.mem.Allocator, path: []const u8) ?ScriptProblem {
     const z = gpa.dupeZ(u8, path) catch return null;
     defer gpa.free(z);
-    const kind = fs.kindFollow(z) orelse return .{ .text = "No such file or directory", .status = 127 };
-    if (kind == .dir) return .{ .text = "Is a directory", .status = 126 };
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, z.ptr, 0, .{ .TYPE = true }, &st);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        // A directory on the way that cannot be searched is not a missing file.
+        .ACCES => return .{ .text = "Permission denied", .status = 126 },
+        else => return .{ .text = "No such file or directory", .status = 127 },
+    }
+    if (st.mode & linux.S.IFMT == linux.S.IFDIR) return .{ .text = "Is a directory", .status = 126 };
     if (linux.errno(linux.access(z.ptr, linux.R_OK)) != .SUCCESS) return .{ .text = "Permission denied", .status = 126 };
     return null;
 }

@@ -693,6 +693,14 @@ pub const Shell = struct {
 
     // --- readonly -----------------------------------------------------------
 
+    /// Marks exactly `name` readonly, without following a reference.
+    pub fn markReadonlyRaw(self: *Shell, name: []const u8) !void {
+        if (self.readonly.contains(name)) return;
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.readonly.put(owned, {});
+    }
+
     pub fn markReadonly(self: *Shell, name_in: []const u8) !void {
         const name = self.deref(name_in);
         if (self.readonly.contains(name)) return;

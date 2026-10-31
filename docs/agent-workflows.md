@@ -328,7 +328,8 @@ With `--json`, every subcommand prints one JSON object per line, each with a
 
 `offset` is the byte offset of the line in the input. `positions` and `spans`
 index `text`, which is the cleaned line (with `--raw`, `text` is the line as
-written but the indexes still count in the cleaned line); an excerpt of a line
+written, and `positions` and `spans` are empty when it holds escape sequences,
+since they would not index it); an excerpt of a line
 longer than 1 KiB also has `excerpt_start`. Usage and input errors exit with status 2; `find`
 and `grep` exit 1 when nothing matched.
 

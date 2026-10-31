@@ -101,7 +101,8 @@ pub fn persist(sh: *Shell, arena: std.mem.Allocator, assigns: []const ast.Prefix
     for (assigns) |assignment| {
         // Like Bash, a script that assigns to a readonly variable stops.
         if (sh.isReadonly(assignment.name)) {
-            expand_mod.printError(sh, "wsh: {s}: readonly variable\n", .{assignment.name});
+            // A nameref's target is what is readonly; name it, as Bash does.
+            expand_mod.printError(sh, "wsh: {s}: readonly variable\n", .{sh.deref(assignment.name)});
             if (!sh.interactive) {
                 sh.should_exit = true;
                 sh.exit_code = 1;
