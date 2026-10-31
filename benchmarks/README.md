@@ -30,6 +30,29 @@ universal claims or CI performance thresholds.
 | `parallel_arithmetic` | 32 independent 2,000-increment tasks, at most 4 workers |
 | `parallel_external` | 32 independent `/bin/true` tasks, at most 4 workers |
 
+The agent workloads run against a private `XDG_RUNTIME_DIR` holding a finished
+run of a synthetic `cargo test` log (`--log-mb`, default 20 MB: passing tests,
+some ANSI colour, four failures and a panic) and an open session. Each one sits
+next to the nearest thing a Bash user writes by hand; `-` means Bash has no
+counterpart. Commands written as `wsh run ...` use the fast path that skips
+shell start-up. `--no-agent` leaves them out.
+
+| Workload | Wolysh | Bash counterpart |
+| --- | --- | --- |
+| `run_start` | `wsh run -d -- /bin/true` | `nohup /bin/true > log 2>&1 &` |
+| `run_status` | `wsh run status bench` | `kill -0` and `wc -c < log` |
+| `run_logs_tail` | `wsh run logs bench --tail 50` | `tail -n 50 log` |
+| `session_exec` | `wsh session exec bench -- true` | a fresh `bash -c true` |
+| `out_failures` | `out failures --file log` | `grep -n -E 'FAILED\|panicked\|^test result' log` |
+| `out_budget` | `out budget 4k --file log` | `head`, `grep \| head` and `tail` of the log |
+| `out_find` | `out find connection refused --limit 20` | `grep -n -i 'connection refused' \| head -n 20` |
+| `run_logs_failures` | `wsh run logs bench --failures` | - |
+
+The Bash counterparts are cheaper questions: `grep` only finds lines, while
+`out failures` names the failed tests, their locations and the summary counts,
+and `out budget` stays within its byte limit. The comparison shows the cost of
+asking, not equal work.
+
 The parallel comparisons use Wolysh's native `parallel` and a Bash queue using
 subshells, `eval`, and `wait -n`. They include the work inside the task, not just
 scheduler latency. The arithmetic comparison measures language execution;
