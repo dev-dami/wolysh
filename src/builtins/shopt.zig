@@ -10,7 +10,23 @@ const set_builtin = @import("set.zig");
 const Options = shellmod.Options;
 
 /// Every name `shopt` accepts, in the order it lists them.
-pub const names = [_][]const u8{ "dotglob", "extglob", "failglob", "globstar", "nocaseglob", "nocasematch", "nullglob" };
+pub const names = [_][]const u8{
+    "autocd",               "assoc_expand_once", "cdable_vars",          "cdspell",
+    "checkhash",            "checkjobs",         "checkwinsize",         "cmdhist",
+    "compat31",             "compat32",          "compat40",             "compat41",
+    "compat42",             "compat43",          "compat44",             "complete_fullquote",
+    "direxpand",            "dirspell",          "dotglob",              "execfail",
+    "expand_aliases",       "extdebug",          "extglob",              "extquote",
+    "failglob",             "force_fignore",     "globasciiranges",      "globskipdots",
+    "globstar",             "gnu_errfmt",        "histappend",           "histreedit",
+    "histverify",           "hostcomplete",      "huponexit",            "inherit_errexit",
+    "interactive_comments", "lastpipe",          "lithist",              "localvar_inherit",
+    "localvar_unset",       "login_shell",       "mailwarn",             "no_empty_cmd_completion",
+    "nocaseglob",           "nocasematch",       "noexpand_translation", "nullglob",
+    "patsub_replacement",   "progcomp",          "progcomp_alias",       "promptvars",
+    "restricted_shell",     "shift_verbose",     "sourcepath",           "varredir_close",
+    "xpg_echo",
+};
 
 fn flag(options: *Options, name: []const u8) ?*bool {
     inline for (names) |known| {
@@ -32,7 +48,7 @@ fn show(ctx: builtins.Ctx, name: []const u8, on: bool, as_command: bool) void {
     if (as_command) {
         ctx.outFmt("shopt {s} {s}\n", .{ if (on) "-s" else "-u", name });
     } else {
-        ctx.outFmt("{s:<20}\t{s}\n", .{ name, if (on) "on" else "off" });
+        ctx.outFmt("{s:<15}\t{s}\n", .{ name, if (on) "on" else "off" });
     }
 }
 
@@ -158,7 +174,7 @@ test "shopt sets, reports and rejects options" {
 
     result = try runCaptured(&sh, &.{ "shopt", "nullglob" }, &buf);
     try testing.expectEqual(@as(u8, 0), result.status);
-    try testing.expectEqualStrings("nullglob            \ton\n", result.text);
+    try testing.expectEqualStrings("nullglob       \ton\n", result.text);
 
     result = try runCaptured(&sh, &.{ "shopt", "-p", "failglob" }, &buf);
     try testing.expectEqual(@as(u8, 1), result.status);

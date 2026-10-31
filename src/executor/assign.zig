@@ -71,7 +71,10 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
         }
     }
     for (cmd.assigns) |assignment| {
-        if (sh.isReadonly(assignment.name)) return error.ReadonlyVariable;
+        if (sh.isReadonly(assignment.name)) {
+            expand_mod.printError(sh, "wsh: {s}: readonly variable\n", .{assignment.name});
+            return error.ExecutionFailed;
+        }
         if (assignment.compound or assignment.index != null) {
             expand_mod.printError(sh, "wsh: {s}: an array assignment cannot prefix a command\n", .{assignment.name});
             return error.BadSubstitution;
@@ -96,6 +99,16 @@ pub fn enter(sh: *Shell, arena: std.mem.Allocator, cmd: ast.Command) Error!State
 /// already exported or `set -a` is on.
 pub fn persist(sh: *Shell, arena: std.mem.Allocator, assigns: []const ast.PrefixAssign) Error!void {
     for (assigns) |assignment| {
+        // Like Bash, a script that assigns to a readonly variable stops.
+        if (sh.isReadonly(assignment.name)) {
+            // A nameref's target is what is readonly; name it, as Bash does.
+            expand_mod.printError(sh, "wsh: {s}: readonly variable\n", .{sh.deref(assignment.name)});
+            if (!sh.interactive) {
+                sh.should_exit = true;
+                sh.exit_code = 1;
+            }
+            return error.ExecutionFailed;
+        }
         if (try arrays.persist(sh, arena, assignment)) continue;
         const text = try expand_mod.expandAssignment(sh, arena, assignment.value);
         strict.traceAssignment(sh, assignment.name, text);

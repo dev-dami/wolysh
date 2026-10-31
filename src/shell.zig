@@ -45,16 +45,88 @@ pub const Options = struct {
     noclobber: bool = false, // set -C
     allexport: bool = false, // set -a
     vi: bool = false, // set -o vi
-    nullglob: bool = false, // shopt -s nullglob
-    failglob: bool = false, // shopt -s failglob
-    dotglob: bool = false, // shopt -s dotglob
-    nocaseglob: bool = false, // shopt -s nocaseglob
-    nocasematch: bool = false, // shopt -s nocasematch
-    globstar: bool = true, // shopt -s globstar
-    extglob: bool = true, // shopt -s extglob
+    emacs: bool = true, // set -o emacs; off with vi, and in scripts
     histexpand: bool = true, // set -H
     ignoreeof: bool = false, // set -o ignoreeof
     errtrace: bool = false, // set -E
+    braceexpand: bool = true, // set -B
+    noexec: bool = false, // set -n
+    physical: bool = false, // set -P
+    // Accepted so scripts that set them run; wsh has no behaviour to change.
+    hashall: bool = true, // set -h
+    history: bool = true, // set -o history
+    interactive_comments: bool = true, // set -o interactive-comments
+    keyword: bool = false, // set -k
+    monitor: bool = false, // set -m
+    notify: bool = false, // set -b
+    onecmd: bool = false, // set -t
+    posix: bool = false, // set -o posix
+    privileged: bool = false, // set -p
+    verbose: bool = false, // set -v
+    functrace: bool = false, // set -T
+    nolog: bool = false, // set -o nolog
+
+    // shopt
+    nullglob: bool = false,
+    failglob: bool = false,
+    dotglob: bool = false,
+    nocaseglob: bool = false,
+    nocasematch: bool = false,
+    globstar: bool = true,
+    extglob: bool = true,
+    expand_aliases: bool = true,
+    inherit_errexit: bool = false,
+    lastpipe: bool = false,
+    promptvars: bool = true,
+    huponexit: bool = false,
+    // The remaining shopt names are accepted and remembered; they carry
+    // Bash's defaults. Their features are interactive conveniences or
+    // compatibility levels wsh does not have.
+    array_expand_once: bool = false,
+    assoc_expand_once: bool = false,
+    autocd: bool = false,
+    cdable_vars: bool = false,
+    cdspell: bool = false,
+    checkhash: bool = false,
+    checkjobs: bool = false,
+    checkwinsize: bool = true,
+    cmdhist: bool = true,
+    compat31: bool = false,
+    compat32: bool = false,
+    compat40: bool = false,
+    compat41: bool = false,
+    compat42: bool = false,
+    compat43: bool = false,
+    compat44: bool = false,
+    complete_fullquote: bool = true,
+    direxpand: bool = false,
+    dirspell: bool = false,
+    execfail: bool = false,
+    extdebug: bool = false,
+    extquote: bool = true,
+    force_fignore: bool = true,
+    globasciiranges: bool = true,
+    globskipdots: bool = true,
+    gnu_errfmt: bool = false,
+    histappend: bool = false,
+    histreedit: bool = false,
+    histverify: bool = false,
+    hostcomplete: bool = true,
+    lithist: bool = false,
+    localvar_inherit: bool = false,
+    localvar_unset: bool = false,
+    login_shell: bool = false,
+    mailwarn: bool = false,
+    no_empty_cmd_completion: bool = false,
+    noexpand_translation: bool = false,
+    patsub_replacement: bool = true,
+    progcomp: bool = true,
+    progcomp_alias: bool = false,
+    restricted_shell: bool = false,
+    shift_verbose: bool = false,
+    sourcepath: bool = true,
+    varredir_close: bool = false,
+    xpg_echo: bool = false,
 };
 
 /// Bit `N` is set when signal `N + 1` arrives. Written only from a signal
@@ -83,6 +155,9 @@ pub fn discardPendingSignal(sig: u32) void {
 pub const Frame = struct {
     name: []u8,
     call_line: u32,
+    /// The file the function was defined in, or the file `source` reads;
+    /// empty for `-c` strings and the prompt. `BASH_SOURCE` reports it.
+    file: []u8,
 };
 
 pub const Shell = struct {
@@ -95,6 +170,8 @@ pub const Shell = struct {
     /// Function name -> line its definition starts on, so a body re-parsed
     /// from `funcs` reports the original line numbers.
     func_lines: std.StringHashMap(u32),
+    /// Function name -> the file it was defined in, for `BASH_SOURCE`.
+    func_files: std.StringHashMap([]const u8),
     /// Functions marked by `export -f`; children receive them as
     /// `BASH_FUNC_name%%` environment entries.
     exported_funcs: std.StringHashMap(void),
@@ -105,6 +182,16 @@ pub const Shell = struct {
     readonly: std.StringHashMap(void),
     /// `declare -i/-l/-u` attributes, applied by `setVar` on every assignment.
     attrs: std.StringHashMap(Attrs),
+    /// `$BASH_SUBSHELL`: how many subshells deep this process is.
+    subshell_depth: u32 = 0,
+    /// `$BASH_COMMAND`: the command being run, as written (truncated).
+    command_text: [1024]u8 = undefined,
+    command_len: usize = 0,
+    /// Coprocesses started and not yet forgotten.
+    coproc_list: std.ArrayList(struct { name: []u8, pid: i32 }) = .empty,
+    /// How many variables carry the `nameref` attribute, so the common case
+    /// of none skips every lookup in `deref`.
+    nameref_count: u32 = 0,
     /// Saved bindings for nested `local` scopes, outermost frame first.
     scopes: std.ArrayList(Scope) = .empty,
     /// Trap handler source per trap id: `exit_trap`, the signal numbers, then
@@ -175,6 +262,11 @@ pub const Shell = struct {
     positional_owned: ?[]const []const u8 = null,
     /// `$0`.
     script_name: []const u8 = "",
+    /// The script file being run, or empty for `-c` and the prompt.
+    script_file: []const u8 = "",
+    /// The file whose commands are running now: the script, or a file that
+    /// `source` is reading. Borrowed; `source` restores it on the way out.
+    source_file: []const u8 = "",
 
     line_arena: std.heap.ArenaAllocator,
 
@@ -216,15 +308,28 @@ pub const Shell = struct {
         was_set: bool,
         previous: value.Value = .none,
         attrs: Attrs = .{},
+        /// The environment entry the local shadowed, restored with it, so
+        /// `local x; export x=1` does not outlive the function.
+        env_previous: ?[]u8 = null,
     };
 
     pub const Attrs = packed struct(u8) {
         integer: bool = false,
         lower: bool = false,
         upper: bool = false,
-        _pad: u5 = 0,
+        /// `declare -n`: the value is the name of the variable to use instead.
+        nameref: bool = false,
+        /// Bound by `let` to a wsh list, where `$name` is every element; a
+        /// Bash array gives its first element instead.
+        native_list: bool = false,
+        _pad: u3 = 0,
 
         pub fn any(self: Attrs) bool {
+            return self.integer or self.lower or self.upper or self.nameref or self.native_list;
+        }
+
+        /// Whether storing a value converts it (`declare -i/-l/-u`).
+        pub fn converts(self: Attrs) bool {
             return self.integer or self.lower or self.upper;
         }
     };
@@ -236,6 +341,7 @@ pub const Shell = struct {
             .env = std.StringHashMap([]const u8).init(gpa),
             .funcs = std.StringHashMap([]const u8).init(gpa),
             .func_lines = std.StringHashMap(u32).init(gpa),
+            .func_files = std.StringHashMap([]const u8).init(gpa),
             .exported_funcs = std.StringHashMap(void).init(gpa),
             .readonly_funcs = std.StringHashMap(void).init(gpa),
             .aliases = std.StringHashMap([]const u8).init(gpa),
@@ -300,7 +406,10 @@ pub const Shell = struct {
     }
 
     pub fn deinit(self: *Shell) void {
-        for (self.call_frames.items) |frame| self.gpa.free(frame.name);
+        for (self.call_frames.items) |frame| {
+            self.gpa.free(frame.name);
+            self.gpa.free(frame.file);
+        }
         self.call_frames.deinit(self.gpa);
 
         var vit = self.vars.iterator();
@@ -336,6 +445,13 @@ pub const Shell = struct {
         while (lit.next()) |key| self.gpa.free(key.*);
         self.func_lines.deinit();
 
+        var file_it = self.func_files.iterator();
+        while (file_it.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
+        }
+        self.func_files.deinit();
+
         var ait = self.aliases.iterator();
         while (ait.next()) |entry| {
             self.gpa.free(entry.key_ptr.*);
@@ -355,10 +471,13 @@ pub const Shell = struct {
             for (scope.saved.items) |saved| {
                 self.gpa.free(saved.name);
                 freeValue(self.gpa, saved.previous);
+                if (saved.env_previous) |text| self.gpa.free(text);
             }
             scope.saved.deinit(self.gpa);
         }
         self.scopes.deinit(self.gpa);
+        for (self.coproc_list.items) |entry| self.gpa.free(entry.name);
+        self.coproc_list.deinit(self.gpa);
 
         for (self.traps) |maybe| {
             if (maybe) |text| self.gpa.free(text);
@@ -391,20 +510,140 @@ pub const Shell = struct {
     // --- variables ----------------------------------------------------------
 
     /// A stored variable, else a computed one such as `RANDOM` or `UID`.
-    pub fn getVar(self: *const Shell, name: []const u8) ?value.Value {
+    pub fn getVar(self: *const Shell, name_in: []const u8) ?value.Value {
+        const name = self.deref(name_in);
         return self.vars.get(name) orelse special_vars.get(self, name);
     }
 
     pub fn hasVar(self: *const Shell, name: []const u8) bool {
-        return self.vars.contains(name);
+        return self.vars.contains(self.deref(name));
     }
+
+    /// The variable a name stands for: follows `declare -n` references until
+    /// a name that is not one. A reference to nothing (or to itself, or one
+    /// that loops) is the name itself, so assigning to it sets the reference.
+    pub fn deref(self: *const Shell, name: []const u8) []const u8 {
+        if (self.nameref_count == 0) return name;
+        var current = name;
+        var hops: u8 = 0;
+        while (hops < max_nameref_depth) : (hops += 1) {
+            const attrs = self.attrs.get(current) orelse return current;
+            if (!attrs.nameref) return current;
+            const target = switch (self.vars.get(current) orelse return current) {
+                .string => |text| text,
+                else => return current,
+            };
+            if (target.len == 0 or std.mem.eql(u8, target, current)) return current;
+            current = target;
+        }
+        return name;
+    }
+
+    /// True when `name` itself (not what it refers to) is a nameref.
+    pub fn isNameref(self: *const Shell, name: []const u8) bool {
+        if (self.nameref_count == 0) return false;
+        return (self.attrs.get(name) orelse return false).nameref;
+    }
+
+    /// `declare -n name=target`: stores the reference without following it.
+    pub fn setNameref(self: *Shell, name: []const u8, target: []const u8) !void {
+        var attrs = self.getAttrs(name);
+        attrs.nameref = false;
+        try self.setAttrs(name, attrs);
+        try self.storeVar(name, .{ .string = target });
+        attrs.nameref = true;
+        try self.setAttrs(name, attrs);
+    }
+
+    /// `unset -n name`: removes the reference, not the variable it names.
+    pub fn unsetNameref(self: *Shell, name: []const u8) bool {
+        if (!self.isNameref(name)) return false;
+        var attrs = self.getAttrs(name);
+        attrs.nameref = false;
+        self.setAttrs(name, attrs) catch {};
+        if (self.vars.fetchRemove(name)) |kv| {
+            self.gpa.free(kv.key);
+            freeValue(self.gpa, kv.value);
+        }
+        return true;
+    }
+
+    pub const max_nameref_depth = 16;
 
     /// Stores `val`, deep-copying it so the caller's arena can be reset. The
     /// variable's `declare` attributes apply first; `RANDOM` and `SECONDS`
     /// take the assignment without storing it.
-    pub fn setVar(self: *Shell, name: []const u8, val: value.Value) !void {
+    pub fn setVar(self: *Shell, name_in: []const u8, val: value.Value) !void {
+        const name = self.deref(name_in);
         if (special_vars.assign(self, name, val)) return;
-        const owned = try cloneValue(self.gpa, try arrays.applyAttrs(self, name, val));
+        // Whatever is stored next is no longer the list `let` made.
+        if (self.attrs.count() != 0) if (self.attrs.get(name)) |old| if (old.native_list) {
+            var attrs = old;
+            attrs.native_list = false;
+            try self.setAttrs(name, attrs);
+        };
+        const stored = try arrays.applyAttrs(self, name, val);
+        try self.storeVar(name, stored);
+        // An exported variable's new value is what children see, as in Bash.
+        if (self.env.getPtr(name)) |slot| try self.updateExported(slot, stored);
+    }
+
+    fn updateExported(self: *Shell, slot: *[]const u8, val: value.Value) !void {
+        var buf: [64]u8 = undefined;
+        const text: []const u8 = switch (val) {
+            .string => |s| s,
+            .int => |n| std.fmt.bufPrint(&buf, "{d}", .{n}) catch return,
+            // Arrays are not exported; `none` (declared, unset) keeps the old text.
+            else => return,
+        };
+        if (std.mem.eql(u8, slot.*, text)) return;
+        const owned = try self.gpa.dupe(u8, text);
+        self.gpa.free(slot.*);
+        slot.* = owned;
+    }
+
+    pub fn noteCommand(self: *Shell, words: []const []const u8) void {
+        var len: usize = 0;
+        for (words, 0..) |word, index| {
+            if (index != 0 and len < self.command_text.len) {
+                self.command_text[len] = ' ';
+                len += 1;
+            }
+            const n = @min(word.len, self.command_text.len - len);
+            @memcpy(self.command_text[len..][0..n], word[0..n]);
+            len += n;
+        }
+        self.command_len = len;
+    }
+
+    /// This shell's own executable, for running scripts that have no `#!`
+    /// line; `/bin/sh` if it cannot be found.
+    pub fn shellExecutable(self: *const Shell) []const u8 {
+        return switch (special_vars.get(self, "BASH") orelse return "/bin/sh") {
+            .string => |path| path,
+            else => "/bin/sh",
+        };
+    }
+
+    /// True when `$name` stands for every element: a list made by `let`.
+    pub fn isNativeList(self: *const Shell, name: []const u8) bool {
+        return (self.attrs.get(self.deref(name)) orelse return false).native_list;
+    }
+
+    /// `let name = [...]`: stores the value and, for a list, marks it as one
+    /// of wsh's own.
+    pub fn bindNative(self: *Shell, name: []const u8, val: value.Value) !void {
+        try self.setVar(name, val);
+        if (val != .list) return;
+        const target = self.deref(name);
+        var attrs = self.getAttrs(target);
+        attrs.native_list = true;
+        try self.setAttrs(target, attrs);
+    }
+
+    /// Stores `val` under exactly `name`, without following references.
+    fn storeVar(self: *Shell, name: []const u8, val: value.Value) !void {
+        const owned = try cloneValue(self.gpa, val);
         errdefer freeValue(self.gpa, owned);
         const gop = try self.vars.getOrPut(name);
         if (gop.found_existing) {
@@ -415,7 +654,8 @@ pub const Shell = struct {
         gop.value_ptr.* = owned;
     }
 
-    pub fn unsetVar(self: *Shell, name: []const u8) bool {
+    pub fn unsetVar(self: *Shell, name_in: []const u8) bool {
+        const name = self.deref(name_in);
         if (self.isReadonly(name)) return false;
         if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
         if (self.vars.fetchRemove(name)) |kv| {
@@ -431,6 +671,12 @@ pub const Shell = struct {
     }
 
     pub fn setAttrs(self: *Shell, name: []const u8, attrs: Attrs) !void {
+        if (self.attrs.get(name)) |old| {
+            if (old.nameref and !attrs.nameref) self.nameref_count -= 1;
+            if (!old.nameref and attrs.nameref) self.nameref_count += 1;
+        } else if (attrs.nameref) {
+            self.nameref_count += 1;
+        }
         if (!attrs.any()) {
             if (self.attrs.fetchRemove(name)) |kv| self.gpa.free(kv.key);
             return;
@@ -447,7 +693,16 @@ pub const Shell = struct {
 
     // --- readonly -----------------------------------------------------------
 
-    pub fn markReadonly(self: *Shell, name: []const u8) !void {
+    /// Marks exactly `name` readonly, without following a reference.
+    pub fn markReadonlyRaw(self: *Shell, name: []const u8) !void {
+        if (self.readonly.contains(name)) return;
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.readonly.put(owned, {});
+    }
+
+    pub fn markReadonly(self: *Shell, name_in: []const u8) !void {
+        const name = self.deref(name_in);
         if (self.readonly.contains(name)) return;
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
@@ -455,7 +710,7 @@ pub const Shell = struct {
     }
 
     pub fn isReadonly(self: *const Shell, name: []const u8) bool {
-        return self.readonly.contains(name);
+        return self.readonly.contains(self.deref(name));
     }
 
     /// `setVar` for a name the user asked for: refuses a `readonly` binding.
@@ -494,6 +749,13 @@ pub const Shell = struct {
                 freeValue(self.gpa, kv.value);
             }
             self.setAttrs(saved.name, saved.attrs) catch {};
+            if (saved.env_previous) |text| {
+                self.setEnv(saved.name, text) catch {};
+                self.gpa.free(text);
+            } else if (self.env.fetchRemove(saved.name)) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value);
+            }
             self.gpa.free(saved.name);
             freeValue(self.gpa, saved.previous);
         }
@@ -516,11 +778,14 @@ pub const Shell = struct {
         const previous = self.vars.get(name);
         const copy = if (previous) |v| try cloneValue(self.gpa, v) else value.Value.none;
         errdefer if (previous != null) freeValue(self.gpa, copy);
+        const env_copy: ?[]u8 = if (self.env.get(name)) |text| try self.gpa.dupe(u8, text) else null;
+        errdefer if (env_copy) |text| self.gpa.free(text);
         try scope.saved.append(self.gpa, .{
             .name = owned,
             .was_set = previous != null,
             .previous = copy,
             .attrs = self.getAttrs(name),
+            .env_previous = env_copy,
         });
         // A local starts without the attributes of the binding it shadows.
         try self.setAttrs(name, .{});
@@ -685,10 +950,11 @@ pub const Shell = struct {
     // --- environment --------------------------------------------------------
 
     pub fn getEnv(self: *const Shell, name: []const u8) ?[]const u8 {
-        return self.env.get(name);
+        return self.env.get(self.deref(name));
     }
 
-    pub fn setEnv(self: *Shell, name: []const u8, val: []const u8) !void {
+    pub fn setEnv(self: *Shell, name_in: []const u8, val: []const u8) !void {
+        const name = self.deref(name_in);
         const owned_val = try self.gpa.dupe(u8, val);
         errdefer self.gpa.free(owned_val);
         const gop = try self.env.getOrPut(name);
@@ -700,7 +966,8 @@ pub const Shell = struct {
         gop.value_ptr.* = owned_val;
     }
 
-    pub fn unsetEnv(self: *Shell, name: []const u8) bool {
+    pub fn unsetEnv(self: *Shell, name_in: []const u8) bool {
+        const name = self.deref(name_in);
         if (self.env.fetchRemove(name)) |kv| {
             self.gpa.free(kv.key);
             self.gpa.free(kv.value);
@@ -783,15 +1050,38 @@ pub const Shell = struct {
         return self.readonly_funcs.contains(name);
     }
 
-    pub fn pushFrame(self: *Shell, name: []const u8, call_line: u32) !void {
+    pub fn pushFrame(self: *Shell, name: []const u8, call_line: u32, file: []const u8) !void {
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
-        try self.call_frames.append(self.gpa, .{ .name = owned, .call_line = call_line });
+        const owned_file = try self.gpa.dupe(u8, file);
+        errdefer self.gpa.free(owned_file);
+        try self.call_frames.append(self.gpa, .{ .name = owned, .call_line = call_line, .file = owned_file });
     }
 
     pub fn popFrame(self: *Shell) void {
         const frame = self.call_frames.pop() orelse return;
         self.gpa.free(frame.name);
+        self.gpa.free(frame.file);
+    }
+
+    /// Records where a function was defined.
+    pub fn setFuncFile(self: *Shell, name: []const u8, file: []const u8) !void {
+        const owned = try self.gpa.dupe(u8, file);
+        errdefer self.gpa.free(owned);
+        const gop = try self.func_files.getOrPut(name);
+        if (gop.found_existing) {
+            self.gpa.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.func_files.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = owned;
+    }
+
+    pub fn getFuncFile(self: *const Shell, name: []const u8) []const u8 {
+        return self.func_files.get(name) orelse "";
     }
 
     /// Whether a history entry is the one made for the command line being run
@@ -1182,6 +1472,50 @@ pub const Shell = struct {
                 job.state = .stopped;
             }
         }
+        self.forgetFinishedCoprocs();
+    }
+
+    /// A coprocess that has exited loses its `NAME` and `NAME_PID` variables
+    /// and the shell's ends of its pipes, as in Bash.
+    pub fn forgetFinishedCoprocs(self: *Shell) void {
+        var i: usize = 0;
+        while (i < self.coproc_list.items.len) {
+            const entry = self.coproc_list.items[i];
+            if (self.coprocAlive(entry.pid)) {
+                i += 1;
+                continue;
+            }
+            _ = self.coproc_list.orderedRemove(i);
+            defer self.gpa.free(entry.name);
+            var buf: [256]u8 = undefined;
+            const pid_name = std.fmt.bufPrint(&buf, "{s}_PID", .{entry.name}) catch continue;
+            // A newer coprocess under the same name owns the variables now.
+            const current = (self.vars.get(pid_name) orelse continue).asInt() orelse continue;
+            if (current != entry.pid) continue;
+            if (self.vars.get(entry.name)) |ends| switch (ends) {
+                .list => |items| for (items) |item| {
+                    const number = item.asInt() orelse continue;
+                    if (number > 2) sys.closeFd(@intCast(number));
+                },
+                else => {},
+            };
+            _ = self.unsetVar(entry.name);
+            _ = self.unsetVar(pid_name);
+        }
+    }
+
+    fn coprocAlive(self: *const Shell, pid: i32) bool {
+        for (self.jobs.jobs.items) |job| {
+            if (job.last_pid == pid) return job.state != .done;
+        }
+        return false;
+    }
+
+    /// Remembers a coprocess so its variables go when it exits.
+    pub fn trackCoproc(self: *Shell, name: []const u8, pid: i32) !void {
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.coproc_list.append(self.gpa, .{ .name = owned, .pid = pid });
     }
 
     /// Block in the kernel until a child changes state, preserving statuses

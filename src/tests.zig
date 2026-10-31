@@ -10,6 +10,8 @@ test {
     _ = @import("proc.zig");
     _ = @import("command_cache.zig");
     _ = @import("fuzzy.zig");
+    _ = @import("output_query.zig");
+    _ = @import("builtins/out.zig");
     _ = @import("command_suggest.zig");
     _ = @import("history.zig");
     _ = @import("shell.zig");
@@ -61,4 +63,10 @@ test {
     _ = @import("interactive/vi.zig");
     _ = @import("interactive/complete.zig");
     _ = @import("builtins/complete.zig");
+    _ = @import("agent/state.zig");
+    _ = @import("agent/wire.zig");
+    _ = @import("agent/pty.zig");
+    _ = @import("agent/runs.zig");
+    _ = @import("agent/sessions.zig");
+    _ = @import("agent/daemon.zig");
 }

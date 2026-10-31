@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-31
+
 ### Added
 
 - Builtins `enable`, `bind`, `caller`, `fc`, `compopt` and `suspend`, and the
@@ -20,12 +22,88 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `setopt` and `shopt` actions.
 - Back-references (`\1` to `\9`) in `[[ =~ ]]` patterns, matched by a
   backtracking engine that gives up after a fixed amount of work.
-- `BASH_COMMAND` is set while a DEBUG trap runs.
+- `run` and `session`, as builtins and as `wsh run ...` and `wsh session ...`:
+  background runs that outlive the caller and keep their output in
+  `output.log` (`run -d`, `status`, `wait --match`, `logs --since`, `kill`,
+  `rm`), and named shells that keep their state between calls (`session new`,
+  `exec`, `attach`, `ls`, `kill`), served by a per-user `wsh --daemon`.
+  An attached session keeps its terminal: a foreground command continues
+  after a detach, the next attach replays the newest 64 KiB of output, and
+  terminal resizes reach the session. A `session exec` request keeps a line
+  that is partly typed at the attached prompt. A client more than 1 MiB
+  behind slows the session's output down, as under tmux; a client that reads
+  nothing for 5 seconds (`WSH_ATTACH_STALL_MS`) is dropped, and the session
+  continues.
+  `session ls` shows each session's
+  current directory.
+  `wsh run` and `wsh session` no longer run a script file with that name; use
+  `wsh ./run`.
+- `out`, for asking questions about command output within a byte budget:
+  `out budget N` summarises a log around its errors, failures and summaries
+  with exact `lines A–B` elision markers, `out find` ranks lines fzf-style,
+  `out grep` searches exactly or by regex, `out failures` lists failed tests for
+  cargo, pytest, Go, Jest, Vitest, Zig, unittest, Maven/Gradle, Mocha and RSpec
+  (exit 1 on failures, 2 when no test output is recognised), and `out lines`
+  and `out stats` follow up. Input is stdin, `--file` or a background run's log
+  (`--run`); `--json` gives JSON lines.
+- Namerefs: `declare -n`, `local -n`, `unset -n` and `${!ref}`, followed in
+  variable, array, environment and readonly lookups.
+- Bash's `let EXPR...` builtin; `let NAME = value` stays wsh's binding.
+- `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO` as call-stack arrays (with
+  `source` frames), `BASH_VERSION`, `BASH_VERSINFO`, `BASH`, `BASHPID`,
+  `MACHTYPE`, `SRANDOM`, `SHELLOPTS`, `BASH_COMMAND`, `BASH_SUBSHELL`,
+  `DIRSTACK`, `GROUPS`, `HISTCMD`, `BASH_ALIASES` and the `IFS`, `PS4`,
+  `OPTIND` and `OPTERR` defaults.
+- Every `set -o` option Bash has: `braceexpand`, `noexec` and `physical` take
+  effect; the rest are accepted. `shopt` lists every Bash option, with
+  `lastpipe`, `expand_aliases`, `inherit_errexit`, `promptvars` and
+  `shift_verbose` in effect.
+- `PS0`, `PROMPT_COMMAND` arrays and `HISTTIMEFORMAT`.
+- `wait -f` and `wait -p VAR`; `wait $pid` reports a job already waited for.
+- `printf -v 'a[i]'`, `${x@P}`, `echo -e '\xHH'`, `'\uHHHH'` and `'\UHHHHHHHH'`.
+- `set -x` shows `for` and `case` lines.
+- `run logs NAME --failures`, `--budget N`, `--find QUERY`, `--grep TEXT` and
+  `--stats` ask `out` about a background run's log.
+- `benchmarks/shell_bench.py` times background runs, sessions and `out`
+  against their nearest Bash counterparts.
+
+### Changed
+
+- `$name` on a Bash array is its element 0, as in Bash; lists bound by `let`
+  still expand to every element.
+- Scripts expand aliases only after `shopt -s expand_aliases`, and `type` and
+  `command -v` ignore aliases that would not expand. In scripts `which` is the
+  external program.
+- "NAME: command not found", worded as in Bash; spelling suggestions only at
+  an interactive prompt.
+- A failed arithmetic expansion, or an assignment to a readonly variable,
+  ends a non-interactive shell, as in Bash.
+- Input that ends inside a quote is a syntax error; a here-document ended by
+  the end of input runs with a warning.
+- `echo -- x` prints `--`, as in Bash.
+- Ctrl-D on an empty line in an attached session prints a hint instead of
+  detaching.
 
 ### Fixed
 
 - After the "There are stopped jobs." warning, an empty or cancelled line now
   disarms it, so only an immediately repeated `exit` leaves the shell.
+- `export NAME=value` also updates an existing shell variable, assigning to an
+  exported variable updates what children see, and a local that shadows an
+  exported variable (`local PATH=...`) is exported and restored.
+- `$IFS` read as empty, so `IFS=$OLD` broke word splitting.
+- Coprocess descriptors could not be used in redirections, and a coprocess's
+  variables now go when it exits.
+- A script without `#!` runs in wsh instead of failing with "Exec format
+  error"; `wsh FILE` reports a missing, unreadable, directory or binary file
+  as Bash does.
+- A `$(...)` body ending in a `\`-newline continuation kept a literal
+  backslash.
+- A function may be defined after `&&` and `||`; `fn a b` calls a function
+  named `fn`.
+- `shift` past the end is quiet unless `shopt -s shift_verbose`.
+- Sessions work under a state directory whose socket path is longer than a
+  Unix socket address holds.
 
 ## [0.5.0] - 2026-10-06
 
@@ -215,7 +293,8 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/dev-dami/wolysh/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dev-dami/wolysh/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dev-dami/wolysh/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dev-dami/wolysh/compare/v0.3.5...v0.4.0

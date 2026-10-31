@@ -29,7 +29,9 @@ pub const Kind = enum { auto, indexed, assoc };
 /// The array and append forms of a standalone assignment. Returns false for a
 /// plain `name=value` on a variable that is not an array; the caller stores
 /// that one as before.
-pub fn persist(sh: *Shell, arena: std.mem.Allocator, a: ast.PrefixAssign) Error!bool {
+pub fn persist(sh: *Shell, arena: std.mem.Allocator, assignment: ast.PrefixAssign) Error!bool {
+    var a = assignment;
+    a.name = sh.deref(assignment.name);
     if (a.compound) {
         try assignCompound(sh, arena, a.name, a.value, a.append, .auto);
         return true;
@@ -76,11 +78,12 @@ fn render(arena: std.mem.Allocator, v: Value) std.mem.Allocator.Error![]const u8
 pub fn assignCompound(
     sh: *Shell,
     arena: std.mem.Allocator,
-    name: []const u8,
+    name_in: []const u8,
     body: []const u8,
     append: bool,
     kind: Kind,
 ) Error!void {
+    const name = sh.deref(name_in);
     if (sh.isReadonly(name)) return error.ReadonlyVariable;
     const words = try compound.splitElements(arena, body);
     const existing = sh.vars.get(name);
@@ -173,11 +176,12 @@ fn findEntry(entries: []const value.Entry, key: []const u8) ?usize {
 pub fn assignElement(
     sh: *Shell,
     arena: std.mem.Allocator,
-    name: []const u8,
+    name_in: []const u8,
     subscript: []const u8,
     text: []const u8,
     append: bool,
 ) Error!void {
+    const name = sh.deref(name_in);
     if (sh.isReadonly(name)) return error.ReadonlyVariable;
     const existing = sh.vars.get(name);
     if (existing == null or (existing.? != .list and existing.? != .map)) {
@@ -258,7 +262,7 @@ fn integerOf(sh: *Shell, arena: std.mem.Allocator, v: Value) Error!i64 {
 /// Applies `declare -i/-l/-u` to a value about to be stored under `name`.
 pub fn applyAttrs(sh: *Shell, name: []const u8, val: Value) Error!Value {
     const attrs = sh.getAttrs(name);
-    if (!attrs.any()) return val;
+    if (!attrs.converts()) return val;
     const arena = sh.scratch();
     switch (val) {
         .list => |items| {
@@ -332,6 +336,7 @@ pub fn flagLetters(sh: *Shell, name: []const u8, buf: *[8]u8) []const u8 {
     }
     const attrs = sh.getAttrs(name);
     const letters = [_]struct { on: bool, letter: u8 }{
+        .{ .on = attrs.nameref, .letter = 'n' },
         .{ .on = attrs.integer, .letter = 'i' },
         .{ .on = sh.isReadonly(name), .letter = 'r' },
         .{ .on = sh.getEnv(name) != null, .letter = 'x' },
@@ -390,12 +395,13 @@ pub fn describe(sh: *Shell, arena: std.mem.Allocator, name: []const u8) std.mem.
 pub fn unsetElement(sh: *Shell, spec: []const u8) ?u8 {
     const open = std.mem.indexOfScalar(u8, spec, '[') orelse return null;
     if (open == 0 or spec[spec.len - 1] != ']') return null;
-    const name = spec[0..open];
+    const written = spec[0..open];
     const subscript = spec[open + 1 .. spec.len - 1];
-    for (name, 0..) |c, i| {
+    for (written, 0..) |c, i| {
         const ok = c == '_' or std.ascii.isAlphabetic(c) or (i > 0 and std.ascii.isDigit(c));
         if (!ok) return null;
     }
+    const name = sh.deref(written);
     if (sh.isReadonly(name)) {
         expand.printError(sh, "wsh: unset: {s}: readonly variable\n", .{name});
         return 1;

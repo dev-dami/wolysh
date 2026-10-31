@@ -12,6 +12,7 @@ import shlex
 import shutil
 import statistics
 import subprocess
+import tempfile
 import time
 
 
@@ -45,16 +46,149 @@ def workloads(iterations, tasks, workers):
     }
 
 
-def measure(binary, source, bash=False):
+# A synthetic `cargo test` log: passing tests, ANSI colour on some lines, a
+# few failures and a panic message, so every `out` question has an answer.
+def write_test_log(path, megabytes):
+    rng = random.Random(1)
+    target = megabytes * 1024 * 1024
+    failures = {int(target * f / 100) for f in (17, 43, 71, 96)}
+    written = 0
+    index = 0
+    with open(path, "w") as log:
+        log.write("running many tests\n")
+        while written < target:
+            index += 1
+            name = f"mod_{index % 997}::case_{index}"
+            if any(written <= at < written + 64 for at in failures):
+                line = f"test {name} ... FAILED\n"
+            elif rng.random() < 0.1:
+                line = f"test {name} ... \x1b[32mok\x1b[0m\n"
+            else:
+                line = f"test {name} ... ok\n"
+            log.write(line)
+            written += len(line)
+        log.write("\nfailures:\n\n---- net::connect stdout ----\n")
+        log.write("thread 'net::connect' panicked at src/net.rs:42:9:\nconnection refused (os error 111)\n\n")
+        log.write(f"test result: FAILED. {index - 4} passed; 4 failed; 0 ignored; 0 measured; 0 filtered out\n")
+
+
+class AgentFixture:
+    """A private state directory holding a finished run of the test log and
+    an open session, for the agent workloads."""
+
+    def __init__(self, wsh, megabytes):
+        self.wsh = str(wsh)
+        self.dir = tempfile.mkdtemp(prefix="wsh-bench-")
+        self.runtime = os.path.join(self.dir, "runtime")
+        self.log = os.path.join(self.dir, "test.log")
+        self.env = {"XDG_RUNTIME_DIR": self.runtime, "BENCH_LOG": self.log, "BENCH_DIR": self.dir}
+        try:
+            os.mkdir(self.runtime, 0o700)
+            write_test_log(self.log, megabytes)
+            self.wsh_run("run", "-d", "--name", "bench", "--", f"cat {shlex.quote(self.log)}")
+            self.wsh_run("run", "wait", "bench")
+            self.wsh_run("session", "new", "bench")
+        except BaseException:
+            self.close()
+            raise
+
+    def wsh_run(self, *args, check=True, timeout=60):
+        return subprocess.run([self.wsh, *args], env=dict(os.environ, **self.env), check=check, capture_output=True, timeout=timeout)
+
+    def forget_extra_runs(self):
+        """Removes the runs a `run_start` sample made, outside the timing, so
+        each sample starts from the same state directory."""
+        listing = self.wsh_run("run", "status", "--json", check=False).stdout.decode()
+        for line in listing.splitlines():
+            name = json.loads(line).get("name")
+            if name and name != "bench":
+                self.wsh_run("run", "wait", name, check=False)
+                self.wsh_run("run", "rm", name, check=False)
+
+    def close(self):
+        try:
+            self.wsh_run("session", "kill", "bench", check=False, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        pid_file = os.path.join(self.runtime, "wsh", "daemon.pid")
+        try:
+            os.kill(int(open(pid_file).read().strip()), 15)
+        except (OSError, ValueError):
+            pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def agent_workloads():
+    """Background runs, sessions and `out`, each next to the nearest thing a
+    Bash user writes by hand. Lists are argv for the `wsh` binary (the fast
+    path without shell start-up); strings run with `-c`."""
+    log = '"$BENCH_LOG"'
+    return {
+        "run_start": {"wsh": ["run", "-d", "--", "/bin/true"], "bash": 'nohup /bin/true > "$BENCH_DIR/nohup.log" 2>&1 &', "after": "forget_extra_runs"},
+        "run_status": {"wsh": ["run", "status", "bench"], "bash": f'kill -0 1 2>/dev/null; wc -c < {log}'},
+        "run_logs_tail": {"wsh": ["run", "logs", "bench", "--tail", "50"], "bash": f"tail -n 50 {log}"},
+        "session_exec": {"wsh": ["session", "exec", "bench", "--", "true"], "bash": "true"},
+        "out_failures": {"wsh": f"out failures --file {log}", "bash": f"grep -n -E 'FAILED|panicked|^test result' {log}", "status": (0, 1)},
+        "out_budget": {
+            "wsh": f"out budget 4k --file {log}",
+            "bash": f"head -n 3 {log}; grep -n -E 'FAILED|error|panicked' {log} | head -n 50; tail -n 5 {log}",
+        },
+        "out_find": {"wsh": f"out find connection refused --limit 20 --file {log}", "bash": f"grep -n -i 'connection refused' {log} | head -n 20"},
+        "run_logs_failures": {"wsh": ["run", "logs", "bench", "--failures"], "status": (0, 1)},
+    }
+
+
+def measure(binary, source, bash=False, extra_env=None, statuses=(0,)):
     args = [str(binary)]
-    args += ["--noprofile", "--norc"] if bash else ["--no-config"]
+    if isinstance(source, list):
+        args += source
+    else:
+        args += ["--noprofile", "--norc"] if bash else ["--no-config"]
+        args += ["-c", source]
     environment = {key: value for key, value in os.environ.items() if key not in ("BASH_ENV", "ENV")}
+    environment.update(extra_env or {})
     start = time.perf_counter_ns()
-    result = subprocess.run(args + ["-c", source], env=environment, capture_output=True, timeout=60, check=False)
+    result = subprocess.run(args, env=environment, capture_output=True, timeout=60, check=False)
     elapsed = (time.perf_counter_ns() - start) / 1_000_000
-    if result.returncode:
+    if result.returncode not in statuses:
         raise RuntimeError(f"{binary} failed ({result.returncode}): {result.stderr.decode(errors='replace')}")
     return elapsed
+
+
+def agent_names():
+    return set(agent_workloads())
+
+
+def run_workload(output, rng, shells, runs, name, work, extra_env, fixture=None):
+    # A previous release has none of the agent commands; Bash only runs a
+    # workload that has a Bash form.
+    participants = [
+        shell
+        for shell in shells
+        if (shell != "baseline" or work.get("baseline", False)) and (shell != "bash" or work.get("bash") is not None)
+    ]
+    statuses = work.get("status", (0,))
+
+    def source_for(shell):
+        return work["bash"] if shell == "bash" else work["wsh"]
+
+    # Cleanup between samples (outside the timing) keeps each one alike.
+    after = getattr(fixture, work["after"]) if fixture and "after" in work else (lambda: None)
+    samples = {shell: [] for shell in participants}
+    for shell in participants:
+        measure(shells[shell], source_for(shell), shell == "bash", extra_env, statuses)
+        after()
+    for _ in range(runs):
+        rng.shuffle(participants)
+        for shell in participants:
+            samples[shell].append(measure(shells[shell], source_for(shell), shell == "bash", extra_env, statuses))
+            after()
+    medians = {shell: round(statistics.median(values), 3) for shell, values in samples.items()}
+    output["results"][name] = {
+        "median_ms": medians,
+        "samples_ms": samples,
+        "bash_over_wsh": round(medians["bash"] / medians["wsh"], 3) if "bash" in medians else None,
+    }
 
 
 def main():
@@ -66,6 +200,8 @@ def main():
     parser.add_argument("--tasks", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--no-agent", action="store_true", help="skip the background run, session and out workloads")
+    parser.add_argument("--log-mb", type=int, default=20, help="size of the synthetic test log for the out workloads")
     args = parser.parse_args()
     if min(args.runs, args.iterations, args.tasks, args.workers) < 1:
         parser.error("counts must be positive")
@@ -91,21 +227,22 @@ def main():
         "results": {},
     }
     rng = random.Random(0)
-    for name, (wsh_source, bash_source, baseline_supported) in workloads(args.iterations, args.tasks, args.workers).items():
-        participants = [shell for shell in shells if shell != "baseline" or baseline_supported]
-        samples = {shell: [] for shell in participants}
-        for shell in participants:
-            measure(shells[shell], bash_source if shell == "bash" else wsh_source, shell == "bash")
-        for _ in range(args.runs):
-            rng.shuffle(participants)
-            for shell in participants:
-                samples[shell].append(measure(shells[shell], bash_source if shell == "bash" else wsh_source, shell == "bash"))
-        medians = {shell: round(statistics.median(values), 3) for shell, values in samples.items()}
-        output["results"][name] = {
-            "median_ms": medians,
-            "samples_ms": samples,
-            "bash_over_wsh": round(medians["bash"] / medians["wsh"], 3),
-        }
+    table = {
+        name: {"wsh": wsh_source, "bash": bash_source, "baseline": baseline_supported}
+        for name, (wsh_source, bash_source, baseline_supported) in workloads(args.iterations, args.tasks, args.workers).items()
+    }
+    fixture = None
+    if not args.no_agent:
+        fixture = AgentFixture(shells["wsh"], args.log_mb)
+        output["log_mb"] = args.log_mb
+        table.update(agent_workloads())
+    try:
+        for name, work in table.items():
+            is_agent = fixture is not None and name in agent_names()
+            run_workload(output, rng, shells, args.runs, name, work, fixture.env if is_agent else None, fixture if is_agent else None)
+    finally:
+        if fixture:
+            fixture.close()
     if args.json:
         print(json.dumps(output, indent=2))
     else:
@@ -115,7 +252,9 @@ def main():
         for name, row in output["results"].items():
             medians = row["median_ms"]
             baseline = f"{medians['baseline']:.3f}" if "baseline" in medians else "-"
-            print(f"{name:<22} {medians['wsh']:>10.3f} {medians['bash']:>10.3f} {baseline:>10} {row['bash_over_wsh']:>10.3f}")
+            bash_ms = f"{medians['bash']:.3f}" if "bash" in medians else "-"
+            ratio = f"{row['bash_over_wsh']:.3f}" if row["bash_over_wsh"] is not None else "-"
+            print(f"{name:<22} {medians['wsh']:>10.3f} {bash_ms:>10} {baseline:>10} {ratio:>10}")
 
 
 if __name__ == "__main__":

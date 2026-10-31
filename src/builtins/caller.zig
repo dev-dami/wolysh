@@ -30,10 +30,13 @@ pub fn run(ctx: Ctx) u8 {
     // frame out, or "main" at the top level.
     const frame = frames[frames.len - 1 - level];
     const parent: []const u8 = if (level + 1 < frames.len) frames[frames.len - 2 - level].name else "main";
+    // The call was made from the code of the next frame out: its file, or the
+    // script at the top.
+    const caller_file: []const u8 = if (level + 1 < frames.len) frames[frames.len - 2 - level].file else ctx.sh.script_file;
     if (args.len == 0) {
-        ctx.outFmt("{d} {s}\n", .{ frame.call_line, ctx.sh.script_name });
+        ctx.outFmt("{d} {s}\n", .{ frame.call_line, caller_file });
     } else {
-        ctx.outFmt("{d} {s} {s}\n", .{ frame.call_line, parent, ctx.sh.script_name });
+        ctx.outFmt("{d} {s} {s}\n", .{ frame.call_line, parent, caller_file });
     }
     return 0;
 }

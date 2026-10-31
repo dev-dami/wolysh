@@ -9,6 +9,7 @@ const exec = @import("exec.zig");
 const strict = @import("strict.zig");
 const set_builtin = @import("builtins/set.zig");
 const fs = @import("fs.zig");
+const builtins = @import("builtins.zig");
 const proc = @import("proc.zig");
 const editor_mod = @import("interactive/editor.zig");
 const prompt = @import("interactive/prompt.zig");
@@ -17,6 +18,7 @@ const history = @import("history.zig");
 const login = @import("login.zig");
 const stdin_script = @import("stdin_script.zig");
 const histexpand = @import("interactive/histexpand.zig");
+const agent = @import("agent/cli.zig");
 
 const Shell = shellmod.Shell;
 
@@ -28,6 +30,9 @@ const help_text =
     \\usage: wsh [options] [script [arguments...]]
     \\       wsh [options] -c command [name [arguments...]]
     \\       wsh [options] -s [arguments...]
+    \\       wsh run -d [--name NAME] [--tty] -- command...
+    \\       wsh run status|wait|logs|kill|rm ...
+    \\       wsh session new|ls|exec|attach|kill ...
     \\
     \\options:
     \\  -c               run the first argument as a command; the next one is $0
@@ -42,6 +47,12 @@ const help_text =
     \\      --noprofile    skip login initialisation
     \\  -h, --help       show this help
     \\  -v, --version    show the version
+    \\      --daemon     serve sessions (`wsh session` starts it when needed)
+    \\
+    \\`wsh run` keeps background commands and their output after the caller
+    \\exits; `wsh session` keeps named shells. `wsh run --help` and
+    \\`wsh session --help` list the subcommands. Run a script named `run`
+    \\or `session` as `wsh ./run`.
     \\
     \\Short options combine (`-lc`, `-ec`), `+` clears a flag, and `--` or `-`
     \\ends the options.
@@ -61,6 +72,7 @@ const help_text =
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     const gpa = std.heap.smp_allocator;
+    proc.recordEntryDispositions();
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -70,6 +82,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         sys.writeStr(2, "wsh: cannot read arguments\n");
         return 1;
     };
+
+    // `wsh run ...` and `wsh session ...` skip shell start-up entirely, so an
+    // agent polling a run pays only for the files it reads.
+    if (argv.len >= 2 and (agent.isCommand(argv[1]) or eql(argv[1], "--daemon"))) {
+        return agent.main(gpa, argv[1..], init.environ.block.slice.ptr);
+    }
 
     var options = Options{};
     const parsed = parseArgs(argv, &options) orelse {
@@ -106,6 +124,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // go to one, or when `-i` asks for it. Standard output may be a pipe.
     const reads_input = options.command == null and options.script == null;
     sh.interactive = options.interactive or (reads_input and sys.isTty(0) and sys.isTty(2));
+    // As in Bash, line editing, history and aliases are interactive
+    // features; a script turns aliases on with `shopt -s expand_aliases`.
+    if (!sh.interactive) {
+        sh.options.emacs = false;
+        sh.options.history = false;
+        sh.options.histexpand = false;
+        sh.options.expand_aliases = false;
+        // wsh's `which` describes builtins and aliases for people; a script
+        // gets the `which` program, as under Bash.
+        _ = builtins.setEnabled("which", false);
+    }
 
     if (!options.check) {
         if (sh.login) {
@@ -127,8 +156,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (options.script) |script| {
         sh.script_name = script;
+        sh.script_file = script;
+        sh.source_file = script;
         // A script file is parsed as a whole: a syntax error anywhere means
         // none of it runs.
+        if (scriptProblem(gpa, script)) |problem| {
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}: {s}\n", .{ script, problem.text }) catch return problem.status;
+            sys.writeStr(2, msg);
+            return problem.status;
+        }
         const data = readWholeFile(gpa, script) orelse {
             var buf: [512]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot read script\n", .{script}) catch return 1;
@@ -136,6 +173,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         };
         defer gpa.free(data);
+        // Bash's test: a NUL before the first newline of the first 80 bytes
+        // means a program, not a script.
+        const head = data[0..@min(data.len, 80)];
+        const first_line = head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
+        if (std.mem.indexOfScalar(u8, first_line, 0) != null) {
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "wsh: {s}: cannot execute binary file\n", .{script}) catch return 126;
+            sys.writeStr(2, msg);
+            return 126;
+        }
         if (options.check) return exec.checkSource(&sh, data);
         if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
         return strict.finish(&sh, exec.runSource(&sh, data));
@@ -347,6 +394,25 @@ fn loadInteractiveConfig(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) vo
     if (!no_config) loadConfig(sh);
 }
 
+const ScriptProblem = struct { text: []const u8, status: u8 };
+
+/// Why a script file cannot be run, worded and numbered as Bash does it.
+fn scriptProblem(gpa: std.mem.Allocator, path: []const u8) ?ScriptProblem {
+    const z = gpa.dupeZ(u8, path) catch return null;
+    defer gpa.free(z);
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, z.ptr, 0, .{ .TYPE = true }, &st);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        // A directory on the way that cannot be searched is not a missing file.
+        .ACCES => return .{ .text = "Permission denied", .status = 126 },
+        else => return .{ .text = "No such file or directory", .status = 127 },
+    }
+    if (st.mode & linux.S.IFMT == linux.S.IFDIR) return .{ .text = "Is a directory", .status = 126 };
+    if (linux.errno(linux.access(z.ptr, linux.R_OK)) != .SUCCESS) return .{ .text = "Permission denied", .status = 126 };
+    return null;
+}
+
 fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     const z = gpa.dupeZ(u8, path) catch return null;
     defer gpa.free(z);
@@ -530,6 +596,7 @@ fn takeControllingTerminal(sh: *Shell, tty_fd: i32) void {
 
     sh.tty_fd = tty_fd;
     sh.job_control = true;
+    sh.options.monitor = true;
 }
 
 fn setupPaths(sh: *Shell, gpa: std.mem.Allocator) !void {

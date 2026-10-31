@@ -47,6 +47,10 @@ pub const Control = struct {
 pub const History = struct {
     /// Oldest first, like the history file.
     entries: std.ArrayList([]u8) = .empty,
+    /// When each entry was added (Unix seconds), for `HISTTIMEFORMAT`. Kept
+    /// in memory only: entries read from the file carry the time they were
+    /// read, as Bash shows entries saved without a timestamp.
+    times: std.ArrayList(i64) = .empty,
     limit: usize = 5000,
     /// Entries the history file is known to hold. Once it is well past
     /// `limit`, `appendToFile` rewrites the file with the newest `limit`.
@@ -57,6 +61,18 @@ pub const History = struct {
     pub fn deinit(self: *History, allocator: std.mem.Allocator) void {
         for (self.entries.items) |entry| allocator.free(entry);
         self.entries.deinit(allocator);
+        self.times.deinit(allocator);
+    }
+
+    /// When entry `index` was added, in Unix seconds.
+    pub fn time(self: *const History, index: usize) i64 {
+        return if (index < self.times.items.len) self.times.items[index] else 0;
+    }
+
+    fn appendEntry(self: *History, allocator: std.mem.Allocator, entry: []u8) !void {
+        try self.times.ensureUnusedCapacity(allocator, 1);
+        try self.entries.append(allocator, entry);
+        self.times.appendAssumeCapacity(nowSeconds());
     }
 
     pub fn count(self: *const History) usize {
@@ -90,19 +106,21 @@ pub const History = struct {
         }
         const owned = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(owned);
-        try self.entries.append(allocator, owned);
+        try self.appendEntry(allocator, owned);
         while (self.entries.items.len > self.limit) self.remove(allocator, 0);
         return owned;
     }
 
     pub fn remove(self: *History, allocator: std.mem.Allocator, index: usize) void {
         allocator.free(self.entries.orderedRemove(index));
+        if (index < self.times.items.len) _ = self.times.orderedRemove(index);
         if (self.unsaved > index) self.unsaved -= 1;
     }
 
     pub fn clear(self: *History, allocator: std.mem.Allocator) void {
         for (self.entries.items) |entry| allocator.free(entry);
         self.entries.clearRetainingCapacity();
+        self.times.clearRetainingCapacity();
         self.unsaved = 0;
     }
 
@@ -122,7 +140,7 @@ pub const History = struct {
                 allocator.free(entry);
                 continue;
             }
-            self.entries.append(allocator, entry) catch |err| {
+            self.appendEntry(allocator, entry) catch |err| {
                 allocator.free(entry);
                 return err;
             };
@@ -209,6 +227,12 @@ pub const History = struct {
         return null;
     }
 };
+
+fn nowSeconds() i64 {
+    var ts: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    return ts.sec;
+}
 
 /// How far past `limit` the file may grow before it is rewritten; rewriting
 /// on every command would make appends as costly as the old full saves.

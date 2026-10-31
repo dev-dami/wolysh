@@ -3,6 +3,7 @@
 //! `-o`). The unary and binary primitives are public so `[[ ]]` can share them.
 
 const std = @import("std");
+const set_options = @import("../set_options.zig");
 const linux = std.os.linux;
 const builtins = @import("../builtins.zig");
 const shellmod = @import("../shell.zig");
@@ -158,11 +159,7 @@ pub fn binary(lhs: []const u8, op: []const u8, rhs: []const u8) IntegerError!boo
 
 /// `set -o` names that `test -o` can query.
 fn optionEnabled(sh: *const Shell, name: []const u8) bool {
-    const names = [_][]const u8{ "errexit", "nounset", "xtrace", "pipefail", "noglob", "noclobber", "allexport", "vi", "ignoreeof", "histexpand" };
-    inline for (names) |field| {
-        if (std.mem.eql(u8, name, field)) return @field(sh.options, field);
-    }
-    return false;
+    return set_options.get(&sh.options, set_options.byName(name) orelse return false);
 }
 
 fn timeOrder(a: linux.statx_timestamp, b: linux.statx_timestamp) std.math.Order {

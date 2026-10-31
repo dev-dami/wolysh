@@ -14,6 +14,7 @@ const proc = @import("proc.zig");
 const glob = @import("glob.zig");
 const jobs = @import("jobs.zig");
 const parallel = @import("parallel.zig");
+const agent = @import("agent/cli.zig");
 const arrays = @import("arrays.zig");
 const declare_builtin = @import("builtins/declare.zig");
 const cd = @import("builtins/cd.zig");
@@ -31,6 +32,7 @@ const dirstack_builtin = @import("builtins/dirstack.zig");
 const exports_builtin = @import("builtins/exports.zig");
 const test_builtin = @import("builtins/test.zig");
 const strict = @import("strict.zig");
+const arith = @import("arith.zig");
 const set_builtin = @import("builtins/set.zig");
 const trap_builtin = @import("builtins/trap.zig");
 const shopt = @import("builtins/shopt.zig");
@@ -38,6 +40,7 @@ const enable_builtin = @import("builtins/enable.zig");
 const caller_builtin = @import("builtins/caller.zig");
 const fc_builtin = @import("builtins/fc.zig");
 const bind_builtin = @import("builtins/bind.zig");
+const out_builtin = @import("builtins/out.zig");
 
 const Shell = shellmod.Shell;
 
@@ -129,14 +132,11 @@ fn builtinEcho(ctx: Ctx) u8 {
     var newline = true;
     var escapes = false;
 
-    // Leading flags only; `echo -- -n` still prints the literal argument.
+    // Leading flags only. As in Bash, `--` is not special: `echo -- -n`
+    // prints both words.
     var start: usize = 1;
     while (start < ctx.argv.len) {
         const arg = ctx.argv[start];
-        if (std.mem.eql(u8, arg, "--")) {
-            start += 1;
-            break;
-        }
         if (arg.len < 2 or arg[0] != '-' or !validEchoFlags(arg[1..])) break;
         for (arg[1..]) |c| {
             switch (c) {
@@ -192,7 +192,39 @@ fn appendEscaped(out: *sys.StringBuilder, text: []const u8) !bool {
             't' => try out.appendByte('\t'),
             'v' => try out.appendByte(0x0b),
             '\\' => try out.appendByte('\\'),
-            '0'...'7' => {
+            'x', 'u', 'U' => |kind| {
+                const max_digits: usize = switch (kind) {
+                    'x' => 2,
+                    'u' => 4,
+                    else => 8,
+                };
+                var code: u32 = 0;
+                var digits: usize = 0;
+                var j = i + 1;
+                while (digits < max_digits and j < text.len) : (j += 1) {
+                    const digit = std.fmt.charToDigit(text[j], 16) catch break;
+                    code = code *% 16 +% digit;
+                    digits += 1;
+                }
+                if (digits == 0) {
+                    try out.appendByte('\\');
+                    try out.appendByte(kind);
+                } else if (kind == 'x') {
+                    try out.appendByte(@intCast(code));
+                    i = j - 1;
+                } else {
+                    var encoded: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(@min(code, 0x10ffff)), &encoded) catch 0;
+                    if (len == 0) {
+                        try out.appendByte('\\');
+                        try out.appendByte(kind);
+                    } else {
+                        for (encoded[0..len]) |byte| try out.appendByte(byte);
+                        i = j - 1;
+                    }
+                }
+            },
+            '0' => {
                 var octal: u32 = 0;
                 var digits: usize = 0;
                 if (text[i] == '0') i += 1;
@@ -213,6 +245,24 @@ fn appendEscaped(out: *sys.StringBuilder, text: []const u8) !bool {
         i += 1;
     }
     return false;
+}
+
+/// `name[subscript]` as the pieces of an array element reference, or null.
+pub fn splitElementName(text: []const u8) ?struct { name: []const u8, subscript: []const u8 } {
+    const open = std.mem.indexOfScalar(u8, text, '[') orelse return null;
+    if (open == 0 or text.len < open + 3 or text[text.len - 1] != ']') return null;
+    if (!validName(text[0..open])) return null;
+    return .{ .name = text[0..open], .subscript = text[open + 1 .. text.len - 1] };
+}
+
+/// Stores `text` in the variable or array element that `target` names
+/// (`name` or `name[subscript]`).
+pub fn assignText(sh: *Shell, target: []const u8, text: []const u8) !void {
+    if (splitElementName(target)) |element| {
+        if (sh.isReadonly(element.name)) return error.ReadonlyVariable;
+        return arrays.assignElement(sh, sh.scratch(), element.name, element.subscript, text, false);
+    }
+    return sh.assignVar(target, .{ .string = text });
 }
 
 fn builtinPrint(ctx: Ctx) u8 {
@@ -238,6 +288,34 @@ fn builtinFalse(_: Ctx) u8 {
     return 1;
 }
 
+/// Bash's `let expr...`: each argument is an arithmetic expression, and the
+/// status is 0 when the last one is non-zero. (`let NAME = value` with spaces
+/// is wsh's own binding statement and never reaches here.)
+fn builtinLet(ctx: Ctx) u8 {
+    if (ctx.argv.len < 2) {
+        ctx.err("wsh: let: expression expected\n");
+        return 1;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var last: i64 = 0;
+    for (ctx.argv[1..]) |expr| {
+        if (ctx.sh.options.xtrace) strict.traceText(ctx.sh, std.fmt.allocPrint(arena, "let {s}", .{expr}) catch expr);
+        last = arith.evaluateExpanded(ctx.sh, arena, expr) catch |err| switch (err) {
+            error.InvalidArithmetic, error.DivisionByZero => {
+                ctx.errFmt("wsh: let: {s}\n", .{arith.takeErrorMessage() orelse "arithmetic syntax error"});
+                return 1;
+            },
+            else => {
+                ctx.err("wsh: let: evaluation failed\n");
+                return 1;
+            },
+        };
+    }
+    return if (last != 0) 0 else 1;
+}
+
 // --- environment and variables ---------------------------------------------
 
 const UnsetMode = enum {
@@ -245,6 +323,8 @@ const UnsetMode = enum {
     either,
     variable,
     function,
+    /// `unset -n`: the reference itself, not what it names.
+    nameref,
 };
 
 /// `unset [-v|-f] [--] NAME...`.
@@ -262,8 +342,9 @@ fn builtinUnset(ctx: Ctx) u8 {
             switch (flag) {
                 'v' => mode = .variable,
                 'f' => mode = .function,
+                'n' => mode = .nameref,
                 else => {
-                    ctx.errFmt("wsh: unset: -{c}: invalid option\nunset: usage: unset [-f] [-v] [name ...]\n", .{flag});
+                    ctx.errFmt("wsh: unset: -{c}: invalid option\nunset: usage: unset [-f] [-v] [-n] [name ...]\n", .{flag});
                     return 2;
                 },
             }
@@ -275,6 +356,7 @@ fn builtinUnset(ctx: Ctx) u8 {
             ctx.sh.getEnv(name) == null and ctx.sh.getFunc(name) != null;
         const ok = switch (mode) {
             .variable => unsetVariable(ctx, name),
+            .nameref => if (ctx.sh.isNameref(name)) unsetNameref(ctx, name) else unsetVariable(ctx, name),
             .function => unsetFunction(ctx, name),
             .either => if (function_only) unsetFunction(ctx, name) else unsetVariable(ctx, name),
         };
@@ -298,6 +380,15 @@ fn unsetVariable(ctx: Ctx, name: []const u8) bool {
     _ = ctx.sh.unsetVar(name);
     _ = ctx.sh.unsetEnv(name);
     return true;
+}
+
+/// `unset -n NAME`: the reference itself, unless `declare -rn` locked it.
+fn unsetNameref(ctx: Ctx, name: []const u8) bool {
+    if (ctx.sh.readonly.contains(name)) {
+        ctx.errFmt("wsh: unset: {s}: cannot unset: readonly variable\n", .{name});
+        return false;
+    }
+    return ctx.sh.unsetNameref(name);
 }
 
 fn unsetFunction(ctx: Ctx, name: []const u8) bool {
@@ -497,13 +588,46 @@ fn finishJob(ctx: Ctx, job: *jobs.Job) u8 {
 fn builtinWait(ctx: Ctx) u8 {
     ctx.sh.reapJobs();
 
+    // `-n` returns the next job to finish; `-p VAR` stores the pid it waited
+    // for; `-f` waits for termination, which is what plain `wait` does here.
     var next = false;
+    var pid_var: ?[]const u8 = null;
     var index: usize = 1;
-    if (ctx.arg(1)) |first| {
-        if (std.mem.eql(u8, first, "-n")) {
-            next = true;
-            index = 2;
+    while (index < ctx.argv.len) {
+        const arg = ctx.argv[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            break;
         }
+        if (arg.len < 2 or arg[0] != '-') break;
+        index += 1;
+        for (arg[1..], 0..) |flag, at| switch (flag) {
+            'n' => next = true,
+            'f' => {},
+            'p' => {
+                if (at + 2 < arg.len) {
+                    pid_var = arg[at + 2 ..];
+                } else if (index < ctx.argv.len) {
+                    pid_var = ctx.argv[index];
+                    index += 1;
+                } else {
+                    ctx.err("wsh: wait: -p: option requires an argument\n");
+                    return 2;
+                }
+                break;
+            },
+            else => {
+                ctx.errFmt("wsh: wait: -{c}: invalid option\nwait: usage: wait [-fn] [-p var] [id ...]\n", .{flag});
+                return 2;
+            },
+        };
+    }
+    if (pid_var) |name| {
+        if (!validName(name)) {
+            ctx.errFmt("wsh: wait: `{s}': not a valid identifier\n", .{name});
+            return 2;
+        }
+        _ = ctx.sh.unsetVar(name);
     }
 
     if (next) {
@@ -529,6 +653,7 @@ fn builtinWait(ctx: Ctx) u8 {
                 if (job.state == .running) running = true;
                 if (job.state != .done) continue;
                 const status = job.status;
+                if (pid_var) |name| ctx.sh.setVar(name, .{ .int = job.last_pid }) catch {};
                 const job_index = ctx.sh.jobs.indexOf(job).?;
                 ctx.sh.jobs.removeAt(ctx.sh.gpa, job_index);
                 return status;
@@ -562,6 +687,7 @@ fn builtinWait(ctx: Ctx) u8 {
                 status = 127;
                 continue;
             }
+            if (pid_var) |name| ctx.sh.setVar(name, .{ .int = number }) catch {};
             if (ctx.sh.jobs.findById(@intCast(number))) |job| {
                 status = finishJob(ctx, job);
                 continue;
@@ -570,7 +696,9 @@ fn builtinWait(ctx: Ctx) u8 {
                 status = finishJob(ctx, job);
                 continue;
             }
-            if (proc.waitPid(number, 0)) |st| {
+            if (ctx.sh.jobs.finishedStatus(number)) |remembered| {
+                status = remembered;
+            } else if (proc.waitPid(number, 0)) |st| {
                 status = st.exitCode();
             } else {
                 ctx.errFmt("wsh: wait: {s}: not a child of this shell\n", .{spec});
@@ -584,6 +712,7 @@ fn builtinWait(ctx: Ctx) u8 {
             status = 127;
             continue;
         };
+        if (pid_var) |name| ctx.sh.setVar(name, .{ .int = job.last_pid }) catch {};
         status = finishJob(ctx, job);
     }
     ctx.sh.jobs.sweep(ctx.sh.gpa);
@@ -798,6 +927,10 @@ fn builtinBuiltin(ctx: Ctx) u8 {
     return b.run(inner);
 }
 
+fn builtinAgent(ctx: Ctx) u8 {
+    return agent.builtin(ctx.sh, ctx.argv, .{ ctx.stdin, ctx.stdout, ctx.stderr }, ctx.run_source);
+}
+
 fn builtinParallel(ctx: Ctx) u8 {
     const run_source = ctx.run_source orelse {
         ctx.err("wsh: parallel: executor unavailable\n");
@@ -825,6 +958,7 @@ pub fn runExternal(ctx: Ctx, argv: []const []const u8, path_env: []const u8) u8 
         .argv = proc.buildArgv(arena, argv) catch return 1,
         .envp = ctx.sh.buildEnvp(arena) catch return 1,
     };
+    proc.addScriptFallback(arena, exec, ctx.sh.shellExecutable(), resolved, argv) catch return 1;
 
     const stage = proc.Stage{
         .exec = exec,
@@ -848,7 +982,8 @@ fn builtinShift(ctx: Ctx) u8 {
         };
     }
     if (count > ctx.sh.positional.len) {
-        ctx.err("wsh: shift: not enough positional parameters\n");
+        // Bash fails quietly unless `shopt -s shift_verbose`.
+        if (ctx.sh.options.shift_verbose) ctx.errFmt("wsh: shift: {d}: shift count out of range\n", .{count});
         return 1;
     }
     ctx.sh.positional = ctx.sh.positional[count..];
@@ -897,12 +1032,14 @@ fn builtinExec(ctx: Ctx) u8 {
     const err = linux.errno(linux.execve(path.ptr, argv, envp));
 
     if (err == .NOEXEC) {
+        const shell = ctx.sh.shellExecutable();
         const script_argv = arena.alloc([]const u8, command_argv.len + 1) catch return 127;
-        script_argv[0] = "/bin/sh";
+        script_argv[0] = shell;
         script_argv[1] = resolved;
         for (command_argv[1..], 0..) |argument, index| script_argv[index + 2] = argument;
         const shell_argv = proc.buildArgv(arena, script_argv) catch return 127;
-        _ = linux.execve("/bin/sh", shell_argv, envp);
+        const shell_z = arena.dupeZ(u8, shell) catch return 127;
+        _ = linux.execve(shell_z.ptr, shell_argv, envp);
     }
 
     // Still here: an interactive shell carries on with its own dispositions.
@@ -955,6 +1092,9 @@ const table = [_]Builtin{
     .{ .name = "jobs", .summary = "list background jobs", .run = jobctl_builtin.jobsBuiltin },
     .{ .name = "wait", .summary = "wait for background jobs", .run = builtinWait },
     .{ .name = "parallel", .summary = "run commands with bounded concurrency", .run = builtinParallel },
+    .{ .name = "run", .summary = "start, follow and stop background runs", .run = builtinAgent },
+    .{ .name = "session", .summary = "keep named shells between calls", .run = builtinAgent },
+    .{ .name = "out", .summary = "summarize, search and check command output within a byte budget", .run = out_builtin.run },
     .{ .name = "fg", .summary = "bring a job to the foreground", .run = builtinFg },
     .{ .name = "bg", .summary = "resume a job in the background", .run = builtinBg },
     .{ .name = "kill", .summary = "send a signal to a process or job", .run = builtinKill },
@@ -971,6 +1111,7 @@ const table = [_]Builtin{
     .{ .name = "shopt", .summary = "set or list bash-style shell options", .run = shopt.run },
     .{ .name = "test", .summary = "evaluate a condition", .run = test_builtin.run },
     .{ .name = "[", .summary = "evaluate a condition", .run = test_builtin.runBracket },
+    .{ .name = "let", .summary = "evaluate arithmetic expressions", .run = builtinLet },
     .{ .name = "true", .summary = "return success", .run = builtinTrue },
     .{ .name = "false", .summary = "return failure", .run = builtinFalse },
     .{ .name = "clear", .summary = "clear the screen", .run = builtinClear },

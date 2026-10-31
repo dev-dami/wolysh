@@ -114,6 +114,12 @@ pub fn runStmts(sh: *Shell, stmts: []const ast.Stmt) u8 {
     for (stmts) |stmt| {
         if (sh.interrupted) return 130;
         sh.runPendingTraps();
+        if (sh.coproc_list.items.len != 0) {
+            sh.reapJobs();
+            sh.forgetFinishedCoprocs();
+        }
+        // `set -n`: commands are read but not run (an interactive shell ignores it).
+        if (sh.options.noexec and !sh.interactive) return status;
         status = runStmt(sh, stmt);
         sh.last_status = status;
         session.checkDirectory(sh);
@@ -138,17 +144,18 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
 
         .var_decl => |decl| {
             setLine(sh, decl.line);
-            const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, exprError(sh, err));
-            sh.assignVar(decl.name, v) catch |err| {
-                if (err == error.ReadonlyVariable) reportReadonly(sh, decl.name);
+            const v = evalExpr(sh, arena, decl.value) catch |err| return statementFailed(sh, nativeError(sh, err));
+            if (sh.isReadonly(decl.name)) {
+                reportReadonly(sh, decl.name);
                 return statementFailed(sh, 1);
-            };
+            }
+            sh.bindNative(decl.name, v) catch return statementFailed(sh, 1);
             return 0;
         },
 
         .env_assign => |assign| {
             setLine(sh, assign.line);
-            const v = evalExpr(sh, arena, assign.value) catch |err| return statementFailed(sh, exprError(sh, err));
+            const v = evalExpr(sh, arena, assign.value) catch |err| return statementFailed(sh, nativeError(sh, err));
             const text = v.renderAlloc(arena) catch return 1;
             const final = switch (assign.op) {
                 .set => text,
@@ -174,6 +181,7 @@ fn runStmt(sh: *Shell, stmt: ast.Stmt) u8 {
                 return statementFailed(sh, 1);
             };
             sh.setFuncLine(decl.name, decl.line) catch return 1;
+            sh.setFuncFile(decl.name, sh.source_file) catch return 1;
             return 0;
         },
 
@@ -214,6 +222,16 @@ fn statementFailed(sh: *Shell, status: u8) u8 {
     return status;
 }
 
+/// An error in one of wsh's own statements (`let x = ...`): reported, but
+/// the Bash rule that a failed arithmetic expansion ends a script does not
+/// apply.
+fn nativeError(sh: *Shell, err: anyerror) u8 {
+    const exiting = sh.should_exit;
+    const status = exprError(sh, err);
+    if (!exiting and (err == error.InvalidArithmetic or err == error.DivisionByZero)) sh.should_exit = false;
+    return status;
+}
+
 fn exprError(sh: *Shell, err: anyerror) u8 {
     switch (err) {
         error.CommandNotFound => return 127,
@@ -227,6 +245,11 @@ fn exprError(sh: *Shell, err: anyerror) u8 {
             var buf: [1100]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "wsh: {s}\n", .{detail}) catch "wsh: arithmetic error\n";
             sys.writeStr(sh.default_err, msg);
+            // As in Bash, a failed arithmetic expansion ends a script.
+            if (!sh.interactive) {
+                sh.should_exit = true;
+                sh.exit_code = 1;
+            }
             return 1;
         },
         error.UnterminatedSubstitution => {
@@ -381,10 +404,20 @@ fn runFor(sh: *Shell, loop: ast.For) u8 {
     defer scope.leave(sh);
     scope.install(sh);
 
+    // `set -x` shows `for NAME in WORDS`, as written, before each iteration,
+    // as Bash does. Iterations reset the scratch arena, so this lives outside.
+    const trace: []const u8 = if (sh.options.xtrace) blk: {
+        const words = std.mem.join(sh.gpa, " ", loop.items) catch return 1;
+        defer sh.gpa.free(words);
+        break :blk std.fmt.allocPrint(sh.gpa, "for {s} in {s}", .{ loop.name, words }) catch return 1;
+    } else "";
+    defer if (trace.len != 0) sh.gpa.free(trace);
+
     var status: u8 = 0;
     for (items) |item| {
         if (sh.interrupted) break;
         scope.nextIteration();
+        if (trace.len != 0) strict.traceText(sh, trace);
         sh.setVar(loop.name, .{ .string = item }) catch return 1;
         status = runStmts(sh, loop.body.stmts);
         sh.last_status = status;
@@ -465,6 +498,7 @@ fn runCase(sh: *Shell, case: ast.Case) u8 {
     defer procsub.release(substitutions);
     const arena = sh.scratch();
     const subject = expand_mod.expandLiteral(sh, arena, case.word) catch |err| return exprError(sh, err);
+    if (sh.options.xtrace) strict.traceText(sh, std.fmt.allocPrint(arena, "case {s} in", .{case.word}) catch "case");
     var status: u8 = 0;
     // Set by `;&`: the next body runs without testing its patterns.
     var fall_through = false;

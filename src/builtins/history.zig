@@ -4,8 +4,11 @@ const std = @import("std");
 const builtins = @import("../builtins.zig");
 const history = @import("../history.zig");
 const histexpand = @import("../interactive/histexpand.zig");
+const strftime = @import("strftime.zig");
+const shellmod = @import("../shell.zig");
 
 const Ctx = builtins.Ctx;
+const Shell = shellmod.Shell;
 
 const usage = "history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]\n";
 
@@ -142,13 +145,30 @@ fn storeArgs(ctx: Ctx, args: []const []const u8) u8 {
     return 0;
 }
 
+fn textOf(sh: *Shell, arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    if (sh.getVar(name)) |v| return v.renderAlloc(arena) catch null;
+    return sh.getEnv(name);
+}
+
 fn list(ctx: Ctx, limit: usize) u8 {
     const total = ctx.sh.hist.count();
     const start = if (limit != 0 and total > limit) total - limit else 0;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.sh.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // `HISTTIMEFORMAT` puts each entry's time, formatted by strftime, after
+    // its number, as in Bash.
+    const time_format = textOf(ctx.sh, arena, "HISTTIMEFORMAT");
+    const zone: ?strftime.Zone = if (time_format != null) strftime.load(arena, textOf(ctx.sh, arena, "TZ")) catch strftime.Zone.utc else null;
     var i = start;
     while (i < total) : (i += 1) {
         // Entries can be longer than `outFmt`'s buffer.
         ctx.outFmt("{d: >5}  ", .{i + 1});
+        if (time_format) |fmt| {
+            var stamp: std.ArrayList(u8) = .empty;
+            strftime.format(arena, &stamp, fmt, strftime.localTime(zone.?, ctx.sh.hist.time(i))) catch {};
+            ctx.out(stamp.items);
+        }
         ctx.out(ctx.sh.hist.get(i));
         ctx.out("\n");
     }

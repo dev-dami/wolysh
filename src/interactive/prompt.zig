@@ -106,12 +106,25 @@ pub fn textVar(sh: *const Shell, arena: std.mem.Allocator, name: []const u8) !?[
 pub fn render(sh: *Shell, arena: std.mem.Allocator, text: []const u8, name: []const u8) ![]const u8 {
     var decoded: std.ArrayList(u8) = .empty;
     try decode(sh, arena, &decoded, text);
+    if (!sh.options.promptvars) return unquote(arena, decoded.items);
     return expand_mod.expandHereDoc(sh, arena, decoded.items) catch |err| {
         var buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "wsh: {s}: {s}\n", .{ name, @errorName(err) }) catch "wsh: prompt expansion failed\n";
         sys.writeStr(2, message);
         return decoded.items;
     };
+}
+
+/// With `shopt -u promptvars` nothing is expanded: only the quoting that
+/// `appendQuoted` added for the expansion step comes off.
+fn unquote(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\\' and i + 1 < text.len and std.mem.indexOfScalar(u8, "$`\\", text[i + 1]) != null) i += 1;
+        try out.append(arena, text[i]);
+    }
+    return out.items;
 }
 
 /// Appends a value that comes from outside the prompt string (a directory,
@@ -227,11 +240,12 @@ pub fn decode(sh: *Shell, arena: std.mem.Allocator, out: *std.ArrayList(u8), tex
     }
 }
 
-/// `\u`: `$USER`, else the password-file entry for the real uid.
+/// `\u`: the password-file name of the real uid, as Bash has it; `$USER`
+/// only when the password file has no entry.
 fn userName(sh: *const Shell, arena: std.mem.Allocator) ![]const u8 {
-    if (sh.getEnv("USER")) |user| if (user.len != 0) return user;
+    const fallback = if (sh.getEnv("USER")) |user| user else "";
     const uid = linux.getuid();
-    const data = (try fs.readFileAlloc(arena, "/etc/passwd", 4 << 20)) orelse return "";
+    const data = (try fs.readFileAlloc(arena, "/etc/passwd", 4 << 20)) orelse return fallback;
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
         var fields = std.mem.splitScalar(u8, line, ':');
@@ -240,7 +254,7 @@ fn userName(sh: *const Shell, arena: std.mem.Allocator) ![]const u8 {
         const id = fields.next() orelse continue;
         if ((std.fmt.parseInt(u32, id, 10) catch continue) == uid) return name;
     }
-    return "";
+    return fallback;
 }
 
 /// `\l`: basename of the terminal on standard input, or `tty`.
@@ -292,7 +306,9 @@ test "PS1 escapes decode like bash" {
     const arena = arena_state.allocator();
 
     const text = try render(&sh, arena, "[\\u@\\h \\W]\\[\\e[1m\\]\\101\\q\\\\x \\H \\w", "PS1");
-    try std.testing.expectEqualStrings("[dami@box a$(x)]\x1b[1mA\\q\\x box.example.org ~/a$(x)", text);
+    // `\\u` is the password-file name of the uid running the test, not $USER.
+    const expected = try std.fmt.allocPrint(arena, "[{s}@box a$(x)]\x1b[1mA\\q\\x box.example.org ~/a$(x)", .{try userName(&sh, arena)});
+    try std.testing.expectEqualStrings(expected, text);
 
     command_number = 7;
     const counters = try render(&sh, arena, "\\#|\\!|\\j|\\s", "PS1");

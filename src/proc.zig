@@ -32,6 +32,18 @@ pub const Exec = struct {
     shell_argv: ?[*:null]const ?[*:0]const u8 = null,
 };
 
+/// Sets up `exec` so that a file `execve` refuses as not a program
+/// (`ENOEXEC`: a script without `#!`) runs as a shell script instead, the
+/// way Bash runs it in a copy of itself. `shell` is this shell's executable.
+pub fn addScriptFallback(arena: std.mem.Allocator, exec: *Exec, shell: []const u8, resolved: []const u8, argv: []const []const u8) !void {
+    const shell_argv = try arena.alloc([]const u8, argv.len + 1);
+    shell_argv[0] = shell;
+    shell_argv[1] = resolved;
+    for (argv[1..], 0..) |argument, index| shell_argv[index + 2] = argument;
+    exec.shell_path = (try arena.dupeZ(u8, shell)).ptr;
+    exec.shell_argv = try buildArgv(arena, shell_argv);
+}
+
 /// One process in a pipeline. Either exec a program or run shell code in the
 /// forked child (used for builtins that appear inside a pipeline).
 pub const Stage = struct {
@@ -77,6 +89,27 @@ fn setHandler(sig: linux.SIG, handler: ?linux.Sigaction.handler_fn) void {
 var original_actions: [linux.NSIG]?linux.Sigaction = [_]?linux.Sigaction{null} ** linux.NSIG;
 /// Signals a `trap '' SIG` ignores. Children keep ignoring them.
 var trap_ignored: u64 = 0;
+
+/// Signals already ignored when the shell started. Bash lists them in `trap`
+/// output (`trap -- '' SIGTSTP`), so a script sees what it inherited.
+var entry_ignored: u64 = 0;
+
+/// Notes which signals the shell inherited as ignored. Call once at start-up,
+/// before the shell changes any disposition.
+pub fn recordEntryDispositions() void {
+    var sig: u32 = 1;
+    while (sig <= 64) : (sig += 1) {
+        var current: linux.Sigaction = undefined;
+        if (linux.errno(linux.sigaction(@enumFromInt(sig), null, &current)) != .SUCCESS) continue;
+        const handler = current.handler.handler orelse continue;
+        if (@intFromPtr(handler) == @intFromPtr(linux.SIG.IGN.?)) entry_ignored |= @as(u64, 1) << @intCast(sig - 1);
+    }
+}
+
+pub fn ignoredOnEntry(sig: u32) bool {
+    if (sig < 1 or sig > 64) return false;
+    return entry_ignored & (@as(u64, 1) << @intCast(sig - 1)) != 0;
+}
 
 fn signalBit(sig: linux.SIG) u64 {
     return @as(u64, 1) << @intCast(@intFromEnum(sig) - 1);

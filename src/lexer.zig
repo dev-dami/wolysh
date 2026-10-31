@@ -277,6 +277,9 @@ pub const Lexer = struct {
     /// Set while the parser reads `case` patterns: `(`, `)` and `|` delimit
     /// patterns there, except inside an extglob group such as `@(a|b)`.
     case_pattern: bool = false,
+    /// The quote character of a string the input ended inside, or 0. Such
+    /// input is a syntax error, as in Bash.
+    unclosed: u8 = 0,
 
     pub fn init(src: []const u8) Lexer {
         return .{ .src = src };
@@ -630,7 +633,11 @@ pub const Lexer = struct {
             self.pos += 1;
         }
         const content = self.src[content_start..self.pos];
-        if (self.pos < self.src.len) self.pos += 1; // closing quote
+        if (self.pos < self.src.len) {
+            self.pos += 1; // closing quote
+        } else {
+            self.unclosed = quote;
+        }
         return .{
             .tag = tag,
             .text = content,
@@ -699,7 +706,11 @@ pub const Lexer = struct {
             if (self.src[self.pos] == '\n') self.line += 1;
             self.pos += 1;
         }
-        if (self.pos < self.src.len) self.pos += 1;
+        if (self.pos < self.src.len) {
+            self.pos += 1;
+        } else {
+            self.unclosed = '`';
+        }
     }
 
     /// Skips a `$'...'` string, where a backslash escapes the closing quote.
@@ -715,6 +726,7 @@ pub const Lexer = struct {
             if (c == '\'') return;
             if (c == '\n') self.line += 1;
         }
+        self.unclosed = '\'';
     }
 
     fn startsProcessSubstitution(self: *const Lexer, p: usize) bool {

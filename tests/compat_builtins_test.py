@@ -226,7 +226,7 @@ class ReadTests(unittest.TestCase):
         self.assert_same(script, script)
 
     def test_array_option_stores_a_list(self):
-        ours = 'read -a "arr" <<< "a b  c"; printf "<%s>" $arr; echo'
+        ours = 'read -a "arr" <<< "a b  c"; printf "<%s>" "${arr[@]}"; echo'
         theirs = 'read -a arr <<< "a b  c"; printf "<%s>" "${arr[@]}"; echo'
         self.assert_same(ours, theirs)
 
@@ -268,11 +268,11 @@ class GetoptsTests(unittest.TestCase):
 class MapfileTests(unittest.TestCase):
     def test_mapfile_options_match_bash(self):
         cases = [
-            ('mapfile -t "arr" <<< "a\nb\nc"; printf "<%s>" $arr; echo',
+            ('mapfile -t "arr" <<< "a\nb\nc"; printf "<%s>" "${arr[@]}"; echo',
              'mapfile -t arr <<< "a\nb\nc"; printf "<%s>" "${arr[@]}"; echo'),
-            ('printf "l1\\nl2\\nl3\\nl4\\n" | { mapfile -t -s 1 -n 2 "arr"; printf "<%s>" $arr; echo; }',
+            ('printf "l1\\nl2\\nl3\\nl4\\n" | { mapfile -t -s 1 -n 2 "arr"; printf "<%s>" "${arr[@]}"; echo; }',
              'printf "l1\\nl2\\nl3\\nl4\\n" | { mapfile -t -s 1 -n 2 arr; printf "<%s>" "${arr[@]}"; echo; }'),
-            ('printf "a:b:c" | { readarray -t -d : "arr"; printf "<%s>" $arr; echo; }',
+            ('printf "a:b:c" | { readarray -t -d : "arr"; printf "<%s>" "${arr[@]}"; echo; }',
              'printf "a:b:c" | { readarray -t -d : arr; printf "<%s>" "${arr[@]}"; echo; }'),
             ('mapfile <<< "m"; printf "<%s>" "$MAPFILE"; echo',
              'mapfile <<< "m"; printf "<%s>" "${MAPFILE[@]}"; echo'),
@@ -311,7 +311,7 @@ class UlimitTests(unittest.TestCase):
 class TypeTests(unittest.TestCase):
     def test_type_t_matches_bash(self):
         names = "ll if then fi do done case '[[' '{' '!' time in echo cd ls definitely-missing-xyz"
-        wsh = run_shell(f"alias ll='ls -l'; fn f() {{ echo hi }}; type -t f {names}; echo rc=$?")
+        wsh = run_shell(f"shopt -s expand_aliases; alias ll='ls -l'; fn f() {{ echo hi }}; type -t f {names}; echo rc=$?")
         bash = run_bash(f"shopt -s expand_aliases; alias ll='ls -l'; f() {{ echo hi; }}; type -t f {names}; echo rc=$?")
         self.assertEqual(wsh.stdout, bash.stdout, wsh.stderr)
 

@@ -65,7 +65,8 @@ const Lookup = struct {
 fn resolve(ctx: Ctx, arena: Allocator, name: []const u8, how: Lookup) Allocator.Error![]const Match {
     var matches: std.ArrayList(Match) = .empty;
     if (!how.path_only) {
-        if (ctx.sh.getAlias(name)) |text| try matches.append(arena, .{ .kind = .alias, .detail = text });
+        // An alias that would not expand is not what the name runs.
+        if (ctx.sh.options.expand_aliases) if (ctx.sh.getAlias(name)) |text| try matches.append(arena, .{ .kind = .alias, .detail = text });
         if (isKeyword(name)) try matches.append(arena, .{ .kind = .keyword });
         // A function shadows a builtin of the same name when it runs.
         if (how.functions) {
@@ -238,6 +239,7 @@ const hash_usage = "wsh: hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\
 pub fn hashBuiltin(ctx: Ctx) u8 {
     var report = false;
     var forget = false;
+    var forgot_all = false;
     var parser = options.Parser.init(ctx.argv, "dlp:rt");
     while (true) {
         switch (parser.next()) {
@@ -254,7 +256,8 @@ pub fn hashBuiltin(ctx: Ctx) u8 {
             },
             .option => |c| switch (c) {
                 'd' => forget = true,
-                'l', 'r' => {},
+                'l' => {},
+                'r' => forgot_all = true,
                 'p' => {
                     ctx.err("wsh: hash: -p: wsh does not cache command paths; every command is looked up in PATH when it runs\n");
                     return 1;
@@ -270,7 +273,8 @@ pub fn hashBuiltin(ctx: Ctx) u8 {
             ctx.errFmt("wsh: hash: -{c}: option requires an argument\n", .{@as(u8, if (report) 't' else 'd')});
             return 1;
         }
-        ctx.out("hash: hash table empty\n");
+        // `hash -r` forgets and says nothing; plain `hash` reports the empty table.
+        if (!forgot_all) ctx.out("hash: hash table empty\n");
         return 0;
     }
 

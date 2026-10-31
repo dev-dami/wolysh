@@ -162,8 +162,12 @@ pub fn exitTrapStatus() ?u8 {
 /// that has not changed any trap, the parent's.
 pub fn listedTrap(sh: *const Shell, id: u32) ?[]const u8 {
     if (sh.getTrap(id)) |handler| return handler;
-    const inherited = inherited_traps orelse return null;
-    return if (id < inherited.len) inherited[id] else null;
+    if (inherited_traps) |inherited| {
+        if (id < inherited.len) if (inherited[id]) |text| return text;
+    }
+    // A script lists the signals it inherited as ignored, as Bash does.
+    if (!sh.interactive and id >= 1 and id <= Shell.max_signal and proc.ignoredOnEntry(id)) return "";
+    return null;
 }
 
 /// Call after `trap` changes anything.
@@ -206,6 +210,7 @@ fn syncFatalHandlers(sh: *Shell) void {
 /// ones stay ignored, and the parent's EXIT, DEBUG and RETURN traps (and ERR,
 /// unless `set -E`) are dropped. Traps the child sets itself still run.
 pub fn enterSubshell(sh: *Shell) void {
+    sh.subshell_depth += 1;
     var sig: u32 = 1;
     while (sig <= Shell.max_signal) : (sig += 1) {
         // A signal the parent has yet to handle is the parent's business.
@@ -238,7 +243,7 @@ fn dropTrap(sh: *Shell, id: u32) void {
 /// does by default, and traces one level deeper.
 pub fn enterSubstitution(sh: *Shell) void {
     enterSubshell(sh);
-    sh.options.errexit = false;
+    if (!sh.options.inherit_errexit) sh.options.errexit = false;
     trace_level += 1;
 }
 
@@ -285,12 +290,11 @@ pub fn runReturnTrap(sh: *Shell) void {
 /// words as written; `BASH_COMMAND` holds them while the trap runs.
 pub fn beforeCommand(sh: *Shell, words: []const []const u8) void {
     if (running_traps != 0) return;
+    // `$BASH_COMMAND` is the command as written; kept in a fixed buffer so
+    // it stays readable after the command's own memory is gone.
+    if (words.len != 0) sh.noteCommand(words);
     const handler = sh.getTrap(Shell.debug_trap) orelse return;
     if (handler.len == 0) return;
-    if (words.len != 0) {
-        const text: []const u8 = std.mem.join(sh.scratch(), " ", words) catch "";
-        sh.setVar("BASH_COMMAND", .{ .string = text }) catch {};
-    }
     runHandler(sh, handler);
 }
 

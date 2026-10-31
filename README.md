@@ -35,6 +35,11 @@ The release archive includes the shell, examples, license, and checksum.
 - Run independent tasks with native `parallel -j N`, fail-fast queueing,
   and JSONL task reports.
 - Check generated scripts with `wsh --check` before executing them.
+- Keep background commands and all their output with `wsh run -d`, and keep
+  named shells between calls with `wsh session`.
+- Ask questions of long output with `out`: a summary within a byte budget,
+  the failed tests, or the lines matching a fuzzy query, with exact line
+  ranges to read next.
 
 ```text
 let workers = 4 * 2
@@ -74,6 +79,13 @@ record task indexes, exit statuses, and elapsed times separately from command
 output. See the [agent workflow guide](docs/agent-workflows.md) for the contract
 and examples.
 
+`wsh run -d --name test -- cargo test` starts a command that outlives the call
+and keeps its output in a log; `run wait`, `run logs --since OFFSET` and
+`run status --json` follow it. `wsh session exec work -- 'cd src'` runs in a
+named shell that keeps its directory, variables and functions. Because `run`
+and `session` are now commands, run a script file with one of those names as
+`wsh ./run`.
+
 <details>
 <summary>Build from source</summary>
 
@@ -99,12 +111,14 @@ Add `$HOME/.local/bin` to your existing shell's `PATH` if it is not already ther
 
 ## Project status
 
-Early stage and not yet a Bash drop-in. POSIX and Bash control flow (`case`,
-`until`, `[[ ]]`, `(( ))`, C-style `for`), functions, indexed and associative
-arrays, Bash parameter expansion, process substitution, extended globbing,
-`set -euo pipefail` and traps are implemented and compared against Bash in the
-test suite. See the [language guide](docs/language.md) for features,
-configuration, key bindings, and the remaining differences.
+Runs most Bash scripts unchanged. POSIX and Bash control flow (`case`,
+`until`, `[[ ]]`, `(( ))`, C-style `for`), functions, namerefs, indexed and
+associative arrays, Bash parameter expansion, process substitution, extended
+globbing, `set -euo pipefail`, traps, and the Bash variables, options and
+builtins scripts depend on are implemented and compared against Bash in the
+test suite; nvm's `nvm.sh` and its fast tests behave as under Bash. See the
+[language guide](docs/language.md) for features, configuration, key bindings,
+and the remaining differences.
 
 Recent changes are recorded in the [changelog](CHANGELOG.md).
 

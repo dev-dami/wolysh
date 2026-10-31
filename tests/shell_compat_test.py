@@ -364,7 +364,7 @@ class ShellCompatibilityTests(unittest.TestCase):
         result = run_shell("wsh-missing-compat-command 2>&1")
 
         self.assertEqual(result.returncode, 127)
-        self.assertIn(b"command not found: wsh-missing-compat-command", result.stdout)
+        self.assertIn(b"wsh-missing-compat-command: command not found", result.stdout)
         self.assertEqual(result.stderr, b"")
 
     def test_unquoted_heredoc_delimiter_expands_variables(self):
@@ -432,11 +432,13 @@ class ShellCompatibilityTests(unittest.TestCase):
         self.assertEqual(result.stdout, f"/tmp\n{ROOT}\n".encode())
         self.assertEqual(result.stderr, b"")
 
-    def test_unterminated_heredoc_fails_with_a_syntax_error(self):
+    def test_unterminated_heredoc_runs_with_a_warning(self):
+        # Bash takes the rest of the input as the body and warns.
         result = run_shell("cat <<EOF\nbody without delimiter\n")
 
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"here-document", result.stderr)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"body without delimiter\n")
+        self.assertIn(b"here-document at line 1 delimited by end-of-file (wanted `EOF')", result.stderr)
 
 
 if __name__ == "__main__":

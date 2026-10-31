@@ -54,6 +54,22 @@ fn run(sh: *Shell, hook: Hook, args: []const []const u8) void {
 
     const status = switch (hook) {
         .PROMPT_COMMAND => blk: {
+            // Bash 5.1: an array runs each element in turn.
+            if (sh.getVar("PROMPT_COMMAND")) |v| if (v == .list) {
+                // Copied first: an element may unset or replace the array,
+                // which frees the stored list while the loop still runs.
+                const arena = sh.scratch();
+                var commands: std.ArrayList([]const u8) = .empty;
+                for (v.list) |item| {
+                    if (item == .none) continue;
+                    const text = item.renderAlloc(arena) catch continue;
+                    if (std.mem.trim(u8, text, " \t\n").len == 0) continue;
+                    commands.append(arena, text) catch continue;
+                }
+                var last: u8 = 0;
+                for (commands.items) |text| last = exec.runSource(sh, text);
+                break :blk last;
+            };
             const text = (prompt.textVar(sh, sh.scratch(), "PROMPT_COMMAND") catch null) orelse return;
             if (std.mem.trim(u8, text, " \t\n").len == 0) return;
             break :blk exec.runSource(sh, text);
@@ -110,6 +126,21 @@ pub fn beforeCommand(sh: *Shell, line: []const u8) void {
         sys.writeStr(term_fd, out.items);
     }
     run(sh, .preexec, &.{line});
+    showPs0(sh);
+}
+
+/// `PS0`: expanded like a prompt and shown after a line is read, before it
+/// runs.
+fn showPs0(sh: *Shell) void {
+    var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = (prompt.textVar(sh, arena, "PS0") catch null) orelse return;
+    if (text.len == 0) return;
+    const saved_status = sh.last_status;
+    defer sh.last_status = saved_status;
+    const shown = prompt.render(sh, arena, text, "PS0") catch return;
+    sys.writeStr(term_fd, shown);
 }
 
 pub fn afterCommand(status: u8) void {

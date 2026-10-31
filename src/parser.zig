@@ -20,6 +20,7 @@ const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const compound_assign = @import("compound.zig");
 const test_ops = @import("builtins/test.zig");
+const sys = @import("sys.zig");
 
 pub const Error = error{ SyntaxError, OutOfMemory } || std.mem.Allocator.Error;
 
@@ -198,6 +199,12 @@ pub const Parser = struct {
         if (self.heredoc_next < self.pending_heredocs.items.len) {
             return self.fail("expected a newline before the here-document body");
         }
+        switch (self.lex.unclosed) {
+            0 => {},
+            '"' => return self.fail("unexpected end of input looking for the closing '\"'"),
+            '\'' => return self.fail("unexpected end of input looking for the closing \"'\""),
+            else => return self.fail("unexpected end of input looking for the closing '`'"),
+        }
         return stmts.toOwnedSlice(self.arena);
     }
 
@@ -311,8 +318,12 @@ pub const Parser = struct {
         if (self.tok.tag == .invalid) return self.fail("unexpected character");
         for (keywords) |kw| {
             if (isKeyword(self.tok, kw)) {
-                if (eql(kw, "let")) return self.parseLet();
-                if (eql(kw, "fn")) return self.parseFn();
+                if (eql(kw, "let")) {
+                    if (try self.tryParseLet()) |stmt| return stmt;
+                }
+                if (eql(kw, "fn")) {
+                    if (self.looksLikeFnDeclaration()) return self.parseFn();
+                }
                 if (eql(kw, "return")) return self.parseReturn();
                 if (eql(kw, "alias")) return self.parseAlias();
                 if (eql(kw, "break")) return self.parseLoopControl(true);
@@ -360,15 +371,23 @@ pub const Parser = struct {
 
     // --- language constructs -------------------------------------------------
 
-    fn parseLet(self: *Parser) Error!ast.Stmt {
+    /// `let NAME = expression` is the native binding. Anything else, such as
+    /// Bash's `let x=1+2` or `let "i += 1"`, is the `let` builtin, so this
+    /// backtracks to an ordinary command.
+    fn tryParseLet(self: *Parser) Error!?ast.Stmt {
         const line = lineOf(self.tok);
+        const saved = self.save();
         self.advance(); // `let`
         if (self.tok.tag != .word or !isIdentifier(self.tok.text)) {
-            return self.fail("expected a variable name after 'let'");
+            self.restore(saved);
+            return null;
         }
         const name = self.tok.text;
         self.advance();
-        if (!isKeyword(self.tok, "=")) return self.fail("expected '=' after the variable name");
+        if (!isKeyword(self.tok, "=")) {
+            self.restore(saved);
+            return null;
+        }
         self.advance();
         self.setMode(.expr);
         const value = try self.parseExpr();
@@ -944,6 +963,18 @@ pub const Parser = struct {
         } };
     }
 
+    /// `fn NAME(` starts a declaration; anything else (`fn a b`) is a call
+    /// to a command or function named `fn`.
+    fn looksLikeFnDeclaration(self: *Parser) bool {
+        const saved = self.save();
+        defer self.restore(saved);
+        self.advance(); // `fn`
+        self.setMode(.expr);
+        if (self.tok.tag != .ident) return false;
+        self.advance();
+        return self.tok.tag == .lparen;
+    }
+
     fn parseFn(self: *Parser) Error!ast.Stmt {
         const line = lineOf(self.tok);
         const decl_start = self.tok.start;
@@ -1073,11 +1104,29 @@ pub const Parser = struct {
             const op: ast.ChainOp = if (self.tok.tag == .ampamp) .and_ else .or_;
             self.advance();
             while (self.tok.tag == .newline) self.advance();
-            const p = try self.parsePipeline();
+            // `cd dir && f() { ...; }` defines a function, as in Bash.
+            const p = (try self.tryParseDefinition()) orelse try self.parsePipeline();
             try links.append(self.arena, .{ .op = op, .pipeline = p });
         }
         first.links = try links.toOwnedSlice(self.arena);
         return first;
+    }
+
+    /// A function definition (`name() ...` or `function name ...`) as a
+    /// one-command pipeline, so it can stand where a command does in a list.
+    fn tryParseDefinition(self: *Parser) Error!?ast.Pipeline {
+        self.setMode(.word);
+        const start = self.tok.start;
+        const definition = if (isKeyword(self.tok, "function"))
+            try self.parseFunctionKeyword()
+        else if (self.tok.tag == .word)
+            try self.tryParsePosixFunction()
+        else
+            null;
+        const stmt = definition orelse return null;
+        const commands = try self.arena.alloc(ast.Command, 1);
+        commands[0] = .{ .words = &.{}, .redirects = &.{}, .compound = try self.newCompound(.{ .statement = stmt }, start) };
+        return .{ .commands = commands, .line = stmt.fn_decl.line };
     }
 
     fn parsePipeline(self: *Parser) Error!ast.Pipeline {
@@ -1469,6 +1518,8 @@ pub const Parser = struct {
     fn consumePendingHereDocs(self: *Parser) Error!void {
         var cursor = self.lex.pos;
         var line = self.lex.line;
+        // The lexer has already counted the newline that ends the opener.
+        const opener_line = if (line > 1) line - 1 else line;
         for (self.pending_heredocs.items[self.heredoc_next..]) |redirect| {
             const body_start = cursor;
             var found = false;
@@ -1492,7 +1543,17 @@ pub const Parser = struct {
                 cursor = line_end + 1;
                 line += 1;
             }
-            if (!found) return self.fail("unterminated here-document");
+            // Bash takes the rest of the input as the body, with a warning.
+            if (!found) {
+                var buf: [320]u8 = undefined;
+                const warning = std.fmt.bufPrint(&buf, "wsh: warning: here-document at line {d} delimited by end-of-file (wanted `{s}')\n", .{ opener_line, redirect.target }) catch "wsh: warning: here-document delimited by end-of-file\n";
+                sys.writeStr(2, warning);
+                var rest = self.lex.src[body_start..];
+                // Every body line ends in a newline, the last one included.
+                if (rest.len > 0 and rest[rest.len - 1] != '\n') rest = try std.mem.concat(self.arena, u8, &.{ rest, "\n" });
+                redirect.body = if (redirect.strip_tabs) try stripLeadingTabs(self.arena, rest) else rest;
+                cursor = self.lex.src.len;
+            }
         }
 
         self.lex.pos = cursor;

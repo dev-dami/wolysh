@@ -4,6 +4,7 @@ history persistence, hooks, terminal integration and bash prompts."""
 import os
 import pathlib
 import pty
+import pwd
 import re
 import select
 import signal
@@ -16,6 +17,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHELL = pathlib.Path(os.environ.get("WSH", ROOT / "zig-out/bin/wsh")).resolve()
 TIMEOUT = 8.0
 
+# Bash renders \$ as # for root and $ otherwise; so does wsh.
+PRIVILEGE_MARK = b"#" if os.geteuid() == 0 else b"$"
 PROMPT_END = b"\x1b]133;B\x1b\\"
 OUTPUT_START = b"\x1b]133;C\x1b\\"
 COMMAND_END = re.compile(rb"\x1b\]133;D;(\d+)\x1b\\")
@@ -307,6 +310,30 @@ class SessionTests(unittest.TestCase):
 
     # --- hooks -----------------------------------------------------------------
 
+    def test_ps0_and_prompt_command_array(self):
+        s = self.start()
+        s.run("PS0='<ps0 $((6*7))>'")
+        s.run("PROMPT_COMMAND=('echo PC-ONE' 'echo PC-TWO')")
+        start = len(s.buf)
+        status, output = s.run("echo body")
+        self.assertEqual(status, 0)
+        tail = strip_ansi(s.buf[start:])
+        self.assertIn(b"<ps0 42>", tail)
+        # PS0 comes after the echoed command line and before its output.
+        ps0 = tail.find(b"<ps0 42>")
+        self.assertGreater(tail.find(b"echo body"), -1)
+        self.assertLess(tail.find(b"echo body"), ps0)
+        self.assertGreater(tail.find(b"body\r\n", ps0), ps0)
+        self.assertIsNotNone(s.read_until(b"PC-TWO", start))
+        self.assertLess(s.buf.find(b"PC-ONE", start), s.buf.find(b"PC-TWO", start))
+
+    def test_histtimeformat_shows_entry_times(self):
+        s = self.start()
+        s.run("echo stamped")
+        status, output = s.run("HISTTIMEFORMAT='%Y|' history 2")
+        self.assertEqual(status, 0)
+        self.assertRegex(output, rb"\d+  20\d\d\|echo stamped")
+
     def test_hooks_run_and_leave_the_status_alone(self):
         s = self.start()
         s.run("fn precmd() { echo PRECMD-RAN; false }")
@@ -376,14 +403,16 @@ class SessionTests(unittest.TestCase):
         s = self.start(extra_env={"USER": "tester"}, cwd=workdir)
         start = len(s.buf)
         s.run(r"PS1='[\u \W]\$ '")
-        self.assertIsNotNone(s.read_until(b"[tester proj$(boom)]$ ", start))
+        # As in Bash, \u is the password-file name, not $USER.
+        user = pwd.getpwuid(os.getuid()).pw_name.encode()
+        self.assertIsNotNone(s.read_until(b"[" + user + b" proj$(boom)]" + PRIVILEGE_MARK + b" ", start))
 
         s.run(r"PS1='\[\e[1m\]bold>\[\e[0m\] '")
         self.assertIn(b"\x1b[1mbold>\x1b[0m " + PROMPT_END, s.last_prompt())
 
     def test_ps1_and_ps2_from_the_environment(self):
         s = self.start(extra_env={"PS1": r"env-ps1 \$ ", "PS2": "cont> "})
-        self.assertIn(b"env-ps1 $ ", s.buf)
+        self.assertIn(b"env-ps1 " + PRIVILEGE_MARK + b" ", s.buf)
         start = len(s.buf)
         s.send("if true {\r")
         self.assertIsNotNone(s.read_until(b"cont> ", start))

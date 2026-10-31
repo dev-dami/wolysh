@@ -215,15 +215,15 @@ class PipefailTests(BashComparison):
 
     def test_pipestatus_holds_every_stage(self):
         self.assert_like_bash(
-            "false | true | (exit 4); echo $PIPESTATUS; ! false | true; echo $PIPESTATUS $?",
+            'false | true | (exit 4); echo "${PIPESTATUS[@]}"; ! false | true; echo "${PIPESTATUS[@]}" $?',
             'false | true | (exit 4); echo "${PIPESTATUS[@]}"; ! false | true; echo "${PIPESTATUS[@]}" $?',
         )
         self.assert_like_bash(
-            "false; echo $PIPESTATUS; (exit 3); echo $PIPESTATUS; x=$(exit 5); echo $PIPESTATUS",
+            'false; echo "${PIPESTATUS[@]}"; (exit 3); echo "${PIPESTATUS[@]}"; x=$(exit 5); echo "${PIPESTATUS[@]}"',
             'false; echo "${PIPESTATUS[@]}"; (exit 3); echo "${PIPESTATUS[@]}"; x=$(exit 5); echo "${PIPESTATUS[@]}"',
         )
         self.assert_like_bash(
-            "set -o pipefail; false | true; echo $PIPESTATUS; { false | true; }; echo $PIPESTATUS",
+            "set -o pipefail; false | true; echo \"${PIPESTATUS[@]}\"; { false | true; }; echo \"${PIPESTATUS[@]}\"",
             'set -o pipefail; false | true; echo "${PIPESTATUS[@]}"; { false | true; }; echo "${PIPESTATUS[@]}"',
         )
 
@@ -268,6 +268,20 @@ class XtraceTests(BashComparison):
 
 
 class TrapTests(BashComparison):
+    def test_signals_ignored_on_entry_are_listed(self):
+        # A shell started with signals ignored lists them, as Bash does.
+        def ignore():
+            signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+            signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+
+        script = "trap 'echo x' EXIT; trap"
+        runs = [
+            subprocess.run(command, cwd=ROOT, capture_output=True, timeout=TIMEOUT, check=False, preexec_fn=ignore)
+            for command in ([str(SHELL), "--no-config", "-c", script], [BASH, "--norc", "--noprofile", "-c", script])
+        ]
+        self.assertEqual(runs[0].stdout, runs[1].stdout)
+        self.assertIn(b"trap -- '' SIGTSTP", runs[0].stdout)
+
     def test_exit_trap_runs_once_at_the_end(self):
         self.assert_like_bash("trap 'echo bye $?' EXIT; echo body")
         self.assert_like_bash("trap 'echo bye $?' EXIT; false")
