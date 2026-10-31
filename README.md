@@ -111,12 +111,14 @@ Add `$HOME/.local/bin` to your existing shell's `PATH` if it is not already ther
 
 ## Project status
 
-Early stage and not yet a Bash drop-in. POSIX and Bash control flow (`case`,
-`until`, `[[ ]]`, `(( ))`, C-style `for`), functions, indexed and associative
-arrays, Bash parameter expansion, process substitution, extended globbing,
-`set -euo pipefail` and traps are implemented and compared against Bash in the
-test suite. See the [language guide](docs/language.md) for features,
-configuration, key bindings, and the remaining differences.
+Runs most Bash scripts unchanged. POSIX and Bash control flow (`case`,
+`until`, `[[ ]]`, `(( ))`, C-style `for`), functions, namerefs, indexed and
+associative arrays, Bash parameter expansion, process substitution, extended
+globbing, `set -euo pipefail`, traps, and the Bash variables, options and
+builtins scripts depend on are implemented and compared against Bash in the
+test suite; nvm's `nvm.sh` and its fast tests behave as under Bash. See the
+[language guide](docs/language.md) for features, configuration, key bindings,
+and the remaining differences.
 
 Recent changes are recorded in the [changelog](CHANGELOG.md).
 
