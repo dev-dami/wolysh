@@ -156,17 +156,20 @@ fn dirStack(sh: *const shell.Shell) value.Value {
     return .{ .list = dirstack_buf[0..count] };
 }
 
-/// `GROUPS`: the groups the user is in.
+/// `GROUPS`: the groups the user is in, the real group first as in Bash.
 fn groups() value.Value {
     var ids: [64]u32 = undefined;
     const rc = linux.getgroups(ids.len, &ids);
     const count: usize = if (linux.errno(rc) == .SUCCESS) @min(rc, ids.len) else 0;
-    if (count == 0) {
-        groups_buf[0] = .{ .int = linux.getgid() };
-        return .{ .list = groups_buf[0..1] };
+    const gid = linux.getgid();
+    groups_buf[0] = .{ .int = gid };
+    var len: usize = 1;
+    for (ids[0..count]) |id| {
+        if (id == gid or len == groups_buf.len) continue;
+        groups_buf[len] = .{ .int = id };
+        len += 1;
     }
-    for (0..count) |i| groups_buf[i] = .{ .int = ids[i] };
-    return .{ .list = groups_buf[0..count] };
+    return .{ .list = groups_buf[0..len] };
 }
 
 /// `BASH_ALIASES`: every alias, keyed by name.

@@ -4,6 +4,7 @@ history persistence, hooks, terminal integration and bash prompts."""
 import os
 import pathlib
 import pty
+import pwd
 import re
 import select
 import signal
@@ -398,7 +399,9 @@ class SessionTests(unittest.TestCase):
         s = self.start(extra_env={"USER": "tester"}, cwd=workdir)
         start = len(s.buf)
         s.run(r"PS1='[\u \W]\$ '")
-        self.assertIsNotNone(s.read_until(b"[tester proj$(boom)]" + PRIVILEGE_MARK + b" ", start))
+        # As in Bash, \u is the password-file name, not $USER.
+        user = pwd.getpwuid(os.getuid()).pw_name.encode()
+        self.assertIsNotNone(s.read_until(b"[" + user + b" proj$(boom)]" + PRIVILEGE_MARK + b" ", start))
 
         s.run(r"PS1='\[\e[1m\]bold>\[\e[0m\] '")
         self.assertIn(b"\x1b[1mbold>\x1b[0m " + PROMPT_END, s.last_prompt())

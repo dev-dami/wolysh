@@ -240,11 +240,12 @@ pub fn decode(sh: *Shell, arena: std.mem.Allocator, out: *std.ArrayList(u8), tex
     }
 }
 
-/// `\u`: `$USER`, else the password-file entry for the real uid.
+/// `\u`: the password-file name of the real uid, as Bash has it; `$USER`
+/// only when the password file has no entry.
 fn userName(sh: *const Shell, arena: std.mem.Allocator) ![]const u8 {
-    if (sh.getEnv("USER")) |user| if (user.len != 0) return user;
+    const fallback = if (sh.getEnv("USER")) |user| user else "";
     const uid = linux.getuid();
-    const data = (try fs.readFileAlloc(arena, "/etc/passwd", 4 << 20)) orelse return "";
+    const data = (try fs.readFileAlloc(arena, "/etc/passwd", 4 << 20)) orelse return fallback;
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
         var fields = std.mem.splitScalar(u8, line, ':');
@@ -253,7 +254,7 @@ fn userName(sh: *const Shell, arena: std.mem.Allocator) ![]const u8 {
         const id = fields.next() orelse continue;
         if ((std.fmt.parseInt(u32, id, 10) catch continue) == uid) return name;
     }
-    return "";
+    return fallback;
 }
 
 /// `\l`: basename of the terminal on standard input, or `tty`.
