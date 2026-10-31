@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
 import shutil
 import signal
@@ -526,6 +527,43 @@ class SessionTests(AgentTestCase):
         self.detach_client(pid, fd)
         # The session still answers requests between attaches.
         self.assertEqual(self.ok("session", "exec", "f", "echo ok").stdout, b"ok\n")
+
+    def test_request_keeps_the_line_being_typed(self):
+        self.ok("session", "new", "p")
+        pid, fd = self.attach_client("p")
+        self.read_until(fd, b"[p]")
+        os.write(fd, b"echo par")
+        self.read_until(fd, b"echo par")
+        # A request interrupts the prompt; the half-typed line must survive.
+        self.assertEqual(self.ok("session", "exec", "p", "echo from-exec").stdout, b"from-exec\n")
+        os.write(fd, b"tial\r")
+        screen = self.read_until(fd, b"partial\r\r\n")
+        # The output line, once the editor's escape sequences are gone.
+        self.assertIn(b"\npartial\r", re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", screen))
+        self.detach_client(pid, fd)
+
+    def test_a_client_that_stops_reading_does_not_stall_the_session(self):
+        self.ok("session", "new", "s")
+        pid, fd = self.attach_client("s")
+        self.read_until(fd, b"[s]")
+        os.write(fd, b"head -c 5000000 /dev/zero | tr '\\0' x; echo; echo BIG$((1+1))DONE\r")
+        # Once the output starts, this client never reads again: its
+        # terminal fills, then the socket, and the relay must drop it rather
+        # than stop reading the session's output.
+        self.read_until(fd, b"xxxxxxxx")
+        # The request waits for the foreground command, so it answers only
+        # once the 5 MB were written.
+        exec_result = self.wsh("session", "exec", "s", "echo after", timeout=60)
+        self.assertEqual((exec_result.returncode, exec_result.stdout), (0, b"after\n"), exec_result.stderr)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        os.close(fd)
+
+        pid, fd = self.attach_client("s")
+        self.assertIn(b"BIG2DONE", self.read_until(fd, b"BIG2DONE"))
+        os.write(fd, b"echo $((40+2))\r")
+        self.assertIn(b"42", self.read_until(fd, b"\n42"))
+        self.detach_client(pid, fd)
 
     def test_daemon_does_not_wait_for_a_busy_session(self):
         self.ok("session", "new", "A")

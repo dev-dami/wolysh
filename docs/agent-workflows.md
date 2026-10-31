@@ -199,10 +199,14 @@ A command in the foreground continues after you detach, as in tmux. The
 session keeps the newest 64 KiB of terminal output, and the next attach shows
 it first. A new attach replaces a client that is still attached. When the
 client's terminal changes size, the session's terminal and its foreground
-program get the new size.
+program get the new size. The session never waits for a client: when a client
+falls more than about 1 MiB behind the output, the session drops it. Attach
+again to get the replay buffer.
 
 `session exec` requests interrupt the attached prompt and run between
-commands. While a foreground command runs on the terminal, they wait. `session
+commands. A line that is partly typed stays, with its cursor, and you can
+continue to type it after the request. While a foreground command runs on the
+terminal, requests wait. `session
 ls` shows the directory of each session after its last command, from
 `session exec` or from the attached prompt.
 

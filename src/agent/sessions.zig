@@ -513,10 +513,13 @@ pub fn host(gpa: std.mem.Allocator, ctl: i32, name: []const u8, cwd: []const u8,
     term.wake_fd = ctl;
 
     var tty: i32 = -1;
+    // One editor for the terminal's life, so a line typed when a request
+    // interrupts the prompt comes back after it.
+    var editor: editor_mod.Editor = undefined;
     while (!sh.should_exit) {
         if (tty >= 0) {
-            if (repl(&sh, tty, name, ctl) == .hangup) {
-                closeTerminal(&sh, tty);
+            if (repl(&sh, &editor, tty, name, ctl) == .hangup) {
+                closeTerminal(&sh, &editor, tty);
                 tty = -1;
             }
             if (sh.should_exit) break;
@@ -533,8 +536,9 @@ pub fn host(gpa: std.mem.Allocator, ctl: i32, name: []const u8, cwd: []const u8,
         } else if (eql(op, "attach") and frame.fd_count >= 1) {
             // The relay of an older terminal is gone, or the daemon would
             // have sent the attach there.
-            if (tty >= 0) closeTerminal(&sh, tty);
+            if (tty >= 0) closeTerminal(&sh, &editor, tty);
             tty = openTerminal(&sh, arena, ctl, frame.fds[0], req.?.rows orelse 24, req.?.cols orelse 80);
+            if (tty >= 0) editor = editor_mod.Editor.init(&sh, tty, tty);
             reportDone(&sh, arena, ctl);
         } else reportDone(&sh, arena, ctl);
     }
@@ -617,7 +621,8 @@ fn openTerminal(sh: *Shell, arena: std.mem.Allocator, ctl: i32, conn: i32, rows:
     return tty;
 }
 
-fn closeTerminal(sh: *Shell, tty: i32) void {
+fn closeTerminal(sh: *Shell, editor: *editor_mod.Editor, tty: i32) void {
+    editor.deinit();
     if (sh.job_control) pty.releaseControlling(tty);
     sh.interactive = false;
     sh.job_control = false;
@@ -631,9 +636,7 @@ const ReplEnd = enum { request, hangup };
 /// The attached shell's prompt loop. It returns when the daemon has a
 /// request (the prompt comes back after it), when the terminal is gone, or
 /// when a command runs `exit`.
-fn repl(sh: *Shell, tty: i32, name: []const u8, ctl: i32) ReplEnd {
-    var editor = editor_mod.Editor.init(sh, tty, tty);
-    defer editor.deinit();
+fn repl(sh: *Shell, editor: *editor_mod.Editor, tty: i32, name: []const u8, ctl: i32) ReplEnd {
     var prompt_text: std.Io.Writer.Allocating = .init(sh.gpa);
     defer prompt_text.deinit();
     var reported_cwd: std.ArrayList(u8) = .empty;
@@ -649,9 +652,10 @@ fn repl(sh: *Shell, tty: i32, name: []const u8, ctl: i32) ReplEnd {
         prompt.write(&prompt_text.writer, sh) catch {};
         const full = prompt_text.writer.buffered();
         const last_line = if (std.mem.lastIndexOfScalar(u8, full, '\n')) |newline| newline + 1 else 0;
-        sys.writeStr(2, full[0..last_line]);
+        // A resumed line is still on screen under the earlier prompt lines.
+        if (!editor.woken) sys.writeStr(2, full[0..last_line]);
         const source = editor.readCommand(full[last_line..], exec.isComplete, prompt.writeContinuation) orelse {
-            if (term.wakePending()) return .request;
+            if (editor.woken or term.wakePending()) return .request;
             if (hungUp(tty)) return .hangup;
             // Ctrl-D on an empty line: the session stays, as it does when
             // the client detaches.
@@ -683,6 +687,154 @@ fn hungUp(tty: i32) bool {
     return linux.poll(&fds, 1, 0) == 1 and fds[0].revents & linux.POLL.HUP != 0;
 }
 
+/// Bytes waiting for a descriptor that cannot take them yet.
+const Backlog = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    start: usize = 0,
+
+    fn len(self: *const Backlog) usize {
+        return self.bytes.items.len - self.start;
+    }
+
+    fn pending(self: *const Backlog) []const u8 {
+        return self.bytes.items[self.start..];
+    }
+
+    fn push(self: *Backlog, gpa: std.mem.Allocator, data: []const u8) !void {
+        try self.bytes.appendSlice(gpa, data);
+    }
+
+    /// Forgets the first `n` pending bytes, compacting now and then so the
+    /// buffer does not grow without bound.
+    fn consume(self: *Backlog, n: usize) void {
+        self.start += n;
+        if (self.start == self.bytes.items.len) return self.clear();
+        if (self.start >= 64 * 1024 and self.start * 2 >= self.bytes.items.len) {
+            const rest = self.bytes.items.len - self.start;
+            std.mem.copyForwards(u8, self.bytes.items[0..rest], self.bytes.items[self.start..]);
+            self.bytes.shrinkRetainingCapacity(rest);
+            self.start = 0;
+        }
+    }
+
+    fn clear(self: *Backlog) void {
+        self.bytes.clearRetainingCapacity();
+        self.start = 0;
+    }
+};
+
+/// Output an attached client has not read yet. Past this the client is
+/// dropped rather than let the session wait; it can attach again and gets
+/// the replay buffer.
+const max_client_backlog = 1 << 20;
+
+/// The terminal relay's state. Nothing in it blocks: the client and the
+/// master side are written without waiting, so the session's programs
+/// always have somewhere to put their output.
+const Relay = struct {
+    gpa: std.mem.Allocator,
+    channel: i32,
+    master: i32,
+    client: i32,
+    ring: Ring = .{},
+    parser: InputParser = .{},
+    /// Output for the client.
+    out: Backlog = .{},
+    /// Keystrokes for the terminal. While any wait, the relay stops reading
+    /// the client, so a program that does not read its input slows the
+    /// client down instead of filling memory.
+    input: Backlog = .{},
+
+    fn dropClient(self: *Relay) void {
+        if (self.client >= 0) _ = linux.close(self.client);
+        self.client = -1;
+        self.out.clear();
+    }
+
+    /// Sends `data` to the client after what is already waiting.
+    fn toClient(self: *Relay, data: []const u8) void {
+        if (self.client < 0) return;
+        var rest = data;
+        if (self.out.len() == 0) {
+            const n = wire.sendNow(self.client, rest, &.{}) catch |e| switch (e) {
+                error.WouldBlock => 0,
+                error.Failed => return self.dropClient(),
+            };
+            rest = rest[n..];
+        }
+        if (rest.len == 0) return;
+        if (self.out.len() + rest.len > max_client_backlog) return self.dropClient();
+        self.out.push(self.gpa, rest) catch self.dropClient();
+    }
+
+    fn flushClient(self: *Relay) void {
+        while (self.client >= 0 and self.out.len() != 0) {
+            const n = wire.sendNow(self.client, self.out.pending(), &.{}) catch |e| switch (e) {
+                error.WouldBlock => return,
+                error.Failed => return self.dropClient(),
+            };
+            self.out.consume(n);
+        }
+    }
+
+    fn flushInput(self: *Relay) void {
+        while (self.input.len() != 0) {
+            const pending_input = self.input.pending();
+            const rc = linux.write(self.master, pending_input.ptr, pending_input.len);
+            switch (linux.errno(rc)) {
+                .SUCCESS => self.input.consume(rc),
+                .INTR => continue,
+                .AGAIN => return,
+                else => return self.input.clear(),
+            }
+        }
+    }
+
+    /// A new client from the daemon replaces the old one and first gets the
+    /// replay buffer.
+    fn takeClient(self: *Relay, arena: std.mem.Allocator, frame: *wire.Frame) void {
+        const conn = frame.fds[0];
+        frame.fds[0] = -1;
+        frame.closeFds();
+        self.dropClient();
+        self.client = conn;
+        self.parser = .{};
+        if (wire.parseJson(Request, arena, frame.body)) |req| pty.setSize(self.master, req.rows orelse 24, req.cols orelse 80);
+        const body = std.json.Stringify.valueAlloc(arena, Reply{ .ok = true }, .{}) catch return self.dropClient();
+        self.toClient(wire.encodeFrame(arena, body) catch return self.dropClient());
+        const replay = self.ring.pieces();
+        self.toClient(replay[0]);
+        self.toClient(replay[1]);
+    }
+
+    /// False when the terminal is gone.
+    fn readMaster(self: *Relay, buf: []u8) bool {
+        const rc = linux.read(self.master, buf.ptr, buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false;
+                self.ring.append(buf[0..rc]);
+                self.toClient(buf[0..rc]);
+                return true;
+            },
+            .INTR, .AGAIN => return true,
+            else => return false,
+        }
+    }
+
+    fn readClient(self: *Relay, buf: []u8) void {
+        const n = sys.readSome(self.client, buf) orelse 0;
+        // End of input: detached. The terminal and its programs carry on.
+        if (n == 0) return self.dropClient();
+        var rest: []const u8 = buf[0..n];
+        while (self.parser.next(&rest)) |event| switch (event) {
+            .bytes => |bytes| self.input.push(self.gpa, bytes) catch {},
+            .resize => |size| pty.setSize(self.master, size.rows, size.cols),
+        };
+        self.flushInput();
+    }
+};
+
 /// Owns the terminal's master side for the session's life. It copies output
 /// to the attached client and into the replay buffer, passes keystrokes and
 /// resizes to the terminal, and takes new clients from the daemon on
@@ -698,16 +850,23 @@ fn relay(channel: i32, master: i32, first: i32) noreturn {
     sys.setpgid(0, 0);
     runs.keepOnly(&.{ channel, master, first });
     state.nullStdio();
-    var ring = Ring{};
-    var client = first;
-    var parser = InputParser{};
+    const flags = linux.fcntl(master, linux.F.GETFL, 0);
+    const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+    _ = linux.fcntl(master, linux.F.SETFL, flags | nonblock);
+
+    var self = Relay{ .gpa = std.heap.page_allocator, .channel = channel, .master = master, .client = first };
     var buf: [65536]u8 = undefined;
     while (true) {
-        const polled_client = client;
+        const polled_client = self.client;
+        const waiting_input = self.input.len() != 0;
         var fds = [_]linux.pollfd{
             .{ .fd = channel, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = master, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = client, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = master, .events = linux.POLL.IN | (if (waiting_input) @as(i16, linux.POLL.OUT) else 0), .revents = 0 },
+            .{
+                .fd = self.client,
+                .events = (if (waiting_input) 0 else @as(i16, linux.POLL.IN)) | (if (self.out.len() != 0) @as(i16, linux.POLL.OUT) else 0),
+                .revents = 0,
+            },
         };
         const rc = linux.poll(&fds, fds.len, -1);
         if (linux.errno(rc) == .INTR) continue;
@@ -715,48 +874,16 @@ fn relay(channel: i32, master: i32, first: i32) noreturn {
         if (fds[0].revents != 0) {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var frame = (wire.recv(channel, arena) catch break) orelse break;
-            if (frame.fd_count != 0) {
-                const conn = frame.fds[0];
-                frame.fds[0] = -1;
-                frame.closeFds();
-                if (client >= 0) _ = linux.close(client);
-                client = conn;
-                parser = .{};
-                if (wire.parseJson(Request, arena, frame.body)) |req| pty.setSize(master, req.rows orelse 24, req.cols orelse 80);
-                const replay = ring.pieces();
-                if (!wire.sendJson(client, arena, Reply{ .ok = true }, &.{}) or
-                    sys.writeAll(client, replay[0]) != .ok or sys.writeAll(client, replay[1]) != .ok)
-                {
-                    _ = linux.close(client);
-                    client = -1;
-                }
-            }
+            var frame = (wire.recv(channel, arena_state.allocator()) catch break) orelse break;
+            if (frame.fd_count != 0) self.takeClient(arena_state.allocator(), &frame);
         }
-        if (fds[1].revents != 0) {
-            const n = sys.readSome(master, &buf) orelse break;
-            if (n == 0) break;
-            ring.append(buf[0..n]);
-            if (client >= 0 and sys.writeAll(client, buf[0..n]) != .ok) {
-                _ = linux.close(client);
-                client = -1;
-            }
-        }
-        if (client >= 0 and client == polled_client and fds[2].revents != 0) {
-            const n = sys.readSome(client, &buf) orelse 0;
-            if (n == 0) {
-                // Detached: the terminal and its programs carry on.
-                _ = linux.close(client);
-                client = -1;
-                continue;
-            }
-            var rest: []const u8 = buf[0..n];
-            while (parser.next(&rest)) |event| switch (event) {
-                .bytes => |bytes| _ = sys.writeAll(master, bytes),
-                .resize => |size| pty.setSize(master, size.rows, size.cols),
-            };
-        }
+        if (fds[1].revents & linux.POLL.OUT != 0) self.flushInput();
+        if (fds[1].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0 and !self.readMaster(&buf)) break;
+        if (self.client < 0 or self.client != polled_client) continue;
+        const client_events = fds[2].revents;
+        if (client_events & linux.POLL.OUT != 0) self.flushClient();
+        if (self.client < 0 or client_events & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) == 0) continue;
+        if (self.input.len() == 0) self.readClient(&buf) else if (client_events & linux.POLL.IN == 0) self.dropClient();
     }
     linux.exit(0);
 }
@@ -819,4 +946,23 @@ test "the replay buffer keeps the newest 64 KiB" {
     try testing.expectEqual(@as(u8, 'a'), parts[0][0]);
     // The 'a's that survive are the newest ones: 64 KiB minus 40 000 'b's.
     try testing.expectEqual(Ring.capacity - 40_000, std.mem.count(u8, parts[0], "a") + std.mem.count(u8, parts[1], "a"));
+}
+
+test "a backlog hands out what is pending and compacts" {
+    var backlog = Backlog{};
+    defer backlog.bytes.deinit(testing.allocator);
+    try backlog.push(testing.allocator, "hello ");
+    try backlog.push(testing.allocator, "world");
+    backlog.consume(6);
+    try testing.expectEqualStrings("world", backlog.pending());
+    backlog.consume(5);
+    try testing.expectEqual(@as(usize, 0), backlog.len());
+
+    const block = [_]u8{'z'} ** (100 * 1024);
+    try backlog.push(testing.allocator, &block);
+    try backlog.push(testing.allocator, "end");
+    backlog.consume(block.len - 1);
+    try testing.expectEqualStrings("zend", backlog.pending());
+    // Compacted: the consumed part is gone from the buffer.
+    try testing.expectEqual(@as(usize, 0), backlog.start);
 }
