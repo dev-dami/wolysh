@@ -103,7 +103,8 @@ pub fn get(sh: *const shell.Shell, name: []const u8) ?value.Value {
     if (eql(u8, name, "BASH_ALIASES")) return aliasMap(sh);
     // Bash starts with its own IFS and ignores the one it inherits.
     if (eql(u8, name, "IFS")) return .{ .string = " \t\n" };
-    if (eql(u8, name, "PS4")) return .{ .string = "+ " };
+    // An inherited PS4 counts, except for root, where Bash ignores it.
+    if (eql(u8, name, "PS4")) return if (sh.env.contains(name) and linux.geteuid() != 0) null else .{ .string = "+ " };
     if (eql(u8, name, "BASH_VERSION")) return .{ .string = bash_version };
     if (eql(u8, name, "BASH_VERSINFO")) return .{ .list = &bash_versinfo };
     if (eql(u8, name, "MACHTYPE")) return .{ .string = @tagName(builtin.cpu.arch) ++ "-pc-linux-gnu" };
