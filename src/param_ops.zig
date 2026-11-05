@@ -198,6 +198,9 @@ pub fn capitalize(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 fn appendConverted(arena: std.mem.Allocator, out: *std.ArrayList(u8), char: []const u8, upper: bool) !void {
+    // `utf8Decode` asserts on a truncated sequence, which is undefined
+    // behaviour in ReleaseFast. Invalid bytes are copied unchanged.
+    if (!std.unicode.utf8ValidateSlice(char)) return out.appendSlice(arena, char);
     const cp = std.unicode.utf8Decode(char) catch return out.appendSlice(arena, char);
     const mapped = if (upper) toUpper(cp) else toLower(cp);
     var buf: [4]u8 = undefined;

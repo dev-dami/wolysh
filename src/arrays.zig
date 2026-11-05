@@ -97,7 +97,8 @@ pub fn assignCompound(
     if (as_map) {
         var entries: std.ArrayList(value.Entry) = .empty;
         if (append) {
-            if (existing) |v| if (v == .map) try entries.appendSlice(arena, v.map);
+            // Deep copies: the expansions below can free the stored strings.
+            if (existing) |v| if (v == .map) for (v.map) |entry| try entries.append(arena, try shellmod.cloneEntry(arena, entry));
         }
         var i: usize = 0;
         while (i < words.len) : (i += 1) {
@@ -132,11 +133,12 @@ pub fn assignCompound(
     var items: std.ArrayList(Value) = .empty;
     if (append) {
         if (existing) |v| switch (v) {
-            .list => |list| try items.appendSlice(arena, list),
+            // Deep copies: the expansions below can free the stored strings.
+            .list => |list| for (list) |item| try items.append(arena, try shellmod.cloneValue(arena, item)),
             .map => return badSubscript(sh, name, "+=(...)"),
             .none => {},
-            else => try items.append(arena, v),
-        } else if (sh.getEnv(name)) |text| try items.append(arena, .{ .string = text });
+            else => try items.append(arena, try shellmod.cloneValue(arena, v)),
+        } else if (sh.getEnv(name)) |text| try items.append(arena, .{ .string = try arena.dupe(u8, text) });
     }
     var next: usize = items.items.len;
     for (words) |word| {
@@ -199,16 +201,34 @@ pub fn assignElement(
     // looked up again just before the store.
     if (sh.vars.get(name).? == .map) {
         const key = try expand.expandLiteral(sh, arena, subscript);
-        const entries = sh.vars.get(name).?.map;
-        const old: ?Value = if (findEntry(entries, key)) |i| entries[i].value else null;
+        const entries = try storedMap(sh, name, subscript);
+        // A copy: `combine` can run arithmetic that frees the stored entry.
+        const old: ?Value = if (findEntry(entries, key)) |i| try shellmod.cloneValue(arena, entries[i].value) else null;
         const item = try combine(sh, arena, attrs, old, text, append);
+        _ = try storedMap(sh, name, subscript);
         return storeEntry(sh.gpa, sh.vars.getPtr(name).?, key, item);
     }
     const index = try resolveIndex(sh, arena, name, subscript, sh.vars.get(name).?.list.len);
-    const items = sh.vars.get(name).?.list;
-    const old: ?Value = if (index < items.len) items[index] else null;
+    const items = try storedList(sh, name, subscript);
+    const old: ?Value = if (index < items.len) try shellmod.cloneValue(arena, items[index]) else null;
     const item = try combine(sh, arena, attrs, old, text, append);
+    _ = try storedList(sh, name, subscript);
     try storeItem(sh.gpa, sh.vars.getPtr(name).?, index, item);
+}
+
+/// The stored list of `name`, looked up again after script code ran. An
+/// arithmetic assignment such as `a[a=0]=x` can replace the whole array.
+fn storedList(sh: *Shell, name: []const u8, subscript: []const u8) Error![]const Value {
+    const v = sh.vars.get(name) orelse return badSubscript(sh, name, subscript);
+    if (v != .list) return badSubscript(sh, name, subscript);
+    return v.list;
+}
+
+/// `storedList` for an associative array.
+fn storedMap(sh: *Shell, name: []const u8, subscript: []const u8) Error![]const value.Entry {
+    const v = sh.vars.get(name) orelse return badSubscript(sh, name, subscript);
+    if (v != .map) return badSubscript(sh, name, subscript);
+    return v.map;
 }
 
 /// Evaluates an indexed-array subscript. A negative index counts back from
@@ -415,7 +435,9 @@ pub fn unsetElement(sh: *Shell, spec: []const u8) ?u8 {
         }
         // As in bash, the key is expanded here, so `unset 'm[$k]'` works.
         const key = expand.expandLiteral(sh, sh.scratch(), subscript) catch return 1;
-        const entries = (sh.vars.get(name) orelse return 0).map;
+        const now = sh.vars.get(name) orelse return 0;
+        if (now != .map) return 0;
+        const entries = now.map;
         const index = findEntry(entries, key) orelse return 0;
         const shrunk = sh.gpa.alloc(value.Entry, entries.len - 1) catch return 1;
         @memcpy(shrunk[0..index], entries[0..index]);

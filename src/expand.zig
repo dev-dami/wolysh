@@ -903,7 +903,7 @@ pub const Expander = struct {
             },
             .substring => {
                 try self.requireSet(p, ref);
-                return self.emitParam(try self.substring(p, b.word, b.word2), quoted);
+                return self.emitParam(try self.substring(try self.ownParam(p), b.word, b.word2), quoted);
             },
             .transform => {
                 try self.requireSet(p, ref);
@@ -915,9 +915,24 @@ pub const Expander = struct {
             },
             .remove_prefix, .remove_suffix, .replace, .upper, .lower => {
                 try self.requireSet(p, ref);
-                return self.emitParam(try self.applyOperator(p, b), quoted);
+                return self.emitParam(try self.applyOperator(try self.ownParam(p), b), quoted);
             },
         }
+    }
+
+    /// `p` with its text copied into the arena. `p` can borrow the stored
+    /// value, and an operand such as `${x:(x=0)}` can free that value before
+    /// the operator reads it.
+    fn ownParam(self: *Expander, p: Param) Error!Param {
+        var out = p;
+        if (p.list) {
+            const items = try self.arena.alloc([]const u8, p.items.len);
+            for (p.items, 0..) |item, i| items[i] = try self.arena.dupe(u8, item);
+            out.items = items;
+        } else {
+            out.text = try self.arena.dupe(u8, p.text);
+        }
+        return out;
     }
 
     fn emitParam(self: *Expander, p: Param, quoted: bool) Error!void {
@@ -1003,10 +1018,15 @@ pub const Expander = struct {
 
     /// `${name[subscript]}`: an arithmetic index for an indexed array (negative
     /// counts from the end), a key for an associative one.
+    ///
+    /// The subscript can assign variables (`${a[a=1]}`), which frees the
+    /// stored array, so the variable is looked up again after it is evaluated.
     fn element(self: *Expander, name: []const u8, v: ?value.Value, subscript: []const u8) Error!Param {
-        const val = v orelse return .{ .set = false };
-        if (val == .map) {
+        const before = v orelse return .{ .set = false };
+        if (before == .map) {
             const key = try expandLiteral(self.sh, self.arena, subscript);
+            const val = variable(self.sh, name) orelse return .{ .set = false };
+            if (val != .map) return .{ .set = false };
             for (val.map) |entry| {
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 if (entry.value == .none) break;
@@ -1015,6 +1035,8 @@ pub const Expander = struct {
             return .{ .set = false };
         }
         const n = try self.arithOperand(subscript);
+        const val = variable(self.sh, name) orelse return .{ .set = false };
+        if (val == .map) return .{ .set = false };
         const len: usize = if (val == .list) val.list.len else 1;
         const index: i64 = if (n < 0) n + @as(i64, @intCast(len)) else n;
         if (index < 0) {
