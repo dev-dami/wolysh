@@ -784,10 +784,19 @@ const Arith = struct {
     /// variable's environment entry in step.
     fn store(self: *Arith, name: []const u8, v: i64) Error!void {
         if (self.noeval != 0) return;
+        var base = name;
+        var subscript: ?[]const u8 = null;
         if (std.mem.indexOfScalar(u8, name, '[')) |open| {
+            base = name[0..open];
+            subscript = name[open + 1 .. name.len - 1];
+        } else if (self.sh.vars.get(self.sh.deref(name))) |stored| {
+            // As in Bash, `a=5` on a Bash array sets element 0. A list made by
+            // `let` is replaced, as before.
+            if ((stored == .list or stored == .map) and !self.sh.isNativeList(name)) subscript = "0";
+        }
+        if (subscript) |sub| {
             const digits = try std.fmt.allocPrint(self.arena, "{d}", .{v});
-            const base = name[0..open];
-            arrays.assignElement(self.sh, self.arena, base, name[open + 1 .. name.len - 1], digits, false) catch |err| switch (err) {
+            arrays.assignElement(self.sh, self.arena, base, sub, digits, false) catch |err| switch (err) {
                 error.ReadonlyVariable => {
                     setMessage("{s}: readonly variable", .{base});
                     return error.InvalidArithmetic;

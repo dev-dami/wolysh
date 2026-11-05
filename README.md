@@ -122,6 +122,7 @@ and the remaining differences.
 
 Recent changes are recorded in the [changelog](CHANGELOG.md).
 
+- [Plan for 1.0](docs/v1.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Demo script](examples/demo.wsh)

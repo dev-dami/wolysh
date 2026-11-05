@@ -118,6 +118,9 @@ SCRIPTS = [
         "3 1 16 8 8 13 29 30 28 56 56\n",
     ),
     ("echo $(( a = b = 5 )) $a $b", "5 5 5\n"),
+    # As in Bash, assigning a whole array sets element 0.
+    ('a=(x y); (( a = 5 )); echo "${a[@]}"', "5 y\n"),
+    ('declare -A m=([k]=v); (( m = 3 )); echo "${m[0]}" "${m[k]}"', "3 v\n"),
     ("echo $(( c = 1, c += 2, c *= 3, c )) $c", "9 9\n"),
     ("echo $((x=1)) $((y = x ? 10 : 20)) $y", "1 10 10\n"),
     ("echo $(( 1 ? a = 2 : 3 )) $a", "2 2\n"),
