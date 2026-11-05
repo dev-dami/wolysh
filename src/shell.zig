@@ -494,6 +494,7 @@ pub const Shell = struct {
         if (self.hostname.len != 0) self.gpa.free(self.hostname);
         if (self.history_path.len != 0) self.gpa.free(self.history_path);
         if (self.config_path.len != 0) self.gpa.free(self.config_path);
+        if (self.config.prompt.len != 0) self.gpa.free(self.config.prompt);
         self.line_arena.deinit();
     }
 
@@ -649,7 +650,11 @@ pub const Shell = struct {
         if (gop.found_existing) {
             freeValue(self.gpa, gop.value_ptr.*);
         } else {
-            gop.key_ptr.* = try self.gpa.dupe(u8, name);
+            // On failure, take the new entry out again: its key is undefined.
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.vars.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
         gop.value_ptr.* = owned;
     }
@@ -961,7 +966,11 @@ pub const Shell = struct {
         if (gop.found_existing) {
             self.gpa.free(gop.value_ptr.*);
         } else {
-            gop.key_ptr.* = try self.gpa.dupe(u8, name);
+            // On failure, take the new entry out again: its key is undefined.
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.env.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
         gop.value_ptr.* = owned_val;
     }
@@ -1021,7 +1030,11 @@ pub const Shell = struct {
         if (gop.found_existing) {
             self.gpa.free(gop.value_ptr.*);
         } else {
-            gop.key_ptr.* = try self.gpa.dupe(u8, name);
+            // On failure, take the new entry out again: its key is undefined.
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.funcs.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
         gop.value_ptr.* = owned;
     }
@@ -1136,7 +1149,11 @@ pub const Shell = struct {
         if (gop.found_existing) {
             self.gpa.free(gop.value_ptr.*);
         } else {
-            gop.key_ptr.* = try self.gpa.dupe(u8, name);
+            // On failure, take the new entry out again: its key is undefined.
+            gop.key_ptr.* = self.gpa.dupe(u8, name) catch |err| {
+                self.aliases.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
         gop.value_ptr.* = owned;
     }
@@ -1413,13 +1430,22 @@ pub const Shell = struct {
         return .{ .status = last_status, .signal = last_signal };
     }
 
+    /// Keeps an owned copy: the variable's text is freed when the script
+    /// assigns or unsets `prompt`.
+    fn setConfigPrompt(self: *Shell, text: []const u8) void {
+        if (std.mem.eql(u8, self.config.prompt, text)) return;
+        const owned: []const u8 = if (text.len == 0) "" else self.gpa.dupe(u8, text) catch return;
+        if (self.config.prompt.len != 0) self.gpa.free(self.config.prompt);
+        self.config.prompt = owned;
+    }
+
     /// Copies well-known shell variables into `config`. Called after the
     /// configuration file runs and after every interactive command, so
     /// `let autosuggest = false` takes effect immediately.
     pub fn applyConfig(self: *Shell) void {
         if (self.getVar("prompt")) |v| {
-            if (std.meta.activeTag(v) == .string) self.config.prompt = v.string;
-        }
+            if (std.meta.activeTag(v) == .string) self.setConfigPrompt(v.string);
+        } else self.setConfigPrompt("");
         if (self.getVar("git_prompt")) |v| self.config.git_prompt = v.truthy();
         if (self.getVar("autosuggest")) |v| self.config.autosuggest = v.truthy();
         if (self.getVar("highlight")) |v| self.config.highlight = v.truthy();
@@ -1495,7 +1521,9 @@ pub const Shell = struct {
             if (self.vars.get(entry.name)) |ends| switch (ends) {
                 .list => |items| for (items) |item| {
                     const number = item.asInt() orelse continue;
-                    if (number > 2) sys.closeFd(@intCast(number));
+                    // The script can store any number here, so it must fit an fd.
+                    const fd = std.math.cast(i32, number) orelse continue;
+                    if (fd > 2) sys.closeFd(fd);
                 },
                 else => {},
             };

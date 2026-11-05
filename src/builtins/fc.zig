@@ -172,11 +172,14 @@ fn reexecuteCommand(ctx: Ctx, operands: []const []const u8, count: usize) u8 {
 }
 
 /// Echoes `text` as bash does before running it, records it, and runs it.
-fn runCommand(ctx: Ctx, text: []const u8) u8 {
+fn runCommand(ctx: Ctx, history_text: []const u8) u8 {
     const run_source = ctx.run_source orelse {
         ctx.err("wsh: fc: cannot run commands from here\n");
         return 1;
     };
+    // A copy: `text` can point into the history, and `remove` or `record`
+    // below can free that entry.
+    const text = ctx.sh.scratch().dupe(u8, history_text) catch return 1;
     sys.writeStr(ctx.stderr, text);
     sys.writeStr(ctx.stderr, "\n");
     // The `fc` line itself is replaced by what actually ran.

@@ -486,7 +486,8 @@ fn assignRecord(ctx: Ctx, arena: Allocator, line: *const Line, names: []const []
         return true;
     }
 
-    const ifs = try currentIfs(sh, arena);
+    // A copy: `read IFS rest` assigns IFS, which frees the stored text.
+    const ifs = try arena.dupe(u8, try currentIfs(sh, arena));
     var splitter = Splitter{ .line = line, .ifs = ifs };
     splitter.skipSpace();
     for (names, 0..) |name, i| {
@@ -589,11 +590,13 @@ pub fn mapfile(ctx: Ctx) u8 {
 
     var existing: []const value.Value = &.{};
     if (origin) |start| {
-        if (ctx.sh.getVar(name)) |current| {
+        // A deep copy: the -C callback can assign or unset the array.
+        if (ctx.sh.getVar(name)) |stored| {
+            const current = shellmod.cloneValue(arena, stored) catch return 1;
             existing = switch (current) {
                 .list => |items| items,
                 .none => &.{},
-                else => &.{current},
+                else => arena.dupe(value.Value, &.{current}) catch return 1,
             };
         }
         if (start > existing.len) {

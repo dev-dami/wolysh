@@ -365,7 +365,11 @@ pub const Tm = struct {
     epoch: i64,
 };
 
-pub fn localTime(zone: Zone, t: i64) Tm {
+pub fn localTime(zone: Zone, t_in: i64) Tm {
+    // About a billion years either way. The limit keeps the zone offset and
+    // day arithmetic below inside i64 for any argument or history stamp.
+    const limit: i64 = 1 << 55;
+    const t = std.math.clamp(t_in, -limit, limit);
     const kind = zone.lookup(t);
     const local = t + kind.utoff;
     const days = @divFloor(local, std.time.s_per_day);

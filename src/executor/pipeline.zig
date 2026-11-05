@@ -408,7 +408,9 @@ fn closeCoprocDescriptors(sh: *Shell, name: []const u8, pid_name: []const u8) vo
     switch (old) {
         .list => |items| for (items) |item| {
             const number = item.asInt() orelse continue;
-            if (number > 2) sys.closeFd(@intCast(number));
+            // The script can store any number here, so it must fit an fd.
+            const fd = std.math.cast(i32, number) orelse continue;
+            if (fd > 2) sys.closeFd(fd);
         },
         else => {},
     }

@@ -142,7 +142,13 @@ fn parseSpec(arg: []const u8) Spec {
             spec.subscript = lhs[open + 1 .. lhs.len - 1];
         }
     }
-    if (list) spec.assigned = spec.assigned.?[1 .. spec.assigned.?.len - 1];
+    if (list) {
+        // The marker byte can also come from data (`printf -v x '\0a=b'`),
+        // so the parentheses are checked before they are cut off.
+        const assigned = spec.assigned.?;
+        if (assigned.len < 2 or assigned[0] != '(' or assigned[assigned.len - 1] != ')') return .{ .name = text };
+        spec.assigned = assigned[1 .. assigned.len - 1];
+    }
     return spec;
 }
 
