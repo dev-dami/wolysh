@@ -39,7 +39,8 @@ const help_text =
     \\  -s               read commands from standard input; arguments are positional
     \\  -i               force interactive mode
     \\  -l, --login      run as a login shell
-    \\  -n, --check      check syntax without executing commands
+    \\  -n, --check      check syntax and warn about Bash mistakes; run nothing
+    \\      --strict     with --check, exit with status 1 when there is a warning
     \\  -e -u -x -f -C -a  set errexit, nounset, xtrace, noglob, noclobber, allexport
     \\  -o NAME, +o NAME   set or clear a shell option (errexit, pipefail, ...)
     \\      --norc, --no-config  skip the configuration file
@@ -167,7 +168,7 @@ fn run(init: std.process.Init.Minimal, gpa: std.mem.Allocator) u8 {
 
     if (options.command) |command| {
         if (options.name) |name| sh.script_name = name;
-        if (options.check) return exec.checkSource(&sh, command);
+        if (options.check) return exec.checkSource(&sh, command, "-c", options.strict_check);
         if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
         return strict.finish(&sh, exec.runSource(&sh, command));
     }
@@ -201,7 +202,7 @@ fn run(init: std.process.Init.Minimal, gpa: std.mem.Allocator) u8 {
             sys.writeStr(2, msg);
             return 126;
         }
-        if (options.check) return exec.checkSource(&sh, data);
+        if (options.check) return exec.checkSource(&sh, data, script, options.strict_check);
         if (sh.interactive) loadInteractiveConfig(&sh, gpa, options.no_config);
         return strict.finish(&sh, exec.runSource(&sh, data));
     }
@@ -209,7 +210,7 @@ fn run(init: std.process.Init.Minimal, gpa: std.mem.Allocator) u8 {
     if (options.check) {
         const data = readAllStdin(gpa) orelse return 1;
         defer gpa.free(data);
-        return exec.checkSource(&sh, data);
+        return exec.checkSource(&sh, data, "stdin", options.strict_check);
     }
     if (!sh.interactive) return strict.finish(&sh, stdin_script.run(&sh));
 
@@ -229,6 +230,8 @@ const Options = struct {
     no_profile: bool = false,
     rcfile: ?[]const u8 = null,
     check: bool = false,
+    /// `--strict`: with `--check`, a warning makes the exit status 1.
+    strict_check: bool = false,
     shell: shellmod.Options = .{},
 };
 
@@ -260,6 +263,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const [:0]const u8, options: 
         if (std.mem.startsWith(u8, arg, "--")) {
             if (eql(arg, "--check")) {
                 options.check = true;
+            } else if (eql(arg, "--strict")) {
+                options.strict_check = true;
             } else if (eql(arg, "--login")) {
                 options.login = true;
             } else if (eql(arg, "--no-config") or eql(arg, "--norc")) {
@@ -336,6 +341,11 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const [:0]const u8, options: 
 /// One letter of a short-option group; `on` is false for the `+` form. The
 /// shell options are the ones `set` takes.
 fn setFlag(options: *Options, letter: u8, on: bool) bool {
+    // `-n` is `--check`. `set -n` also takes the letter, so test it first.
+    if (letter == 'n' and on) {
+        options.check = true;
+        return true;
+    }
     if (set_builtin.setByLetter(&options.shell, letter, on)) return true;
     // The invocation-only options have no `+` form.
     if (!on) return false;
@@ -344,7 +354,6 @@ fn setFlag(options: *Options, letter: u8, on: bool) bool {
         's' => options.read_stdin = true,
         'i' => options.interactive = true,
         'l' => options.login = true,
-        'n' => options.check = true,
         else => return false,
     }
     return true;
@@ -686,4 +695,10 @@ test "bundled options, -c operands and named options" {
     _ = parseArgs(arena.allocator(), &dash_argv, &dash_options).?;
     try std.testing.expect(dash_options.shell.xtrace);
     try std.testing.expectEqualStrings("-script", dash_options.script.?);
+
+    const check_argv = [_][:0]const u8{ "wsh", "-n", "--strict", "-c", "cd x" };
+    var check_options = Options{};
+    _ = parseArgs(arena.allocator(), &check_argv, &check_options).?;
+    try std.testing.expect(check_options.check and check_options.strict_check);
+    try std.testing.expect(!check_options.shell.noexec);
 }

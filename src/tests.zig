@@ -3,6 +3,7 @@
 test {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
+    _ = @import("lint.zig");
     _ = @import("value.zig");
     _ = @import("fs.zig");
     _ = @import("glob.zig");

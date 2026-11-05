@@ -274,6 +274,55 @@ class StreamingStdinTests(unittest.TestCase):
         result = run_shell(["--no-config", "--check"], input=b"echo before\n)\n", env=self.env)
         self.assertEqual((result.returncode, result.stdout), (2, b""))
 
+    def test_check_warns_about_common_bash_mistakes(self):
+        source = (
+            "rm -rf $dir\n"
+            'cp $src "$dst"\n'
+            "if [ $x = y ]; then\n"
+            "    cd /tmp\n"
+            "fi\n"
+            'for f in $(ls); do echo "$f"; done\n'
+            "f() { test -n ${name}; }\n"
+        )
+        warnings = (
+            "1: warning: unquoted $dir in a rm argument can split or glob; quote it\n",
+            "2: warning: unquoted $src in a cp argument can split or glob; quote it\n",
+            "3: warning: unquoted $x in [ ]; quote it or use [[ ]]\n",
+            "4: warning: cd without a check; use cd DIR || exit\n",
+            "6: warning: for loop over $(ls) breaks on spaces; use a glob\n",
+            "7: warning: unquoted $name in [ ]; quote it or use [[ ]]\n",
+        )
+        script = pathlib.Path(self.temp.name) / "mistakes.sh"
+        script.write_text(source)
+        for name, args, data in (("-c", ["-c", source], None), (str(script), [str(script)], None),
+                                 ("stdin", [], source.encode())):
+            expected = "".join(f"wsh: {name}:{warning}" for warning in warnings).encode()
+            with self.subTest(name=name):
+                result = run_shell(["--no-config", "--check", *args], input=data, env=self.env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", expected))
+                result = run_shell(["--no-config", "--check", "--strict", *args], input=data, env=self.env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (1, b"", expected))
+        result = run_shell(["--no-config", "-n", "-c", "cd /tmp"], env=self.env)
+        self.assertEqual((result.returncode, result.stderr),
+                         (0, b"wsh: -c:1: warning: cd without a check; use cd DIR || exit\n"))
+
+    def test_check_accepts_quoted_and_tested_forms(self):
+        source = (
+            'rm -rf "$dir" "${dir}/x"\n'
+            '[ "$x" = y ] && echo same\n'
+            "[[ $x = y ]]\n"
+            'for f in *.txt "$(ls)"; do :; done\n'
+            "cd /tmp || exit 1\n"
+            "cd /tmp && pwd\n"
+            "if cd /tmp; then :; fi\n"
+            "echo $x\n"
+        )
+        result = run_shell(["--no-config", "--check", "--strict", "-c", source], env=self.env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+        result = run_shell(["--no-config", "--check", "--strict", "-c", "cd /tmp\n)\n"], env=self.env)
+        self.assertEqual((result.returncode, result.stdout), (2, b""))
+        self.assertNotIn(b"warning", result.stderr)
+
 
 class LoginTests(unittest.TestCase):
     def setUp(self):
