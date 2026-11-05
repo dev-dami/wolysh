@@ -2408,7 +2408,8 @@ test "an escaped backtick does not close a substitution" {
     try testing.expectEqual(@as(usize, 1), fields.items.len);
     try testing.expectEqualStrings("hi", fields.items[0]);
 
-    try testing.expectEqualStrings("a\\`b", try expandLiteral(&sh, arena, "`a\\`b`"));
+    // The body runs without the backslash, as POSIX says for `\``.
+    try testing.expectEqualStrings("a`b", try expandLiteral(&sh, arena, "`a\\`b`"));
 }
 
 test "IFS drives field splitting" {
