@@ -1,6 +1,7 @@
 //! wolysh (`wsh`) — a modern Unix shell with a sane scripting language.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const build_options = @import("build_options");
 const sys = @import("sys.zig");
@@ -69,6 +70,24 @@ const help_text =
     \\  command <<EOF               read a here-document
     \\
 ;
+
+/// Release builds are stripped, so the stack-trace code in the default panic
+/// handler has no symbols to print and only adds size. They print the message
+/// and exit with 134, the status of an abort. Debug and `-Dmem-guard` builds
+/// keep the full handler with its stack traces.
+pub const panic = if (builtin.mode == .Debug or build_options.mem_guard)
+    std.debug.FullPanic(std.debug.defaultPanic)
+else
+    std.debug.FullPanic(releasePanic);
+
+fn releasePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = first_trace_addr;
+    sys.writeStr(2, "wsh: panic: ");
+    sys.writeStr(2, msg);
+    sys.writeStr(2, "\n");
+    sys.exitProcess(134);
+}
 
 /// `-Dmem-guard` builds wsh on a checking allocator. It reports leaks at
 /// exit with the stack trace of each allocation, and it catches double frees.
