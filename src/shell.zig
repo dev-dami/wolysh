@@ -248,6 +248,11 @@ pub const Shell = struct {
     /// Guards against unbounded recursion through functions, `source` and
     /// command substitution.
     call_depth: u32 = 0,
+    /// How many texts parsed at run time are running inside each other:
+    /// `eval`, `source`, command and process substitution, and traps. A
+    /// forked substitution child keeps the count, since it runs on the same
+    /// stack.
+    source_depth: u32 = 0,
     /// Non-zero while nested execution is running; only the outermost command
     /// may reset the line arena.
     exec_depth: u32 = 0,
@@ -290,6 +295,7 @@ pub const Shell = struct {
     subst_runner: ?SubstFn = null,
 
     pub const max_call_depth = 256;
+    pub const max_source_depth = 128;
     pub const max_signal = 64;
     pub const exit_trap: u32 = 0;
     pub const debug_trap: u32 = max_signal + 1;

@@ -77,6 +77,8 @@ check "out budget 1k --file $work/log"
 check '[[ x =~ a{0}{32767}{32767}{32767} ]]; echo $?'
 check 'eval "$(printf "{ %.0s" $(seq 100000))"; echo $?'
 check 'eval "[[ $(printf "( %.0s" $(seq 100000)) x ]]"; echo $?'
+check 's=; for i in $(seq 5000); do s="eval $s"; done; eval "$s echo deep"; echo $?'
+check 's="echo deep"; for i in $(seq 400); do s="echo \$($s)"; done; eval "$s"; echo $?'
 
 printf '%d of %d guard cases failed\n' "$failed" "$count"
 [ "$failed" -eq 0 ]
