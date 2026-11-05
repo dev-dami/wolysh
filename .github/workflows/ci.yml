@@ -50,8 +50,6 @@ jobs:
   mem-guard:
     name: Memory guard
     runs-on: ubuntu-24.04
-    # Reports leaks without blocking merges until the known leaks are fixed.
-    continue-on-error: true
     steps:
       - name: Check out source
         uses: actions/checkout@v7

@@ -12,8 +12,8 @@ rules that every change must obey to reach them.
    variables, files, terminals, sockets) must be safe without the runtime
    checks.
 2. **No leaks, double frees or uses after free.** The Memory guard job in CI
-   must pass. At first it does not block a merge. When it is clean, remove
-   `continue-on-error` from `.github/workflows/ci.yml` so that it does.
+   must pass. It blocks a merge. When you fix a memory bug, add a script that
+   triggers it to that job.
 3. **Binary size does not grow without a reason.** CI writes the ReleaseFast
    and ReleaseSmall sizes to the job summary. A pull request that adds more
    than 2% to either size must say why.
