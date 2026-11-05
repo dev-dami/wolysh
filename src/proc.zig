@@ -99,8 +99,12 @@ var entry_ignored: u64 = 0;
 pub fn recordEntryDispositions() void {
     var sig: u32 = 1;
     while (sig <= 64) : (sig += 1) {
+        // std's `sigaction` asserts on these two, which is undefined
+        // behaviour in ReleaseFast. They can never be ignored anyway.
+        const which: linux.SIG = @enumFromInt(sig);
+        if (isUncatchable(which)) continue;
         var current: linux.Sigaction = undefined;
-        if (linux.errno(linux.sigaction(@enumFromInt(sig), null, &current)) != .SUCCESS) continue;
+        if (linux.errno(linux.sigaction(which, null, &current)) != .SUCCESS) continue;
         const handler = current.handler.handler orelse continue;
         if (@intFromPtr(handler) == @intFromPtr(linux.SIG.IGN.?)) entry_ignored |= @as(u64, 1) << @intCast(sig - 1);
     }
@@ -144,6 +148,7 @@ pub fn restoreHandler(sig: linux.SIG) void {
 /// True when the shell started with `sig` at its default action, so catching
 /// it changes nothing but the chance to run cleanup first.
 pub fn startedDefault(sig: linux.SIG) bool {
+    if (isUncatchable(sig)) return true;
     // SIG_DFL is the null handler.
     if (original_actions[@intFromEnum(sig)]) |original| return original.handler.handler == null;
     var current: linux.Sigaction = undefined;
