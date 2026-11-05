@@ -61,6 +61,15 @@ pub fn importFunction(sh: *Shell, name: []const u8, definition: []const u8) bool
 
 /// `runSource` with `$LINENO` counting from `line`.
 fn runSourceAt(sh: *Shell, src: []const u8, line: u32) u8 {
+    // Each nested `eval`, `source` or substitution adds parse and run frames
+    // to the stack, so deep nesting stops here before the stack overflows.
+    if (sh.source_depth >= Shell.max_source_depth) {
+        sys.writeStr(sh.default_err, std.fmt.comptimePrint("wsh: maximum nesting level exceeded ({d})\n", .{Shell.max_source_depth}));
+        sh.last_status = 1;
+        return 1;
+    }
+    sh.source_depth += 1;
+    defer sh.source_depth -= 1;
     const arena = sh.scratch();
     var p = parser_mod.Parser.initAt(arena, src, line);
     const program = p.parseProgram() catch {

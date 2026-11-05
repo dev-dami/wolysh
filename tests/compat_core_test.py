@@ -411,6 +411,48 @@ class CoreCompatTests(unittest.TestCase):
                 self.assertEqual(result.stderr.decode(), f"wsh: not a number: '{operand}'\n")
         self.assert_output("let total = 0; for n in 1 2 3 { let total = total + n }; echo $total", "6\n")
 
+    # --- 12. nesting of eval, source and substitutions ----------------------
+
+    def assert_nesting_stops(self, result):
+        # A crash ends on a signal: a negative code, or 128 and up from a shell.
+        self.assertGreaterEqual(result.returncode, 0)
+        self.assertLess(result.returncode, 128)
+        self.assertEqual(result.stderr.count(b"wsh: maximum nesting level exceeded (128)\n"), 1, result.stderr)
+
+    def test_nested_eval_runs_up_to_the_limit(self):
+        # Each `eval` runs the rest of the line as a new nested text.
+        self.assert_output("eval " * 100 + "echo deep", "deep\n")
+
+    def test_deeply_nested_eval_stops_with_an_error(self):
+        result = run_shell("eval " * 5000 + "echo deep")
+        self.assert_nesting_stops(result)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+
+    def test_nested_command_substitution_runs_up_to_the_limit(self):
+        command = "echo deep"
+        for _ in range(50):
+            command = f"echo $({command})"
+        self.assert_output(command, "deep\n")
+
+    def test_deeply_nested_command_substitution_stops_with_an_error(self):
+        # An assignment takes the status of its substitution, so the error
+        # status reaches the top.
+        command = "echo deep"
+        for _ in range(400):
+            command = f"x=$({command})"
+        result = run_shell(command, timeout=60)
+        self.assert_nesting_stops(result)
+        self.assertEqual(result.returncode, 1)
+
+    def test_recursive_source_stops_with_an_error(self):
+        with tempfile.TemporaryDirectory(prefix="wsh-core-") as temp_dir:
+            script = pathlib.Path(temp_dir) / "self.sh"
+            script.write_text(f". {shlex.quote(str(script))}\n")
+            result = run_shell(f". {shlex.quote(str(script))}")
+            self.assert_nesting_stops(result)
+            self.assertEqual(result.returncode, 1)
+
 
 class Session:
     """A pty-driven interactive shell, as in tests/pty_test.py."""
