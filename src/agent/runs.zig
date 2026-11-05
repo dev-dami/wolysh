@@ -174,7 +174,8 @@ pub fn sweep(arena: std.mem.Allocator, runs: [:0]const u8, ttl_ms: i64, persist_
                 _ = writeMeta(arena, run.dir, meta);
             } else {
                 const ended = run.meta.ended_ms orelse run.meta.started_ms;
-                if (now - ended >= ttl_ms and state.removeTree(arena, run.dir)) continue;
+                // `ended_ms` comes from a file, so it can be any i64.
+                if (now -| ended >= ttl_ms and state.removeTree(arena, run.dir)) continue;
             }
         }
         all[kept] = run;

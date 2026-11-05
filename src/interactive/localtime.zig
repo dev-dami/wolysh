@@ -286,13 +286,21 @@ const RuleParser = struct {
             if (self.peek() == '-') sign = -1;
             self.pos += 1;
         }
-        var total = (self.number() orelse return null) * 3600;
+        // RFC 8536 allows hours up to 167. The limits also keep the i32
+        // arithmetic below from overflow, as in `TZ=ABC600000`.
+        const hours = self.number() orelse return null;
+        if (hours > 167) return null;
+        var total = hours * 3600;
         if (self.peek() == ':') {
             self.pos += 1;
-            total += (self.number() orelse return null) * 60;
+            const minutes = self.number() orelse return null;
+            if (minutes > 59) return null;
+            total += minutes * 60;
             if (self.peek() == ':') {
                 self.pos += 1;
-                total += self.number() orelse return null;
+                const seconds = self.number() orelse return null;
+                if (seconds > 59) return null;
+                total += seconds;
             }
         }
         return sign * total;

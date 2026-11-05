@@ -312,7 +312,9 @@ pub fn formatElapsed(buf: []u8, ms: i64) []const u8 {
 pub fn envSeconds(envp: [*:null]const ?[*:0]const u8, name: []const u8, default: i64) i64 {
     const text = envLookup(envp, name) orelse return default;
     const seconds = std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t"), 10) catch return default;
-    return if (seconds < 0) default else seconds;
+    // Callers multiply by 1000 to get milliseconds; the limit keeps that
+    // product inside i64.
+    return if (seconds < 0) default else @min(seconds, std.math.maxInt(i64) / 1000);
 }
 
 const testing = std.testing;

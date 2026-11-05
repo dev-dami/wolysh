@@ -260,7 +260,7 @@ fn serve(self: *Daemon) void {
         }
         // Past the idle deadline with runs still going, the sweeps recheck.
         var timeout = next_sweep - now;
-        const idle_deadline = self.last_activity_ms + self.idle_ms;
+        const idle_deadline = self.last_activity_ms +| self.idle_ms;
         if (self.sessions.items.len == 0 and idle_deadline > now) timeout = @min(timeout, idle_deadline - now);
         const rc = linux.poll(pollfds.items.ptr, @intCast(pollfds.items.len), @intCast(@max(timeout, 0)));
         if (linux.errno(rc) != .SUCCESS) continue;
@@ -455,6 +455,8 @@ fn handleClient(self: *Daemon, conn: i32) bool {
             reply(conn, arena, .{ .ok = false, .@"error" = "out of memory" });
             return false;
         };
+        // The queue took `count` descriptors. Close the ones it did not take.
+        for (passed[count..]) |extra| _ = linux.close(extra);
         frame.fd_count = 0;
         if (!to_relay) session.busy += 1;
         session.last_used_ms = state.nowMs();

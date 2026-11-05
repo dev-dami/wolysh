@@ -1601,9 +1601,9 @@ const Recognizer = struct {
 
     noinline fn addCounts(self: *Recognizer, framework: Framework, counts: Counts) void {
         self.detect(framework);
-        if (counts.passed) |n| self.counts.passed = (self.counts.passed orelse 0) + n;
-        if (counts.failed) |n| self.counts.failed = (self.counts.failed orelse 0) + n;
-        if (counts.skipped) |n| self.counts.skipped = (self.counts.skipped orelse 0) + n;
+        if (counts.passed) |n| self.counts.passed = (self.counts.passed orelse 0) +| n;
+        if (counts.failed) |n| self.counts.failed = (self.counts.failed orelse 0) +| n;
+        if (counts.skipped) |n| self.counts.skipped = (self.counts.skipped orelse 0) +| n;
     }
 
     fn feed(self: *Recognizer, number: u64, line: []const u8, kind: Kind) void {
@@ -1709,7 +1709,8 @@ const Recognizer = struct {
                         self.detect(.cargo);
                         return true;
                     }
-                    const at = find(line, " ... ") orelse return false;
+                    // `test ... FAILED` has no name: " ... " starts inside "test ".
+                    const at = findPos(line, "test ".len, " ... ") orelse return false;
                     const outcome = line[at + 5 ..];
                     if (startsWith(outcome, "FAILED")) {
                         _ = self.add(.cargo, line[5..at], number);
@@ -1739,7 +1740,8 @@ const Recognizer = struct {
     /// line, or the older `panicked at 'message', src/lib.rs:6:29`.
     noinline fn cargoPanic(self: *Recognizer, index: u32, rest: []const u8) void {
         if (rest.len > 0 and rest[0] == '\'') {
-            if (findLast(rest, "', ")) |close| {
+            if (findLast(rest[1..], "', ")) |found| {
+                const close = found + 1;
                 self.setReason(index, rest[1..close]);
                 self.setLocation(index, rest[close + 3 ..]);
                 return;
@@ -1964,7 +1966,7 @@ const Recognizer = struct {
             self.zig_name = null;
             return true;
         }
-        if (startsWith(t, "All ") and endsWith(t, " tests passed.")) {
+        if (t.len >= "All ".len + " tests passed.".len and startsWith(t, "All ") and endsWith(t, " tests passed.")) {
             const n = parseNumber(t[4 .. t.len - " tests passed.".len]) orelse return false;
             self.addCounts(.zig, .{ .passed = n, .failed = 0 });
             return true;
@@ -2023,11 +2025,11 @@ const Recognizer = struct {
         }
         if (self.unittest_ran) |ran| {
             if (startsWith(line, "FAILED (") or std.mem.eql(u8, line, "OK") or startsWith(line, "OK (")) {
-                const failed = keyedCount(line, "failures=") + keyedCount(line, "errors=") + keyedCount(line, "unexpected successes=");
+                const failed = keyedCount(line, "failures=") +| keyedCount(line, "errors=") +| keyedCount(line, "unexpected successes=");
                 const skipped = keyedCount(line, "skipped=");
                 const expected = keyedCount(line, "expected failures=");
                 self.addCounts(.unittest, .{
-                    .passed = ran -| (failed + skipped + expected),
+                    .passed = ran -| (failed +| skipped +| expected),
                     .failed = failed,
                     .skipped = skipped,
                 });
@@ -2081,7 +2083,7 @@ const Recognizer = struct {
                 const failed = keyedCount(body, "Failures: ") + keyedCount(body, "Errors: ");
                 const skipped = keyedCount(body, "Skipped: ");
                 self.addCounts(.junit, .{
-                    .passed = keyedCount(body, "Tests run: ") -| (failed + skipped),
+                    .passed = keyedCount(body, "Tests run: ") -| (failed +| skipped),
                     .failed = failed,
                     .skipped = skipped,
                 });
@@ -2153,7 +2155,7 @@ const Recognizer = struct {
             return true;
         }
         if (startsWith(line, "rspec ")) {
-            const hash = find(line, " # ") orelse return false;
+            const hash = findPos(line, "rspec ".len, " # ") orelse return false;
             const index = self.addNested(.rspec, line[hash + 3 ..], number);
             self.setLocation(index, line["rspec ".len..hash]);
             return true;
@@ -2262,11 +2264,11 @@ noinline fn parseCounts(text: []const u8) Counts {
             const totals = [_][]const u8{ "total", "examples", "example", "tests" };
         };
         if (inList(word, &words.passed)) {
-            counts.passed = (counts.passed orelse 0) + n;
+            counts.passed = (counts.passed orelse 0) +| n;
         } else if (inList(word, &words.failed)) {
-            counts.failed = (counts.failed orelse 0) + n;
+            counts.failed = (counts.failed orelse 0) +| n;
         } else if (inList(word, &words.skipped)) {
-            counts.skipped = (counts.skipped orelse 0) + n;
+            counts.skipped = (counts.skipped orelse 0) +| n;
         } else if (inList(word, &words.totals)) {
             total = n;
         }

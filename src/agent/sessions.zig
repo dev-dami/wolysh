@@ -588,9 +588,14 @@ fn openTerminal(sh: *Shell, arena: std.mem.Allocator, ctl: i32, conn: i32, rows:
         return -1;
     };
     var channel: [2]i32 = undefined;
-    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &channel)) != .SUCCESS or
-        !wire.sendJson(conn, arena, Reply{ .ok = true }, &.{}))
-    {
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &channel)) != .SUCCESS) {
+        _ = linux.close(pair.master);
+        _ = linux.close(pair.slave);
+        return -1;
+    }
+    if (!wire.sendJson(conn, arena, Reply{ .ok = true }, &.{})) {
+        _ = linux.close(channel[0]);
+        _ = linux.close(channel[1]);
         _ = linux.close(pair.master);
         _ = linux.close(pair.slave);
         return -1;
@@ -793,7 +798,7 @@ const Relay = struct {
     /// no output waits.
     fn stallTimeout(self: *const Relay) i32 {
         if (self.client < 0 or self.out.len() == 0) return -1;
-        return @intCast(std.math.clamp(self.progress_ms + self.stall_ms - state.monotonicMs(), 0, std.math.maxInt(i32)));
+        return @intCast(std.math.clamp((self.progress_ms +| self.stall_ms) -| state.monotonicMs(), 0, std.math.maxInt(i32)));
     }
 
     fn flushInput(self: *Relay) void {

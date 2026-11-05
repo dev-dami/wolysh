@@ -657,7 +657,18 @@ pub const Request = struct {
     cword: usize = 0,
 };
 
-fn programmable(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize, ctx: Context, spec: Spec, items: *std.ArrayList([]const u8)) !bool {
+/// `spec` with its strings copied into `arena`. A `-F` function can run
+/// `complete` and free the registry's strings while the spec is in use.
+fn ownSpec(arena: Allocator, spec: Spec) !Spec {
+    var out = spec;
+    inline for (.{ "glob", "words", "prefix", "suffix", "filter", "command", "function" }) |field| {
+        if (@field(spec, field)) |text| @field(out, field) = try arena.dupe(u8, text);
+    }
+    return out;
+}
+
+fn programmable(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize, ctx: Context, registered: Spec, items: *std.ArrayList([]const u8)) !bool {
+    const spec = try ownSpec(arena, registered);
     // No command index: the word being completed is the command name itself,
     // so the function sees every word of the line.
     const first = ctx.command_index orelse 0;

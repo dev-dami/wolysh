@@ -556,12 +556,15 @@ pub const Editor = struct {
         const point = std.fmt.bufPrint(&cursor_text, "{d}", .{self.cursor}) catch return;
         sh.setVar("READLINE_LINE", .{ .string = self.buf.items }) catch return;
         sh.setVar("READLINE_POINT", .{ .string = point }) catch return;
+        // A copy: the command can rebind its own key, which frees the text.
+        const owned = sh.gpa.dupe(u8, command) catch return;
+        defer sh.gpa.free(owned);
 
         self.leaveFrame();
         self.write(term.paste_off);
         if (self.raw) |raw| raw.disable();
         const saved_status = sh.last_status;
-        _ = runner(sh, command, 1);
+        _ = runner(sh, owned, 1);
         sh.last_status = saved_status;
         if (self.raw) |raw| {
             if (term.RawMode.enable(self.in_fd)) |again| raw.* = again;
