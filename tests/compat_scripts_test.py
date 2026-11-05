@@ -87,6 +87,13 @@ case("bash_path_runs", '"$BASH" -c "echo ok" 2>/dev/null || echo "$BASH" | grep 
 case("bashpid", 'echo $(( BASHPID == $$ )); (echo $(( BASHPID != $$ )))')
 case("shellopts_follow_set", 'set -e; set -u; case $SHELLOPTS in *errexit*nounset*) echo both;; esac')
 
+# --- found by the compatibility corpus ---------------------------------------
+case("status_of_a_subshell_in_a_list", '(false || exit 5) || echo "status $?"; (exit 3) && echo no || echo "status $?"')
+case("empty_array_alternate_gives_no_word",
+     'a=(); set -- "${a[@]+"${a[@]}"}"; echo $#; set -- "${a[@]:+x}"; echo $#; set -- "${a[*]+x}"; echo $#; '
+     'set -- "pre${a[@]+x}"; echo $#; b=(1 2); set -- "${b[@]+"${b[@]}"}"; echo $#')
+case("backquotes_remove_escapes", r'echo `echo a \`echo b\``; echo "`echo \"q\" \$HOME`" | grep -c q; echo `echo \\\\`')
+
 # --- arrays and the call stack -----------------------------------------------
 case("array_without_subscript_is_element_zero", 'a=(x y z); echo $a "$a" ${#a[@]} ${#a}')
 case("assoc_without_subscript_is_key_zero", 'declare -A m=([0]=zero [k]=v); echo $m')

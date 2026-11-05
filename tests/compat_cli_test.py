@@ -292,16 +292,17 @@ class StreamingStdinTests(unittest.TestCase):
             "6: warning: for loop over $(ls) breaks on spaces; use a glob\n",
             "7: warning: unquoted $name in [ ]; quote it or use [[ ]]\n",
         )
-        script = pathlib.Path(self.temp.name) / "mistakes.sh"
-        script.write_text(source)
-        for name, args, data in (("-c", ["-c", source], None), (str(script), [str(script)], None),
-                                 ("stdin", [], source.encode())):
-            expected = "".join(f"wsh: {name}:{warning}" for warning in warnings).encode()
-            with self.subTest(name=name):
-                result = run_shell(["--no-config", "--check", *args], input=data, env=self.env)
-                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", expected))
-                result = run_shell(["--no-config", "--check", "--strict", *args], input=data, env=self.env)
-                self.assertEqual((result.returncode, result.stdout, result.stderr), (1, b"", expected))
+        with tempfile.TemporaryDirectory(prefix="wsh-lint-") as temp:
+            script = pathlib.Path(temp) / "mistakes.sh"
+            script.write_text(source)
+            for name, args, data in (("-c", ["-c", source], None), (str(script), [str(script)], None),
+                                     ("stdin", [], source.encode())):
+                expected = "".join(f"wsh: {name}:{warning}" for warning in warnings).encode()
+                with self.subTest(name=name):
+                    result = run_shell(["--no-config", "--check", *args], input=data, env=self.env)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", expected))
+                    result = run_shell(["--no-config", "--check", "--strict", *args], input=data, env=self.env)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (1, b"", expected))
         result = run_shell(["--no-config", "-n", "-c", "cd /tmp"], env=self.env)
         self.assertEqual((result.returncode, result.stderr),
                          (0, b"wsh: -c:1: warning: cd without a check; use cd DIR || exit\n"))

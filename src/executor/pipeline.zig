@@ -64,6 +64,9 @@ pub fn runChain(sh: *Shell, chain: ast.Pipeline, runtime: Runtime) u8 {
         if (sh.interrupted) break;
         // `cd dir && make`: chpwd runs before `make`, as it would in zsh.
         session.checkDirectory(sh);
+        // The next pipeline sees this one's status in `$?`, as in Bash. A
+        // subshell does not set it itself: `(exit 5) || echo $?` prints 5.
+        sh.last_status = status;
         const should_run = switch (link.op) {
             .and_ => status == 0,
             .or_ => status != 0,

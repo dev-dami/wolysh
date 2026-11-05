@@ -532,7 +532,7 @@ pub const Expander = struct {
                 '$' => try self.scanDollar(word, &i, false),
                 '`' => {
                     const end = findClosingBacktick(word, i + 1);
-                    try self.substitute(word[i + 1 .. end], false);
+                    try self.substitute(try backtickBody(self.arena, word[i + 1 .. end], false), false);
                     i = if (end < word.len) end + 1 else word.len;
                 },
                 else => {
@@ -600,7 +600,7 @@ pub const Expander = struct {
             }
             if (c == '`') {
                 const end = findClosingBacktick(content, i + 1);
-                try self.substitute(content[i + 1 .. end], true);
+                try self.substitute(try backtickBody(self.arena, content[i + 1 .. end], true), true);
                 i = if (end < content.len) end + 1 else content.len;
                 continue;
             }
@@ -633,7 +633,7 @@ pub const Expander = struct {
             }
             if (c == '`') {
                 const end = findClosingBacktick(content, i + 1);
-                try self.substitute(content[i + 1 .. end], true);
+                try self.substitute(try backtickBody(self.arena, content[i + 1 .. end], false), true);
                 i = if (end < content.len) end + 1 else content.len;
                 continue;
             }
@@ -938,6 +938,9 @@ pub const Expander = struct {
             },
             .use_alternate => {
                 if (!isMissing(p, b.colon)) return self.emitOperand(b.word, quoted);
+                // As in Bash, `"${a[@]+word}"` with no elements gives no field,
+                // like `"${a[@]}"`.
+                if (p.list and !p.star) return self.emitList(&.{}, false, quoted);
             },
             .assign_default => {
                 if (!isMissing(p, b.colon)) return self.emitParam(p, quoted);
@@ -1897,6 +1900,27 @@ fn findMatching(s: []const u8, open_index: usize, open: u8, close: u8) ?usize {
         }
     }
     return null;
+}
+
+/// The body of a `` `...` `` substitution as it runs. As POSIX says, a
+/// backslash before `$`, `` ` `` or `\` is removed, and inside double quotes
+/// also one before `"`, so `` `echo \`echo x\`` `` runs `echo `echo x``.
+fn backtickBody(arena: std.mem.Allocator, body: []const u8, in_double_quotes: bool) Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, body, '\\') == null) return body;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        if (body[i] == '\\' and i + 1 < body.len) {
+            const next = body[i + 1];
+            if (next == '$' or next == '`' or next == '\\' or (in_double_quotes and next == '"')) {
+                try out.append(arena, next);
+                i += 1;
+                continue;
+            }
+        }
+        try out.append(arena, body[i]);
+    }
+    return out.items;
 }
 
 /// The backtick closing a command substitution, skipping escaped backticks.
