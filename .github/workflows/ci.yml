@@ -62,20 +62,36 @@ jobs:
       - name: Build with the checking allocator
         run: zig build -Doptimize=Debug -Dmem-guard=true -Dtarget=x86_64-linux -Dcpu=baseline
 
-      - name: Run scripts and fail on a leak or a bad free
+      - name: Run the demo and the guard cases
         run: |
-          wsh=zig-out/bin/wsh
-          : > guard.log
-          "$wsh" examples/demo.wsh > /dev/null 2>> guard.log || true
-          for script in \
-            'for i in 1 2 3; do x="$x$i"; done; echo "$x"' \
-            'f() { local a=$1; echo "${a^^}"; }; f hello' \
-            'arr=(a b c); arr+=(d); echo "${arr[@]:1:2}" "${#arr[@]}"' \
-            'declare -A m; m[k]=v; unset "m[k]"; echo "${!m[@]}"' \
-            'echo $(( 2**62 + 2**62 )) $(( -9223372036854775807 - 1 ))' \
-            'x=$(printf "%s-" a b c); echo "${x%-}"' \
-            'set -- one two three; shift; echo "$@"'; do
-            "$wsh" -c "$script" > /dev/null 2>> guard.log || true
+          zig-out/bin/wsh examples/demo.wsh > /dev/null 2> demo.err || true
+          cat demo.err
+          ! grep -q -e 'mem-guard' -e 'Double free' -e 'panic' demo.err
+          bash tests/guard_cases.sh zig-out/bin/wsh
+
+  guarded-suite:
+    name: Test suite under the memory guard
+    runs-on: ubuntu-24.04
+    # The Debug build is slower, so timing-sensitive tests can fail. Read the
+    # failures; make this job blocking when it is clean.
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build with the checking allocator
+        run: zig build -Doptimize=Debug -Dmem-guard=true -Dtarget=x86_64-linux -Dcpu=baseline
+
+      - name: Run every test file on the guarded build
+        run: |
+          status=0
+          for test_file in tests/*_test.py; do
+            echo "== ${test_file}"
+            python3 "${test_file}" || status=1
           done
-          cat guard.log
-          ! grep -q -e 'mem-guard' -e 'Double free' -e 'panic' guard.log
+          exit "$status"

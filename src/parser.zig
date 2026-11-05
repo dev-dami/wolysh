@@ -149,6 +149,10 @@ const Save = struct {
 const ParsedCondition = struct { value: ast.Condition, native: bool };
 const ConditionList = struct { stmts: []ast.Stmt, native: bool };
 
+/// Real scripts nest a few levels. The limit is far above that and far below
+/// what the stack holds.
+const max_nesting = 128;
+
 pub const Parser = struct {
     lex: lexer.Lexer,
     arena: std.mem.Allocator,
@@ -164,6 +168,10 @@ pub const Parser = struct {
     /// Set while reading a native `if`/`while`/`until` condition, where a
     /// standalone `{` after a command opens the body instead of a group.
     cond_brace: bool = false,
+    /// Statement lists and `[[ ]]` groups open at the moment. Each level
+    /// costs several stack frames here and in the executor, so a limit
+    /// turns `{ { { ...` without end into a syntax error, not a crash.
+    nesting: u32 = 0,
 
     pub fn init(arena: std.mem.Allocator, src: []const u8) Parser {
         return initAt(arena, src, 1);
@@ -302,6 +310,9 @@ pub const Parser = struct {
     }
 
     fn parseStmtList(self: *Parser, out: *std.ArrayList(ast.Stmt)) Error!void {
+        if (self.nesting >= max_nesting) return self.fail("commands nested too deeply");
+        self.nesting += 1;
+        defer self.nesting -= 1;
         // A nested list never ends at a native condition's `{`.
         const saved_cond_brace = self.cond_brace;
         self.cond_brace = false;
@@ -559,6 +570,9 @@ pub const Parser = struct {
     }
 
     fn parseCondPrimary(self: *Parser) Error!*ast.Cond {
+        if (self.nesting >= max_nesting) return self.fail("conditional expression nested too deeply");
+        self.nesting += 1;
+        defer self.nesting -= 1;
         switch (self.tok.tag) {
             .lparen => {
                 self.advance();

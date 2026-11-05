@@ -546,6 +546,20 @@ const Compiler = struct {
         return @intCast(self.insts.items.len);
     }
 
+    /// Whether `gen` emits no instruction for `node`.
+    fn generatesNothing(node: Node) bool {
+        return switch (node) {
+            .empty => true,
+            .concat => |items| for (items) |item| {
+                if (!generatesNothing(item)) break false;
+            } else true,
+            // `x{0}` emits nothing. A repeat with no loop slot has min == max,
+            // so it emits only `min` copies of its child.
+            .repeat => |r| (r.max != null and r.max.? == 0) or (r.loop == null and generatesNothing(r.child.*)),
+            else => false,
+        };
+    }
+
     fn gen(self: *Compiler, node: Node) Error!void {
         switch (node) {
             .empty => {},
@@ -572,6 +586,10 @@ const Compiler = struct {
                 for (jumps.items) |jump| self.insts.items[jump].jmp = self.here();
             },
             .repeat => |r| {
+                // Repeating nothing is nothing. Without this check,
+                // `a{0}{32767}{32767}{32767}` loops 32767^3 times and never
+                // reaches `max_insts`, because no instruction is emitted.
+                if (r.loop == null and generatesNothing(r.child.*)) return;
                 var i: u32 = 0;
                 while (i < r.min) : (i += 1) try self.gen(r.child.*);
                 const start = self.loop_base + 2 * (r.loop orelse 0);
