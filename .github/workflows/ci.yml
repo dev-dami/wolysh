@@ -45,7 +45,7 @@ jobs:
             echo "|---|---|"
             echo "| ReleaseFast | $(stat -c %s zig-out/bin/wsh) |"
             echo "| ReleaseSmall | $(stat -c %s zig-out/bin/wsh-small) |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   mem-guard:
     name: Memory guard
