@@ -196,7 +196,8 @@ See [agent workflows](agent-workflows.md) for report fields and exit semantics.
 
 `wsh --safe`, `set -o safe` and `shopt -so safe` turn on safe mode. It turns
 on `errexit`, `nounset`, `pipefail` and `noclobber`. It also stops a command
-when a parameter that is set but empty comes right before a `/`:
+when an expansion in a command word gives nothing and comes right before a
+`/`:
 
 ```text
 set -o safe
@@ -204,10 +205,14 @@ dir=""
 rm -rf "$dir/"*    # wsh: dir: empty value before '/' (set -o safe)
 ```
 
-The check covers `$dir/`, `${dir}/`, `"$dir/"` and `"$dir"/`, also in
-assignments and here-documents. It does not cover operator forms such as
-`${dir:-}/`; use them when an empty value is what you want. The error ends a
-script with status 1, as an unbound variable does. `set +o safe` turns off
+The check covers every expansion form: `$dir/`, `${dir}/`, `"$dir"/`,
+`$dir"/x"`, `$dir'/x'`, `$dir\/x`, operator forms such as `${dir:-}/`,
+`${dir#prefix}/` and `${dir:+x}/`, `"$@"/` with no parameters, and
+`$(command)/` when the command prints nothing. It checks command arguments
+only. Assignments (`p=$dir/x`), here-documents, `case` patterns and `[[ ]]`
+operands are not checked, because they do not name files to act on. To use
+an empty prefix on purpose, write the path without the expansion. The error
+ends a script with status 1, as an unbound variable does. `set +o safe` turns off
 only `safe` itself. `errexit`, `nounset`, `pipefail` and `noclobber` stay on
 until you turn them off. `safe` has no letter in `$-`.
 

@@ -274,6 +274,34 @@ class SafeOptionTests(BashComparison):
                     self.assertEqual(result.returncode, 1)
                     self.assertTrue(keep.exists())
 
+    def test_every_form_that_expands_to_nothing_is_caught(self):
+        cases = (
+            ('dir=""; echo $dir"/x"', b"dir"),
+            ("dir=''; echo $dir'/x'", b"dir"),
+            ('dir=""; echo $dir\\/x', b"dir"),
+            ('dir=""; echo "${dir:-}/x"', b"${dir:-}"),
+            ('dir=""; echo "${dir:+set}/x"', b"${dir:+set}"),
+            ('dir=tmp; echo "${dir#tmp}/x"', b"${dir#tmp}"),
+            ('echo "$(true)/x"', b"$(true)"),
+            ('set --; echo "$@"/x', b"@"),
+        )
+        for script, label in cases:
+            with self.subTest(script=script):
+                result = run_shell(f"set -o safe; {script}; echo after")
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr, b"wsh: " + label + b": empty value before '/' (set -o safe)\n")
+                self.assertEqual(result.returncode, 1)
+
+    def test_only_command_words_are_checked(self):
+        script = (
+            'set -o safe; dir=""; p=$dir/x; echo "[$p]"; '
+            'cat <<EOF\n$dir/y\nEOF\n'
+            'case /z in $dir/z) echo case;; esac; [[ $dir/w == /w ]] && echo cond'
+        )
+        result = run_shell(script)
+        self.assertEqual(result.stdout, b"[/x]\n/y\ncase\ncond\n")
+        self.assertEqual(result.returncode, 0)
+
     def test_a_value_before_the_slash_still_works(self):
         result = run_shell('set -o safe; dir=/tmp; e=""; echo "$dir/x" ${dir}/y "$dir"/z "$e"x "${e:-.}/w"')
         self.assertEqual(result.stdout, b"/tmp/x /tmp/y /tmp/z x ./w\n")

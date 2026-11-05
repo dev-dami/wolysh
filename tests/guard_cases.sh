@@ -38,6 +38,7 @@ check 'echo $(( 2**62 + 2**62 )) $(( -9223372036854775807 - 1 ))'
 check 'x=$(printf "%s-" a b c); echo "${x%-}"'
 check 'set -- one two three; shift; echo "$@"'
 check 'set -o safe; d=""; echo "$d/x"; echo after'
+check 'set -o safe; d=""; echo "${d:-}/x" $d"/y" "$(true)/z"; echo after'
 
 # An assignment inside a subscript or operand frees the stored value.
 check 'a=(x y); a[a=0]=z; echo "${a[@]}"'
