@@ -23,6 +23,13 @@ each `tests/*_test.py` file.
 The test suites expect the ReleaseFast binary at `zig-out/bin/wsh` by default.
 To run the PTY tests against another binary, set `WSH=/absolute/path/to/wsh`.
 
+## Check memory
+
+Changes must obey the ownership and integer rules in
+[docs/memory.md](docs/memory.md). To find leaks, double frees and uses after
+free, build with `zig build -Doptimize=Debug -Dmem-guard=true` and run your
+script with `zig-out/bin/wsh`.
+
 ## Measure performance
 
 Use the ReleaseFast build and run the benchmark separately from compilation
