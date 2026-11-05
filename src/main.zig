@@ -42,6 +42,8 @@ const help_text =
     \\  -n, --check      check syntax without executing commands
     \\  -e -u -x -f -C -a  set errexit, nounset, xtrace, noglob, noclobber, allexport
     \\  -o NAME, +o NAME   set or clear a shell option (errexit, pipefail, ...)
+    \\      --safe       set -o safe: errexit, nounset, pipefail, noclobber and
+    \\                   an error for an empty variable before `/`
     \\      --norc, --no-config  skip the configuration file
     \\      --rcfile FILE  read FILE instead of the configuration file
     \\      --noprofile    skip login initialisation
@@ -266,6 +268,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const [:0]const u8, options: 
                 options.no_config = true;
             } else if (eql(arg, "--noprofile")) {
                 options.no_profile = true;
+            } else if (eql(arg, "--safe")) {
+                _ = setNamedOption(&options.shell, "safe", true);
             } else if (eql(arg, "--rcfile")) {
                 i += 1;
                 if (i >= argv.len) return missingArgument(arg);
@@ -686,4 +690,10 @@ test "bundled options, -c operands and named options" {
     _ = parseArgs(arena.allocator(), &dash_argv, &dash_options).?;
     try std.testing.expect(dash_options.shell.xtrace);
     try std.testing.expectEqualStrings("-script", dash_options.script.?);
+
+    const safe_argv = [_][:0]const u8{ "wsh", "--safe", "-c", "true" };
+    var safe_options = Options{};
+    _ = parseArgs(arena.allocator(), &safe_argv, &safe_options).?;
+    try std.testing.expect(safe_options.shell.safe and safe_options.shell.errexit and safe_options.shell.nounset);
+    try std.testing.expect(safe_options.shell.pipefail and safe_options.shell.noclobber);
 }

@@ -39,6 +39,7 @@ pub const options = [_]Option{
     .{ .name = "pipefail", .field = "pipefail" },
     .{ .name = "posix", .field = "posix" },
     .{ .name = "privileged", .letter = 'p', .field = "privileged" },
+    .{ .name = "safe", .field = "safe" },
     .{ .name = "verbose", .letter = 'v', .field = "verbose" },
     .{ .name = "vi", .field = "vi" },
     .{ .name = "xtrace", .letter = 'x', .field = "xtrace" },
@@ -58,6 +59,13 @@ pub fn put(opts: *Options, index: usize, on: bool) void {
     // The two editing modes exclude each other.
     if (on and std.mem.eql(u8, options[index].name, "vi")) opts.emacs = false;
     if (on and std.mem.eql(u8, options[index].name, "emacs")) opts.vi = false;
+    // `safe` turns on the strict options. Clearing it leaves them as they are.
+    if (on and std.mem.eql(u8, options[index].name, "safe")) {
+        opts.errexit = true;
+        opts.nounset = true;
+        opts.pipefail = true;
+        opts.noclobber = true;
+    }
 }
 
 pub fn byName(name: []const u8) ?usize {

@@ -35,6 +35,8 @@ The release archive includes the shell, examples, license, and checksum.
 - Run independent tasks with native `parallel -j N`, fail-fast queueing,
   and JSONL task reports.
 - Check generated scripts with `wsh --check` before executing them.
+- Run scripts with `wsh --safe`: strict mode, plus an error when an empty
+  variable comes before `/`, so `rm -rf "$dir/"*` cannot become `rm -rf /*`.
 - Keep background commands and all their output with `wsh run -d`, and keep
   named shells between calls with `wsh session`.
 - Ask questions of long output with `out`: a summary within a byte budget,
