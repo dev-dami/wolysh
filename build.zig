@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
+    // `-Dmem-guard` puts a checking allocator under the shell: see `MemGuard`
+    // in src/main.zig. Combine it with `-Doptimize=Debug` for stack traces.
+    options.addOption(bool, "mem_guard", b.option(
+        bool,
+        "mem-guard",
+        "report leaks, double frees and use after free at run time (slow)",
+    ) orelse false);
 
     // Not `single_threaded`: wolysh never starts a thread, but it does use
     // `std.heap.smp_allocator`, which is compiled out of single-threaded builds.

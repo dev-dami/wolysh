@@ -1,6 +1,7 @@
 //! Execution: statements, pipelines, functions and expression evaluation.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const ast = @import("ast.zig");
@@ -376,7 +377,9 @@ const LoopScope = struct {
     }
 
     fn nextIteration(self: *LoopScope) void {
-        _ = self.arena.reset(.retain_capacity);
+        // Under `-Dmem-guard` the memory goes back to the checking allocator,
+        // so a slice kept from an earlier iteration reads poisoned bytes.
+        _ = self.arena.reset(if (build_options.mem_guard) .free_all else .retain_capacity);
     }
 
     fn leave(self: *LoopScope, sh: *Shell) void {

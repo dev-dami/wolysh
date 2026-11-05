@@ -70,8 +70,26 @@ const help_text =
     \\
 ;
 
+/// `-Dmem-guard` builds wsh on a checking allocator. It reports leaks at
+/// exit with the stack trace of each allocation, and it catches double frees.
+/// Freed pages stay mapped and are filled with 0xaa, so a use after free
+/// reads garbage that is easy to see. It is slow: use it to find bugs only.
+const MemGuard = std.heap.DebugAllocator(.{
+    .safety = true,
+    .never_unmap = true,
+    .retain_metadata = true,
+});
+
 pub fn main(init: std.process.Init.Minimal) u8 {
-    const gpa = std.heap.smp_allocator;
+    if (!build_options.mem_guard) return run(init, std.heap.smp_allocator);
+    var guard: MemGuard = .init;
+    const status = run(init, guard.allocator());
+    // A leak does not change the exit status, so scripts keep their results.
+    if (guard.deinit() == .leak) sys.writeStr(2, "wsh: mem-guard: memory leaked, see the traces above\n");
+    return status;
+}
+
+fn run(init: std.process.Init.Minimal, gpa: std.mem.Allocator) u8 {
     proc.recordEntryDispositions();
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -90,7 +108,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     var options = Options{};
-    const parsed = parseArgs(argv, &options) orelse {
+    const parsed = parseArgs(arena, argv, &options) orelse {
         sys.writeStr(2, help_text);
         return 2;
     };
@@ -228,7 +246,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 /// Options are read up to the first operand, `--` or `-`, as bash does. With
 /// `-c` the first operand is the command and the next one `$0`; with `-s` all
 /// operands are positional; otherwise the first operand is a script file.
-fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
+fn parseArgs(allocator: std.mem.Allocator, argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
     var rest: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     var result = ParsedArgs{};
@@ -310,8 +328,8 @@ fn parseArgs(argv: []const [:0]const u8, options: *Options) ?ParsedArgs {
         params = operands[1..];
     }
 
-    for (params) |param| rest.append(gpaOf(argv), param) catch return null;
-    result.rest = rest.toOwnedSlice(gpaOf(argv)) catch return null;
+    for (params) |param| rest.append(allocator, param) catch return null;
+    result.rest = rest.toOwnedSlice(allocator) catch return null;
     return result;
 }
 
@@ -349,14 +367,6 @@ fn missingArgument(option: []const u8) ?ParsedArgs {
     const msg = std.fmt.bufPrint(&buf, "wsh: {s}: option requires an argument\n", .{option}) catch return null;
     sys.writeStr(2, msg);
     return null;
-}
-
-/// `parseArgs` needs an allocator only for the positional list; the process
-/// arena is not available here, so the arguments are copied into a small
-/// leak-free page-backed list that lives as long as the process.
-fn gpaOf(argv: []const [:0]const u8) std.mem.Allocator {
-    _ = argv;
-    return std.heap.smp_allocator;
 }
 
 /// Increments and exports `SHLVL`; a missing or malformed value counts as 0.
@@ -634,23 +644,27 @@ fn loadHistory(sh: *Shell) void {
 }
 
 test "argument parsing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const argv = [_][:0]const u8{ "wsh", "-c", "echo hi" };
     var options = Options{};
-    const parsed = parseArgs(&argv, &options).?;
+    const parsed = parseArgs(arena.allocator(), &argv, &options).?;
     try std.testing.expectEqualStrings("echo hi", options.command.?);
     _ = parsed;
 
     const argv2 = [_][:0]const u8{ "wsh", "script.wsh", "a", "b" };
     var options2 = Options{};
-    const parsed2 = parseArgs(&argv2, &options2).?;
+    const parsed2 = parseArgs(arena.allocator(), &argv2, &options2).?;
     try std.testing.expectEqualStrings("script.wsh", options2.script.?);
     try std.testing.expectEqual(@as(usize, 2), parsed2.rest.len);
 }
 
 test "bundled options, -c operands and named options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const argv = [_][:0]const u8{ "wsh", "-lec", "+e", "-o", "pipefail", "echo", "name", "one" };
     var options = Options{};
-    const parsed = parseArgs(&argv, &options).?;
+    const parsed = parseArgs(arena.allocator(), &argv, &options).?;
     try std.testing.expect(options.login);
     try std.testing.expect(!options.shell.errexit);
     try std.testing.expect(options.shell.pipefail);
@@ -661,7 +675,7 @@ test "bundled options, -c operands and named options" {
 
     const stdin_argv = [_][:0]const u8{ "wsh", "-s", "--noprofile", "--rcfile", "rc", "a", "b" };
     var stdin_options = Options{};
-    const stdin_parsed = parseArgs(&stdin_argv, &stdin_options).?;
+    const stdin_parsed = parseArgs(arena.allocator(), &stdin_argv, &stdin_options).?;
     try std.testing.expect(stdin_options.read_stdin and stdin_options.no_profile);
     try std.testing.expectEqualStrings("rc", stdin_options.rcfile.?);
     try std.testing.expect(stdin_options.script == null);
@@ -669,7 +683,7 @@ test "bundled options, -c operands and named options" {
 
     const dash_argv = [_][:0]const u8{ "wsh", "-x", "-", "-script" };
     var dash_options = Options{};
-    _ = parseArgs(&dash_argv, &dash_options).?;
+    _ = parseArgs(arena.allocator(), &dash_argv, &dash_options).?;
     try std.testing.expect(dash_options.shell.xtrace);
     try std.testing.expectEqualStrings("-script", dash_options.script.?);
 }
