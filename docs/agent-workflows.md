@@ -34,6 +34,32 @@ not whether a program exists or whether code stored inside strings will parse
 when evaluated. `parallel` additionally parses every task before starting any
 task, so a malformed task prevents the whole batch from starting.
 
+A check also prints a warning on standard error for each common Bash mistake
+in valid source. Each warning is one line:
+
+```text
+wsh: NAME:LINE: warning: TEXT
+```
+
+NAME is the script path, `-c` for a command, or `stdin` for standard input.
+LINE is the line of the statement. The warnings are:
+
+| Mistake | TEXT |
+|---|---|
+| An unquoted `$var` or `${var}` as a whole argument of `rm`, `mv`, `cp`, `rmdir`, `chmod` or `chown` | `unquoted $NAME in a rm argument can split or glob; quote it` (with the command name) |
+| An unquoted `$var` or `${var}` operand of `[ ... ]` or `test` | `unquoted $NAME in [ ]; quote it or use [[ ]]` |
+| `for NAME in $(ls ...)` or `` for NAME in `ls ...` `` | `for loop over $(ls) breaks on spaces; use a glob` |
+| A `cd` outside a `&&`/`||` chain and outside an `if`, `while` or `until` condition | `cd without a check; use cd DIR \|\| exit` |
+
+Quoted words, such as `"$dir"`, give no warning. Warnings do not change the
+exit status. Add `--strict` to make the exit status 1 when there is at least
+one warning. A syntax error still gives 2. `--strict` has no effect without
+`--check`:
+
+```sh
+wsh --check --strict script.sh
+```
+
 ## Run independent tasks
 
 ```sh

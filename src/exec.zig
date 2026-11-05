@@ -23,6 +23,7 @@ const session = @import("interactive/session.zig");
 const strict = @import("strict.zig");
 const procsub = @import("executor/procsub.zig");
 const conditional = @import("executor/conditional.zig");
+const lint = @import("lint.zig");
 
 const Shell = shellmod.Shell;
 const Value = value.Value;
@@ -90,13 +91,33 @@ fn runSourceAt(sh: *Shell, src: []const u8, line: u32) u8 {
     return status;
 }
 
-pub fn checkSource(sh: *Shell, src: []const u8) u8 {
+/// Parses `src` without running it and prints a warning for each common Bash
+/// mistake, with `name` and the line in front. Returns 2 on a syntax error, 1
+/// when `fail_on_warning` is set and there is a warning, and 0 otherwise.
+pub fn checkSource(sh: *Shell, src: []const u8, name: []const u8, fail_on_warning: bool) u8 {
     var p = parser_mod.Parser.init(sh.scratch(), src);
-    _ = p.parseProgram() catch {
+    const program = p.parseProgram() catch {
         reportSyntaxError(sh, &p);
         return 2;
     };
+    const count = reportWarnings(sh, name, program.stmts) catch {
+        sys.writeStr(sh.default_err, "wsh: out of memory\n");
+        return 1;
+    };
+    if (fail_on_warning and count != 0) return 1;
     return 0;
+}
+
+/// Prints the warnings for `stmts` and returns how many there are.
+fn reportWarnings(sh: *Shell, name: []const u8, stmts: []const ast.Stmt) error{OutOfMemory}!usize {
+    const arena = sh.scratch();
+    var warnings: std.ArrayList(lint.Warning) = .empty;
+    try lint.check(arena, stmts, &warnings);
+    for (warnings.items) |warning| {
+        const text = try warning.text(arena);
+        sys.writeStr(sh.default_err, try std.fmt.allocPrint(arena, "wsh: {s}:{d}: warning: {s}\n", .{ name, warning.line, text }));
+    }
+    return warnings.items.len;
 }
 
 fn reportSyntaxError(sh: *Shell, p: *const parser_mod.Parser) void {
