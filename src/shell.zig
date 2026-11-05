@@ -52,6 +52,7 @@ pub const Options = struct {
     braceexpand: bool = true, // set -B
     noexec: bool = false, // set -n
     physical: bool = false, // set -P
+    safe: bool = false, // set -o safe; also stops an empty `$name` before `/`
     // Accepted so scripts that set them run; wsh has no behaviour to change.
     hashall: bool = true, // set -h
     history: bool = true, // set -o history

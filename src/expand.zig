@@ -35,8 +35,8 @@ pub const Error = error{
     ExecutionFailed,
     /// A malformed or failed `${...}`; the message has been printed.
     BadSubstitution,
-    /// `set -u` met an unset parameter, or `${name?word}` fired; the message
-    /// has been printed.
+    /// `set -u` met an unset parameter, `${name?word}` fired, or `set -o safe`
+    /// met an empty parameter before a `/`; the message has been printed.
     UnboundVariable,
 } || std.mem.Allocator.Error;
 
@@ -252,6 +252,9 @@ pub const Expander = struct {
     brace_words: usize = 0,
     /// The whole word is an assignment value: `~` expands after each `:`.
     assignment: bool = false,
+    /// The character after the closing quote of the double-quoted text being
+    /// scanned, or 0. `set -o safe` uses it to see the `/` in `"$dir"/`.
+    after_quote: u8 = 0,
     /// Holds integers and option letters, which have a small fixed bound.
     scratch: [256]u8 = undefined,
     flag_buf: [8]u8 = undefined,
@@ -520,6 +523,9 @@ pub const Expander = struct {
                     const end = findClosingDouble(word, i + 1);
                     // `""` is a real (empty) field, so mark it before scanning.
                     self.active = true;
+                    const saved = self.after_quote;
+                    self.after_quote = if (end + 1 < word.len) word[end + 1] else 0;
+                    defer self.after_quote = saved;
                     try self.scanDouble(word[i + 1 .. end]);
                     i = if (end < word.len) end + 1 else word.len;
                 },
@@ -675,7 +681,7 @@ pub const Expander = struct {
                     i.* = s.len;
                     return Error.UnterminatedSubstitution;
                 };
-                try self.expandBraced(s[start + 2 .. close], quoted);
+                try self.expandBraced(s[start + 2 .. close], quoted, self.beforeSlash(s, close + 1, quoted));
                 i.* = close + 1;
             },
             '(' => {
@@ -708,14 +714,14 @@ pub const Expander = struct {
                 i.* = start + 2;
             },
             '!', '@', '*', '0'...'9' => {
-                try self.expandSimple(s[start + 1 .. start + 2], quoted);
+                try self.expandSimple(s[start + 1 .. start + 2], quoted, self.beforeSlash(s, start + 2, quoted));
                 i.* = start + 2;
             },
             else => {
                 if (isIdentStart(next)) {
                     var j = start + 1;
                     while (j < s.len and isIdentChar(s[j])) j += 1;
-                    try self.expandSimple(s[start + 1 .. j], quoted);
+                    try self.expandSimple(s[start + 1 .. j], quoted, self.beforeSlash(s, j, quoted));
                     i.* = j;
                 } else {
                     try self.appendRaw("$");
@@ -723,6 +729,14 @@ pub const Expander = struct {
                 }
             },
         }
+    }
+
+    /// `set -o safe`: whether the expansion that ends before `s[end]` is
+    /// followed by a `/`, in `s` or right after the closing double quote.
+    fn beforeSlash(self: *Expander, s: []const u8, end: usize, quoted: bool) bool {
+        if (!self.sh.options.safe) return false;
+        if (end < s.len) return s[end] == '/';
+        return quoted and self.after_quote == '/';
     }
 
     fn intText(self: *Expander, n: anytype) []const u8 {
@@ -843,15 +857,19 @@ pub const Expander = struct {
         undeclared: bool = false,
     };
 
-    /// `$name`, `$1`, `$!` and the other unbraced forms.
-    fn expandSimple(self: *Expander, name: []const u8, quoted: bool) Error!void {
+    /// `$name`, `$1`, `$!` and the other unbraced forms. `before_slash` is
+    /// true when `set -o safe` is on and a `/` follows.
+    fn expandSimple(self: *Expander, name: []const u8, quoted: bool, before_slash: bool) Error!void {
         const p = try self.resolve(name, null);
-        try self.requireSet(p, .{ .name = name, .subscript = null });
+        const ref = Label{ .name = name, .subscript = null };
+        try self.requireSet(p, ref);
+        if (before_slash) try self.requireNotEmpty(p, ref);
         try self.emitParam(p, quoted);
     }
 
-    /// `${...}`; `Braced` lists the forms.
-    fn expandBraced(self: *Expander, inner: []const u8, quoted: bool) Error!void {
+    /// `${...}`; `Braced` lists the forms. `before_slash` is as for
+    /// `expandSimple`, and only plain `${name}` checks it.
+    fn expandBraced(self: *Expander, inner: []const u8, quoted: bool, before_slash: bool) Error!void {
         const b = parseBraced(inner) orelse {
             printError(self.sh, "wsh: ${{{s}}}: bad substitution\n", .{inner});
             return error.BadSubstitution;
@@ -867,6 +885,7 @@ pub const Expander = struct {
             .names, .keys => unreachable,
             .none => {
                 try self.requireSet(p, ref);
+                if (before_slash) try self.requireNotEmpty(p, ref);
                 return self.emitParam(p, quoted);
             },
             .length => {
@@ -944,6 +963,14 @@ pub const Expander = struct {
     fn requireSet(self: *Expander, p: Param, ref: Label) Error!void {
         if (p.set or p.list or !self.sh.options.nounset) return;
         printError(self.sh, "wsh: {f}: unbound variable\n", .{ref});
+        return error.UnboundVariable;
+    }
+
+    /// `set -o safe`: a set parameter that is empty before a `/` is an error,
+    /// so `rm -rf "$dir/"*` cannot become `rm -rf /*`.
+    fn requireNotEmpty(self: *Expander, p: Param, ref: Label) Error!void {
+        if (!p.set or p.list or p.text.len != 0) return;
+        printError(self.sh, "wsh: {f}: empty value before '/' (set -o safe)\n", .{ref});
         return error.UnboundVariable;
     }
 
@@ -1259,6 +1286,10 @@ pub const Expander = struct {
         const saved = self.bare_vars;
         self.bare_vars = false;
         defer self.bare_vars = saved;
+        // The operand ends at the `}`, not at the closing quote.
+        const saved_quote = self.after_quote;
+        self.after_quote = 0;
+        defer self.after_quote = saved_quote;
         if (quoted) try self.scanOperandQuoted(word) else try self.scanText(word);
     }
 
@@ -2748,6 +2779,28 @@ test "set -u rejects unset parameters outside the default forms" {
     try sh.setVar("empty", .{ .list = &.{} });
     try testing.expectEqualStrings("0", try expandLiteral(&sh, arena, "${#empty[@]}"));
     try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${#nope[@]}"));
+}
+
+test "set -o safe rejects an empty parameter before a slash" {
+    var sh = try testShell();
+    defer sh.deinit();
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    sh.default_err = -1;
+    try sh.setVar("d", .{ .string = "" });
+    try sh.setVar("x", .{ .string = "tmp" });
+
+    try testing.expectEqualStrings("/a", try expandLiteral(&sh, arena, "$d/a"));
+    sh.options.safe = true;
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "$d/a"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "${d}/a"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "\"$d/\"a"));
+    try testing.expectError(error.UnboundVariable, expandLiteral(&sh, arena, "\"${d}\"/a"));
+    try testing.expectEqualStrings("tmp/a", try expandLiteral(&sh, arena, "\"$x\"/a"));
+    try testing.expectEqualStrings("a/", try expandLiteral(&sh, arena, "$d\"a\"/"));
+    try testing.expectEqualStrings("/", try expandLiteral(&sh, arena, "${d:-}/"));
+    try testing.expectEqualStrings("b/", try expandLiteral(&sh, arena, "\"${d:-$d}b\"/"));
 }
 
 test "arrays expand by element" {

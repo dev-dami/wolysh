@@ -201,6 +201,18 @@ test "set flags, -o names and combined forms" {
     try testing.expectEqual(@as(u8, 2), runSet(&sh, &.{ "set", "-o", "nosuch" }));
 }
 
+test "set -o safe turns on the strict options and +o safe keeps them" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+
+    try testing.expectEqual(@as(u8, 0), runSet(&sh, &.{ "set", "-o", "safe" }));
+    try testing.expect(sh.options.safe and sh.options.errexit and sh.options.nounset);
+    try testing.expect(sh.options.pipefail and sh.options.noclobber);
+    try testing.expectEqual(@as(u8, 0), runSet(&sh, &.{ "set", "+o", "safe" }));
+    try testing.expect(!sh.options.safe and sh.options.errexit and sh.options.nounset);
+    try testing.expect(sh.options.pipefail and sh.options.noclobber);
+}
+
 test "set replaces the positional parameters" {
     var sh = try Shell.initBare(testing.allocator);
     defer sh.deinit();

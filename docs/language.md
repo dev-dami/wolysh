@@ -192,6 +192,25 @@ commands stored in strings for later `eval`, function calls, or `parallel`.
 
 See [agent workflows](agent-workflows.md) for report fields and exit semantics.
 
+## Safe mode
+
+`wsh --safe`, `set -o safe` and `shopt -so safe` turn on safe mode. It turns
+on `errexit`, `nounset`, `pipefail` and `noclobber`. It also stops a command
+when a parameter that is set but empty comes right before a `/`:
+
+```text
+set -o safe
+dir=""
+rm -rf "$dir/"*    # wsh: dir: empty value before '/' (set -o safe)
+```
+
+The check covers `$dir/`, `${dir}/`, `"$dir/"` and `"$dir"/`, also in
+assignments and here-documents. It does not cover operator forms such as
+`${dir:-}/`; use them when an empty value is what you want. The error ends a
+script with status 1, as an unbound variable does. `set +o safe` turns off
+only `safe` itself. `errexit`, `nounset`, `pipefail` and `noclobber` stay on
+until you turn them off. `safe` has no letter in `$-`.
+
 ## Configuration
 
 Configuration is loaded from `$XDG_CONFIG_HOME/wsh/config` or

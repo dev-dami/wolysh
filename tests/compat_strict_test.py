@@ -234,6 +234,56 @@ class PipefailTests(BashComparison):
         self.assertEqual(result.stdout, b"6\n")
 
 
+def option_line(name, on):
+    return b"%-15s\t%s\n" % (name.encode(), b"on" if on else b"off")
+
+
+class SafeOptionTests(BashComparison):
+    def test_set_o_safe_turns_on_the_strict_options(self):
+        result = run_shell("set -o safe; echo $-; set -o | grep -E '^(pipefail|safe) '")
+        self.assertEqual(result.stdout, b"euC\n" + option_line("pipefail", True) + option_line("safe", True))
+
+    def test_clearing_safe_keeps_the_other_options(self):
+        result = run_shell("set -o safe; set +o safe; echo $-; set -o | grep -E '^(pipefail|safe) '")
+        self.assertEqual(result.stdout, b"euC\n" + option_line("pipefail", True) + option_line("safe", False))
+
+    def test_shopt_o_and_the_command_line_flag(self):
+        result = run_shell("shopt -so safe; echo $-")
+        self.assertEqual(result.stdout, b"euC\n")
+        result = subprocess.run(
+            [str(SHELL), "--no-config", "--safe", "-c", "echo $-; shopt -o safe pipefail"],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=TIMEOUT,
+            check=False,
+        )
+        self.assertEqual(result.stdout, b"euC\n" + option_line("safe", True) + option_line("pipefail", True))
+        self.assertEqual(result.returncode, 0)
+
+    def test_empty_value_before_a_slash_stops_the_script(self):
+        with tempfile.TemporaryDirectory(prefix="wsh-strict-") as temp_dir:
+            keep = pathlib.Path(temp_dir, "keep")
+            # If the guard failed, `rm` would remove this file, not `/`.
+            rest = str(keep).lstrip("/")
+            for word in (f'"$dir/{rest}"', f'"${{dir}}/{rest}"', f"$dir/{rest}", f'"$dir"/{rest}'):
+                with self.subTest(word=word):
+                    keep.write_text("x")
+                    result = run_shell(f'set -o safe; dir=""; rm -f {word}; echo after')
+                    self.assertEqual(result.stdout, b"")
+                    self.assertEqual(result.stderr, b"wsh: dir: empty value before '/' (set -o safe)\n")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertTrue(keep.exists())
+
+    def test_a_value_before_the_slash_still_works(self):
+        result = run_shell('set -o safe; dir=/tmp; e=""; echo "$dir/x" ${dir}/y "$dir"/z "$e"x "${e:-.}/w"')
+        self.assertEqual(result.stdout, b"/tmp/x /tmp/y /tmp/z x ./w\n")
+        self.assertEqual(result.returncode, 0)
+
+    def test_without_safe_nothing_changes(self):
+        self.assert_like_bash('dir=""; echo "$dir/x" $dir/y "${dir}"/z; echo after')
+        self.assert_like_bash('set -euo pipefail; dir=""; echo "$dir/x"; echo after')
+
+
 class XtraceTests(BashComparison):
     def test_words_are_quoted_like_bash(self):
         self.assert_like_bash(
