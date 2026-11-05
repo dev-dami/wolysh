@@ -58,6 +58,7 @@ check 'declare -A m=([k]=v); m+=([j]=$((m=0))); echo ok'
 check 'IFS=": "; read IFS rest <<< "a:b c"; echo "$rest"'
 check 'arr=(a b); mapfile -O 1 -c 1 -C "unset arr;:" arr <<< x; echo "${arr[@]}"'
 check 'prompt="> "; unset prompt; echo ok'
+check "alias ll='ls -l'; echo \${BASH_ALIASES[ll]}"
 
 # Bytes and numbers from data.
 check 'x=$(printf "a\342\202"); echo "${x^^}" "${x,,}" "${x@U}"'

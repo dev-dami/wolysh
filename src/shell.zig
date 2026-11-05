@@ -495,6 +495,7 @@ pub const Shell = struct {
         if (self.history_path.len != 0) self.gpa.free(self.history_path);
         if (self.config_path.len != 0) self.gpa.free(self.config_path);
         if (self.config.prompt.len != 0) self.gpa.free(self.config.prompt);
+        special_vars.deinit(self.gpa);
         self.line_arena.deinit();
     }
 

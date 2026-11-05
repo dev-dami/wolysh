@@ -173,6 +173,12 @@ fn groups() value.Value {
     return .{ .list = groups_buf[0..len] };
 }
 
+/// Frees the buffer behind `BASH_ALIASES`. `Shell.deinit` calls it.
+pub fn deinit(gpa: std.mem.Allocator) void {
+    alias_entries.deinit(gpa);
+    alias_entries = .empty;
+}
+
 /// `BASH_ALIASES`: every alias, keyed by name.
 fn aliasMap(sh: *const shell.Shell) ?value.Value {
     alias_entries.clearRetainingCapacity();
