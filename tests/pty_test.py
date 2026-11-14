@@ -171,6 +171,28 @@ def main():
     s.send("\r")
     check("autosuggestion accepted and runs", s.read_until(b"interactive-works"))
 
+    # 3b. suggestions prefer the current directory over recency
+    s.clear()
+    s.send("echo rank-here\r")
+    s.read_until(b"rank-here\r\n")
+    s.send(f"cd /tmp\recho rank-there\rcd {ROOT}\r")
+    s.read_until(b"rank-there\r\n")
+    s.drain()
+    s.clear()
+    s.send("echo rank-")
+    s.drain()
+    plain = strip_ansi(s.buf)
+    check("suggestion prefers the current directory", plain.rstrip().endswith(b"echo rank-here"), repr(plain[-200:]))
+    s.send(b"\x15")
+    s.drain(0.2)
+    with open(os.path.join(s.data_home.name, "data", "wsh", "history"), "rb") as history_file:
+        saved = history_file.read()
+    check(
+        "history file is v3 with status lines",
+        saved.startswith(b"#wsh-history v3\n") and b"\n=" in saved and b"\t/tmp\techo rank-there\n" in saved,
+        repr(saved[-300:]),
+    )
+
     # 4. tab completion of a command name
     s.clear()
     s.send("ech\t")

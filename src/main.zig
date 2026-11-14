@@ -503,6 +503,7 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         session.beforeCommand(sh, line);
         const warned = sh.exit_warned;
         sh.entered_entry = entry orelse "";
+        const started = monotonicMillis();
         var status = exec.runSource(sh, line);
         sh.entered_entry = "";
         // Only an immediately repeated `exit` gets past the stopped-jobs warning.
@@ -513,6 +514,7 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
             // Keep the echoed ^C on its own line, as bash does.
             sys.writeStr(2, "\n");
         }
+        if (entry) |stored| finishHistory(sh, stored, status, monotonicMillis() -| started, &history_error_reported);
         session.afterCommand(status);
         // `let prompt = ...` or `let autosuggest = false` should take effect
         // on the very next prompt.
@@ -565,7 +567,7 @@ fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) ?[]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
     defer arena_state.deinit();
     const control_text = prompt.textVar(sh, arena_state.allocator(), "HISTCONTROL") catch null;
-    const entry = (sh.hist.record(sh.gpa, source, history.Control.parse(control_text)) catch return null) orelse return null;
+    const entry = (sh.hist.recordEntered(sh.gpa, source, history.Control.parse(control_text), sh.cwd) catch return null) orelse return null;
     if (sh.history_path.len == 0) return entry;
     sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
         if (reported.*) return entry;
@@ -575,6 +577,24 @@ fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) ?[]const u8 {
         sys.writeStr(2, msg);
     };
     return entry;
+}
+
+/// Records how an entered line ended, for suggestion ranking, and appends its
+/// status line to the history file.
+fn finishHistory(sh: *Shell, entry: []const u8, status: u8, millis: u64, reported: *bool) void {
+    sh.hist.finishEntered(sh.gpa, sh.history_path, entry, status, millis) catch {
+        if (reported.*) return;
+        reported.* = true;
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "wsh: history: cannot write {s}\n", .{sh.history_path}) catch return;
+        sys.writeStr(2, msg);
+    };
+}
+
+fn monotonicMillis() u64 {
+    var ts: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
 /// Puts the shell in its own process group and claims the terminal, which is

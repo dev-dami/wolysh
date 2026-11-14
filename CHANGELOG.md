@@ -7,6 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed
+
+- Inline suggestions rank history by context. Among commands that start with
+  what you typed, wsh prefers one entered in the current directory right after
+  the command you just ran, then one entered in the current directory, then the
+  newest anywhere. A command whose latest run failed is suggested only when no
+  successful one matches. `let suggest = "recent"` restores the old
+  newest-match behaviour.
+- The history file moves to format v3, which records each entry's time,
+  directory and previous command, plus its exit status and duration once it
+  finishes. Older files load unchanged and are upgraded on the first new
+  entry. wsh 0.6.0 and earlier read a v3 file wrongly, so avoid running old
+  and new versions against the same history file at once. Entry times now
+  survive a restart, so `HISTTIMEFORMAT` shows when commands were entered.
+
+### Fixed
+
+- `eval` skips a leading `--` and rejects other options, as Bash does. Among
+  other things, this makes `eval "$(starship init bash)"` start without an
+  error.
+
 ## [0.6.0] - 2026-10-31
 
 ### Added

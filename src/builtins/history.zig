@@ -255,7 +255,7 @@ fn fileOperation(ctx: Ctx, op: u8, file: ?[]const u8) u8 {
     const entries = sh.hist.entries.items;
     switch (op) {
         'w' => {
-            history.writeEntries(sh.gpa, path, @ptrCast(entries)) catch {
+            sh.hist.writeFile(sh.gpa, path) catch {
                 ctx.errFmt("wsh: history: {s}: cannot write\n", .{path});
                 return 1;
             };
@@ -265,7 +265,7 @@ fn fileOperation(ctx: Ctx, op: u8, file: ?[]const u8) u8 {
             // Entries reach the history file as they are entered; only another
             // file can still be missing some.
             if (!is_history_file) {
-                history.appendEntries(sh.gpa, path, @ptrCast(entries[@min(sh.hist.unsaved, entries.len)..])) catch {
+                sh.hist.appendRangeToFile(sh.gpa, path, @min(sh.hist.unsaved, entries.len)) catch {
                     ctx.errFmt("wsh: history: {s}: cannot write\n", .{path});
                     return 1;
                 };

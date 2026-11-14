@@ -1343,10 +1343,8 @@ pub const Editor = struct {
         if (self.buf.items.len == 0) return null;
         if (self.hist_index != null) return null;
 
-        const index = self.sh.hist.searchBackward(self.sh.hist.count(), self.buf.items) orelse return null;
-        const entry = self.sh.hist.get(index);
-        if (entry.len <= self.buf.items.len) return null;
-        return entry[self.buf.items.len..];
+        const index = self.sh.hist.suggest(self.buf.items, self.sh.cwd, self.sh.config.suggest) orelse return null;
+        return self.sh.hist.get(index)[self.buf.items.len..];
     }
 
     fn acceptSuggestionOrMoveRight(self: *Editor) void {

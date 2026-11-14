@@ -144,6 +144,13 @@ before bounded edit-distance checks; regular command lookup does not run it.
 The shell caches up to 64 recent failed command names per session and can show
 their best correction inline; press Right to accept it.
 
+History suggestions are ranked by context. Among history entries that start
+with what you typed, wsh picks the newest one entered in the current directory
+right after the command you just ran; failing that, the newest entered in the
+current directory; failing that, the newest anywhere. A command whose latest
+run exited non-zero is suggested only when no successful command matches.
+`let suggest = "recent"` always takes the newest match instead.
+
 | Key | Action |
 | --- | --- |
 | Up / Down | Browse history |

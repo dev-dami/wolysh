@@ -28,6 +28,9 @@ pub const Config = struct {
     /// Prompt prefix override; empty means the built-in prompt is used.
     prompt: []const u8 = "",
     autosuggest: bool = true,
+    /// `let suggest = "recent"` picks the newest history match; anything
+    /// else ranks matches by directory, previous command and status.
+    suggest: history.Rank = .context,
     highlight: bool = true,
     completion: bool = true,
     git_prompt: bool = true,
@@ -1422,6 +1425,10 @@ pub const Shell = struct {
         }
         if (self.getVar("git_prompt")) |v| self.config.git_prompt = v.truthy();
         if (self.getVar("autosuggest")) |v| self.config.autosuggest = v.truthy();
+        if (self.getVar("suggest")) |v| {
+            const recent = std.meta.activeTag(v) == .string and std.mem.eql(u8, v.string, "recent");
+            self.config.suggest = if (recent) .recent else .context;
+        }
         if (self.getVar("highlight")) |v| self.config.highlight = v.truthy();
         if (self.getVar("completion")) |v| self.config.completion = v.truthy();
         if (self.getVar("history_limit")) |v| {
