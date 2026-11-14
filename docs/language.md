@@ -181,6 +181,25 @@ The selected candidate replaces the word in the line as you move. Enter with
 nothing selected closes the menu and runs the line. The menu is redrawn in
 place and erased when it closes, so it never stays in the scrollback.
 
+Candidates the shell knows something about get a dimmed description in
+parentheses, lined up after the names:
+
+| Candidate | Description |
+| --- | --- |
+| Builtin | Its one-line summary, as `help` lists it |
+| Function / keyword | `function` / `keyword` |
+| Alias | `alias: ` and its text |
+| Command on `PATH` | `command` |
+| Variable (`$HO<Tab>`) | Its value, cut to fit, with control characters shown as `^X` |
+| Directory / symlink / executable file | `directory` / `link` / `executable` (a plain file has none) |
+
+Descriptions use fewer columns, so the menu may need more rows. When the
+terminal is too narrow for them, they are dropped before any name is cut.
+Words from `complete` / `compgen` specs and the other argument completers
+have no descriptions. Only the menu shows them; a single match or a common
+prefix is inserted as before. Command completion also offers reserved words
+such as `while` and `done`, as Bash's does.
+
 `jobs`, `fg`, `bg`, and `wait` support `%1`, `%+`, and command prefixes.
 Foreground jobs receive the terminal and run in their own process groups.
 `wait -n` blocks until a job completes; optional operands limit which jobs it

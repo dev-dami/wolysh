@@ -10,6 +10,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - Alt-Enter inserts a new line without running the command.
+- The completion menu describes candidates, fish-style: a builtin's summary,
+  `function`, `alias: <text>`, `keyword` and `command` for command names, the
+  value of a variable, and `directory`, `link` or `executable` for paths.
+  Descriptions line up after the names and are dropped on a terminal too
+  narrow for them. Command completion also offers reserved words such as
+  `while`, as Bash does.
 
 ### Changed
 

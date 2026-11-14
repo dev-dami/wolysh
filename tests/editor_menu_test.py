@@ -290,6 +290,22 @@ class MenuTests(unittest.TestCase):
         os.mkdir(odd)
         for name in ("my file", "my été", "my_long_" + "x" * 60):
             open(os.path.join(odd, name), "w").close()
+        # For descriptions: a directory, a link to it, an executable and a
+        # plain file, all starting with "zz".
+        os.mkdir(os.path.join(cls.dir.name, "zzdir"))
+        os.symlink("zzdir", os.path.join(cls.dir.name, "zzlink"))
+        exe = os.path.join(cls.dir.name, "zzexec")
+        with open(exe, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(exe, 0o755)
+        open(os.path.join(cls.dir.name, "zzplain"), "w").close()
+        # A PATH of one directory holding one command.
+        cls.bin = os.path.join(cls.dir.name, "bin")
+        os.mkdir(cls.bin)
+        cmd = os.path.join(cls.bin, "zzcmd")
+        with open(cmd, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(cmd, 0o755)
 
     @classmethod
     def tearDownClass(cls):
@@ -477,6 +493,65 @@ class MenuTests(unittest.TestCase):
         self.assertScreen(sh, sh.screen.reversed_text() == ["apricot"], "the menu redraws after a resize")
         sh.send(ESC)
         self.assertScreen(sh, self.menu_rows(sh) == [], "the menu closes after a resize")
+
+    def row_with(self, sh, name):
+        for row in self.menu_rows(sh):
+            if name in row:
+                return row
+        self.fail(f"{name} is not in the menu\n" + sh.screen.dump())
+
+    def test_commands_show_their_kind(self):
+        config = (f"PATH={self.bin}\n"
+                  "alias zzalias='echo hello there'\n"
+                  "zzfunc() { :; }\n")
+        sh = self.start(cols=60, config=config)
+        self.open_menu(sh, "zz")
+        self.assertScreen(sh, sh.lines()[sh.screen.y] == "$ zz", "the line is unchanged")
+        self.assertIn("(alias: echo hello there)", self.row_with(sh, "zzalias"))
+        self.assertIn("(function)", self.row_with(sh, "zzfunc"))
+        self.assertIn("(command)", self.row_with(sh, "zzcmd"))
+        # The current directory's names complete here too.
+        self.assertIn("(directory)", self.row_with(sh, "zzdir/"))
+
+    def test_builtins_and_keywords_are_described(self):
+        sh = self.start(cols=70, config=f"PATH={self.bin}\n")
+        self.open_menu(sh, "read")
+        self.assertIn("(mark variables readonly)", self.row_with(sh, "readonly"))
+        sh.send(ESC)
+        sh.send(CTRL_C)
+        self.open_menu(sh, "do")
+        self.assertIn("(keyword)", self.row_with(sh, "done"))
+
+    def test_variables_show_their_values(self):
+        config = "zzvar1='hello world'\nzzvar2=$'tab\\there'\n"
+        sh = self.start(cols=60, config=config)
+        self.open_menu(sh, "echo $zzvar")
+        self.assertIn("(hello world)", self.row_with(sh, "$zzvar1"))
+        self.assertIn("(tab^Ihere)", self.row_with(sh, "$zzvar2"))
+
+    def test_paths_are_marked(self):
+        sh = self.start(cols=60)
+        self.open_menu(sh, "ls zz")
+        self.assertIn("(directory)", self.row_with(sh, "zzdir/"))
+        self.assertIn("(link)", self.row_with(sh, "zzlink/"))
+        self.assertIn("(executable)", self.row_with(sh, "zzexec"))
+        self.assertNotIn("zzplain  (", "\n".join(self.menu_rows(sh)), "a plain file has no description")
+        sh.send(TAB)
+        selected = sh.screen.reversed_text()
+        self.assertScreen(sh, len(selected) == 1 and selected[0].startswith("zzdir/")
+                          and selected[0].endswith("(directory)"),
+                          "the highlight covers the name and its description")
+        self.assertScreen(sh, sh.lines()[sh.screen.y] == "$ ls zzdir/", "the line gets the name only")
+
+    def test_narrow_terminal_drops_descriptions(self):
+        sh = self.start(cols=16, rows=16)
+        self.open_menu(sh, "ls zz")
+        rows = self.menu_rows(sh)
+        text = "\n".join(rows)
+        for name in ("zzdir/", "zzlink/", "zzexec", "zzplain"):
+            self.assertScreen(sh, name in text, f"{name} is shown whole")
+        self.assertScreen(sh, "(" not in text and "…" not in text, "descriptions are dropped, names not cut")
+        self.assertScreen(sh, all(len(r) <= 16 for r in sh.lines()), "nothing wider than the terminal")
 
 
 if __name__ == "__main__":

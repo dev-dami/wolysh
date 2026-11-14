@@ -5,9 +5,11 @@
 //! of its frame, so every redraw repaints or erases it in place and nothing
 //! reaches the scrollback. This file owns the menu's state, its keyboard
 //! navigation helpers and the layout: candidates in as many columns as fit
-//! the terminal (column-major, like `ls`), a height cap with a final
-//! "…and N more" row, and truncation with "…" for cells wider than the
-//! screen. The layout functions are pure so they can be tested directly.
+//! the terminal (column-major, like `ls`) with any descriptions lined up
+//! after the names (or dropped when they leave too little room), a height
+//! cap with a final "…and N more" row, and truncation with "…" for cells
+//! wider than the screen. The layout functions are pure so they can be
+//! tested directly.
 
 const std = @import("std");
 const wcwidth = @import("wcwidth.zig");
@@ -16,8 +18,8 @@ const complete = @import("complete.zig");
 const Allocator = std.mem.Allocator;
 
 /// One candidate. `text` is the replacement word as it goes into the line;
-/// `label` is how the menu shows it. `description` is drawn dimmed after the
-/// label when a completion source provides one (none do yet).
+/// `label` is how the menu shows it. `description`, when the completion
+/// source has one (see `complete.describe`), is drawn dimmed after the label.
 pub const Item = struct {
     text: []const u8,
     label: []const u8,
@@ -31,6 +33,9 @@ pub const max_columns = 128;
 /// The menu never takes fewer rows than this (screen permitting) nor more
 /// than a third of the screen.
 pub const min_rows = 4;
+/// Descriptions are shown only when at least this many columns of each are
+/// left beside the widest label; otherwise they are dropped so no name is cut.
+pub const min_description = 8;
 
 pub const Menu = struct {
     gpa: Allocator,
@@ -68,6 +73,16 @@ pub const Menu = struct {
             .end = end,
             .original = try a.dupe(u8, line[start..end]),
         };
+    }
+
+    /// Copies `descriptions` (parallel to the items; a shorter list leaves
+    /// the rest without one) into the menu.
+    pub fn describe(self: *Menu, descriptions: []const []const u8) Allocator.Error!void {
+        const a = self.arena.allocator();
+        const n = @min(self.items.len, descriptions.len);
+        for (self.items[0..n], descriptions[0..n]) |*item, description| {
+            item.description = try a.dupe(u8, description);
+        }
     }
 
     pub fn deinit(self: *Menu) void {
@@ -120,11 +135,9 @@ fn makeLabel(arena: Allocator, word: []const u8, strip: usize) Allocator.Error![
     return copy;
 }
 
-/// Columns a cell needs: the label, and the description in parentheses.
-pub fn cellWidth(item: Item) usize {
-    var total = wcwidth.width(item.label);
-    if (item.description.len > 0) total += gap + 2 + wcwidth.width(item.description);
-    return total;
+/// Columns a description needs: its text in parentheses, or none.
+pub fn descriptionWidth(item: Item) usize {
+    return if (item.description.len > 0) 2 + wcwidth.width(item.description) else 0;
 }
 
 pub const Layout = struct {
@@ -133,16 +146,46 @@ pub const Layout = struct {
     rows: usize,
     /// Width of each column, gap excluded, each at most the screen width.
     widths: [max_columns]usize,
+    /// Width of the widest described label in each column: its
+    /// descriptions start `gap` after it, so they line up.
+    labels: [max_columns]usize,
 };
+
+/// A column holding `labels[i]` / `descriptions[i]` for the given cells.
+/// Descriptions line up after the widest label that has one; a label
+/// without one may run past that, so one directory among many long file
+/// names does not push every name apart.
+fn columnWidth(labels: []const usize, descriptions: ?[]const usize, first: usize, end: usize) struct { label: usize, total: usize } {
+    var plain: usize = 0;
+    var label: usize = 0;
+    var description: usize = 0;
+    for (first..end) |i| {
+        const d = if (descriptions) |all| all[i] else 0;
+        if (d == 0) {
+            plain = @max(plain, labels[i]);
+        } else {
+            label = @max(label, labels[i]);
+            description = @max(description, d);
+        }
+    }
+    if (description == 0) return .{ .label = plain, .total = plain };
+    return .{ .label = label, .total = @max(plain, label + gap + description) };
+}
 
 /// Lays `cells` (display widths) out column-major in as many columns as fit
 /// in `avail` columns of screen, with `gap` between columns.
 pub fn layout(cells: []const usize, avail: usize) Layout {
-    var result: Layout = .{ .columns = 1, .rows = cells.len, .widths = undefined };
-    const n = cells.len;
-    var widest: usize = 0;
-    for (cells) |w| widest = @max(widest, w);
-    result.widths[0] = @min(widest, avail);
+    return layoutDescribed(cells, null, avail);
+}
+
+/// `layout` for cells of a label and a description (widths parallel to
+/// `labels`, zero for none), aligned within each column.
+pub fn layoutDescribed(labels: []const usize, descriptions: ?[]const usize, avail: usize) Layout {
+    var result: Layout = .{ .columns = 1, .rows = labels.len, .widths = undefined, .labels = undefined };
+    const n = labels.len;
+    const all = columnWidth(labels, descriptions, 0, n);
+    result.widths[0] = @min(all.total, avail);
+    result.labels[0] = @min(all.label, avail);
     if (n <= 1) return result;
 
     var try_columns = @min(n, max_columns);
@@ -153,13 +196,14 @@ pub fn layout(cells: []const usize, avail: usize) Layout {
         if (columns != try_columns) continue;
         var total: usize = gap * (columns - 1);
         var widths: [max_columns]usize = undefined;
+        var label_widths: [max_columns]usize = undefined;
         var fits = true;
         for (0..columns) |c| {
-            var w: usize = 0;
             const first = c * rows;
-            for (cells[first..@min(first + rows, n)]) |cell| w = @max(w, cell);
-            widths[c] = w;
-            total += w;
+            const column = columnWidth(labels, descriptions, first, @min(first + rows, n));
+            widths[c] = column.total;
+            label_widths[c] = column.label;
+            total += column.total;
             if (total > avail) {
                 fits = false;
                 break;
@@ -169,6 +213,7 @@ pub fn layout(cells: []const usize, avail: usize) Layout {
             result.columns = columns;
             result.rows = rows;
             result.widths = widths;
+            result.labels = label_widths;
             return result;
         }
     }
@@ -238,11 +283,25 @@ pub fn draw(writer: *std.Io.Writer, menu: *Menu, width: usize, limit: usize) usi
     // One column spare: a row that ends exactly at the margin leaves the
     // terminal in its pending-wrap state, which differs between terminals.
     const avail = width - 1;
-    const cells = menu.gpa.alloc(usize, menu.items.len) catch return 0;
+    const cells = menu.gpa.alloc(usize, menu.items.len * 2) catch return 0;
     defer menu.gpa.free(cells);
-    for (menu.items, cells) |item, *cell| cell.* = cellWidth(item);
-
-    const lay = layout(cells, avail);
+    const labels = cells[0..menu.items.len];
+    const descriptions = cells[menu.items.len..];
+    // The widest label that has a description, and the widest description.
+    var widest_label: usize = 0;
+    var widest_description: usize = 0;
+    for (menu.items, labels, descriptions) |item, *label, *description| {
+        label.* = wcwidth.width(item.label);
+        description.* = descriptionWidth(item);
+        if (description.* == 0) continue;
+        widest_label = @max(widest_label, label.*);
+        widest_description = @max(widest_description, description.*);
+    }
+    // Descriptions take fewer columns, and none at all when even one column
+    // would leave them too little room: names matter more.
+    const described = widest_description > 0 and
+        (widest_label + gap + widest_description <= avail or widest_label + gap + 2 + min_description <= avail);
+    const lay = layoutDescribed(labels, if (described) descriptions else null, avail);
     menu.rows = lay.rows;
     const selected_row = if (menu.selected) |s| s % lay.rows else null;
     const win = window(lay.rows, limit, selected_row, menu.scroll);
@@ -257,7 +316,9 @@ pub fn draw(writer: *std.Io.Writer, menu: *Menu, width: usize, limit: usize) usi
             if (index >= menu.items.len) break;
             if (column > 0) writer.splatByteAll(' ', gap) catch {};
             const last = column + 1 == lay.columns or index + lay.rows >= menu.items.len;
-            drawCell(writer, menu.items[index], lay.widths[column], menu.selected == index, last);
+            const item = menu.items[index];
+            const label_width = if (described and item.description.len > 0) lay.labels[column] else lay.widths[column];
+            drawCell(writer, item, label_width, lay.widths[column], menu.selected == index, last);
         }
     }
     if (win.more) {
@@ -282,10 +343,12 @@ fn visibleCount(lay: Layout, win: Window, n: usize) usize {
     return count;
 }
 
-/// One cell, padded to `column_width` unless it is the last in its row.
-fn drawCell(writer: *std.Io.Writer, item: Item, column_width: usize, selected: bool, last: bool) void {
+/// One cell, padded to `column_width` unless it is the last in its row: the
+/// label in `label_width` columns, then the description dimmed in what is
+/// left. The selection's reverse video covers both.
+fn drawCell(writer: *std.Io.Writer, item: Item, label_width: usize, column_width: usize, selected: bool, last: bool) void {
     var used: usize = 0;
-    const label = fit(item.label, column_width);
+    const label = fit(item.label, label_width);
     if (selected) writer.writeAll(reverse) catch {};
     writer.writeAll(item.label[0..label.len]) catch {};
     used += label.width;
@@ -293,20 +356,20 @@ fn drawCell(writer: *std.Io.Writer, item: Item, column_width: usize, selected: b
         writer.writeAll(ellipsis) catch {};
         used += 1;
     }
-    if (selected) writer.writeAll(reset) catch {};
-    // The description gets what is left, if that is enough to be useful.
-    if (!label.cut and item.description.len > 0 and column_width >= used + gap + 4) {
-        const room = column_width - used - gap - 2;
+    // The description gets what is left, if that holds at least a character.
+    var described = false;
+    if (!label.cut and item.description.len > 0 and column_width >= label_width + gap + 3) {
+        writer.splatByteAll(' ', label_width + gap - used) catch {};
+        const room = column_width - label_width - gap - 2;
         const description = fit(item.description, room);
-        writer.splatByteAll(' ', gap) catch {};
-        writer.writeAll(dim) catch {};
-        writer.writeAll("(") catch {};
+        writer.writeAll(dim ++ "(") catch {};
         writer.writeAll(item.description[0..description.len]) catch {};
         if (description.cut) writer.writeAll(ellipsis) catch {};
         writer.writeAll(")") catch {};
-        writer.writeAll(reset) catch {};
-        used += gap + 2 + description.width + @intFromBool(description.cut);
+        used = label_width + gap + 2 + description.width + @intFromBool(description.cut);
+        described = true;
     }
+    if (selected or described) writer.writeAll(reset) catch {};
     if (!last and column_width > used) writer.splatByteAll(' ', column_width - used) catch {};
 }
 
@@ -419,12 +482,77 @@ test "draw highlights the selection and counts hidden items" {
     try testing.expectEqualStrings("\r\nitem00\r\n\x1b[7mitem01\x1b[0m\r\nitem02\r\n…and 17 more", out.written());
 }
 
-test "draw shows descriptions when there is room" {
-    var menu = try Menu.init(testing.allocator, &.{ "ab", "cd" }, "", 0, 0);
+test "layout aligns descriptions within each column" {
+    // Labels 3 and 5 wide; only the first has a description (9 with parens).
+    const labels = [_]usize{ 3, 5, 4 };
+    const descriptions = [_]usize{ 9, 0, 0 };
+    const two = layoutDescribed(&labels, &descriptions, 24);
+    try testing.expectEqual(@as(usize, 2), two.columns);
+    try testing.expectEqual(@as(usize, 2), two.rows);
+    // The description lines up after the described label; the plain one
+    // fits within the same width.
+    try testing.expectEqual(@as(usize, 3), two.labels[0]);
+    try testing.expectEqual(@as(usize, 3 + gap + 9), two.widths[0]);
+    try testing.expectEqual(@as(usize, 4), two.labels[1]);
+    try testing.expectEqual(@as(usize, 4), two.widths[1]);
+    // Descriptions make cells wider, so fewer columns fit than without.
+    try testing.expectEqual(@as(usize, 3), layout(&labels, 24).columns);
+    const one = layoutDescribed(&labels, &descriptions, 12);
+    try testing.expectEqual(@as(usize, 1), one.columns);
+    try testing.expectEqual(@as(usize, 3), one.labels[0]);
+    try testing.expectEqual(@as(usize, 12), one.widths[0]);
+}
+
+test "draw aligns descriptions after the labels" {
+    var menu = try Menu.init(testing.allocator, &.{ "ab", "cdef", "g" }, "", 0, 0);
     defer menu.deinit();
-    menu.items[0].description = "first";
+    try menu.describe(&.{ "first", "x", "" });
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
+    _ = draw(&out.writer, &menu, 16, 4);
+    try testing.expectEqualStrings("\r\nab    \x1b[2m(first)\x1b[0m\r\ncdef  \x1b[2m(x)\x1b[0m\r\ng", out.written());
+}
+
+test "the selection covers the label and its description" {
+    var menu = try Menu.init(testing.allocator, &.{ "ab", "cdef" }, "", 0, 0);
+    defer menu.deinit();
+    try menu.describe(&.{ "first", "" });
+    menu.selected = 0;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // Fifteen usable columns: one column.
+    _ = draw(&out.writer, &menu, 16, 4);
+    try testing.expectEqualStrings("\r\n\x1b[7mab  \x1b[2m(first)\x1b[0m\r\ncdef", out.written());
+}
+
+test "draw cuts a long description to the screen" {
+    var menu = try Menu.init(testing.allocator, &.{ "ab", "cd" }, "", 0, 0);
+    defer menu.deinit();
+    try menu.describe(&.{ "a long description here", "" });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    _ = draw(&out.writer, &menu, 20, 4);
+    try testing.expectEqualStrings("\r\nab  \x1b[2m(a long descr…)\x1b[0m\r\ncd", out.written());
+}
+
+test "a narrow screen drops descriptions before cutting names" {
+    var menu = try Menu.init(testing.allocator, &.{ "ab", "cd" }, "", 0, 0);
+    defer menu.deinit();
+    try menu.describe(&.{ "first", "second" });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // Nine usable columns: room for both names side by side, not for a
+    // useful part of a description.
     _ = draw(&out.writer, &menu, 10, 4);
-    try testing.expectEqualStrings("\r\nab  \x1b[2m(fi…)\x1b[0m\r\ncd", out.written());
+    try testing.expectEqualStrings("\r\nab  cd", out.written());
+}
+
+test "describe copies the descriptions and tolerates a short list" {
+    var menu = try Menu.init(testing.allocator, &.{ "a", "b", "c" }, "", 0, 0);
+    defer menu.deinit();
+    var text = [_]u8{ 'x', 'y' };
+    try menu.describe(&.{&text});
+    text[0] = 'z';
+    try testing.expectEqualStrings("xy", menu.items[0].description);
+    try testing.expectEqualStrings("", menu.items[2].description);
 }

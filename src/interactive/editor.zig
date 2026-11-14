@@ -1781,6 +1781,9 @@ pub const Editor = struct {
         // `handleMenuKey` while it is open.
         self.closeMenu();
         self.menu = pager.Menu.init(self.sh.gpa, result.items, self.buf.items, result.start, self.cursor) catch return;
+        // Descriptions are only worked out (and stat'ed) for a menu.
+        const descriptions = complete.describe(self.sh, arena, result) catch &.{};
+        self.menu.?.describe(descriptions) catch {};
     }
 
     fn closeMenu(self: *Editor) void {
