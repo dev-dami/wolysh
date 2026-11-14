@@ -31,7 +31,7 @@ pub const gap = 2;
 /// Most columns a layout uses; a cell is at least one column plus the gap.
 pub const max_columns = 128;
 /// The menu never takes fewer rows than this (screen permitting) nor more
-/// than a third of the screen.
+/// than half the screen.
 pub const min_rows = 4;
 /// Descriptions are shown only when at least this many columns of each are
 /// left beside the widest label; otherwise they are dropped so no name is cut.
@@ -223,9 +223,9 @@ pub fn layoutDescribed(labels: []const usize, descriptions: ?[]const usize, avai
 /// Most rows the menu may use on a screen of `screen_rows` when the command
 /// line already takes `command_rows`. Zero when there is no room at all.
 pub fn maxRows(screen_rows: usize, command_rows: usize) usize {
-    const third = @max(screen_rows / 3, min_rows);
+    const half = @max(screen_rows / 2, min_rows);
     const room = if (screen_rows > command_rows) screen_rows - command_rows else 0;
-    return @min(third, room);
+    return @min(half, room);
 }
 
 pub const Window = struct {
@@ -278,13 +278,14 @@ const reset = "\x1b[0m";
 /// Writes the menu rows, each preceded by "\r\n", for a screen `width`
 /// columns wide and at most `limit` rows. Updates `menu.scroll` and
 /// `menu.rows`. Returns the number of rows written.
-pub fn draw(writer: *std.Io.Writer, menu: *Menu, width: usize, limit: usize) usize {
-    if (menu.items.len == 0 or limit == 0 or width < 2) return 0;
+/// How the menu is laid out on `width` columns: `draw` and the editor's
+/// row budget (`rowsWanted`) share it, so they always agree.
+const Plan = struct { lay: Layout, described: bool, avail: usize };
+
+fn plan(menu: *const Menu, width: usize, cells: []usize) Plan {
     // One column spare: a row that ends exactly at the margin leaves the
     // terminal in its pending-wrap state, which differs between terminals.
     const avail = width - 1;
-    const cells = menu.gpa.alloc(usize, menu.items.len * 2) catch return 0;
-    defer menu.gpa.free(cells);
     const labels = cells[0..menu.items.len];
     const descriptions = cells[menu.items.len..];
     // The widest label that has a description, and the widest description.
@@ -301,7 +302,25 @@ pub fn draw(writer: *std.Io.Writer, menu: *Menu, width: usize, limit: usize) usi
     // would leave them too little room: names matter more.
     const described = widest_description > 0 and
         (widest_label + gap + widest_description <= avail or widest_label + gap + 2 + min_description <= avail);
-    const lay = layoutDescribed(labels, if (described) descriptions else null, avail);
+    return .{ .lay = layoutDescribed(labels, if (described) descriptions else null, avail), .described = described, .avail = avail };
+}
+
+/// Rows the menu needs to list every item on `width` columns.
+pub fn rowsWanted(menu: *const Menu, width: usize) usize {
+    if (menu.items.len == 0 or width < 2) return 0;
+    const cells = menu.gpa.alloc(usize, menu.items.len * 2) catch return min_rows;
+    defer menu.gpa.free(cells);
+    return plan(menu, width, cells).lay.rows;
+}
+
+pub fn draw(writer: *std.Io.Writer, menu: *Menu, width: usize, limit: usize) usize {
+    if (menu.items.len == 0 or limit == 0 or width < 2) return 0;
+    const cells = menu.gpa.alloc(usize, menu.items.len * 2) catch return 0;
+    defer menu.gpa.free(cells);
+    const p = plan(menu, width, cells);
+    const lay = p.lay;
+    const described = p.described;
+    const avail = p.avail;
     menu.rows = lay.rows;
     const selected_row = if (menu.selected) |s| s % lay.rows else null;
     const win = window(lay.rows, limit, selected_row, menu.scroll);
@@ -418,8 +437,8 @@ test "window keeps the selection in view with a more row" {
     try testing.expectEqual(Window{ .first = 0, .shown = 0, .more = true }, window(10, 1, 3, 0));
 }
 
-test "maxRows takes a third of the screen, at least a few rows" {
-    try testing.expectEqual(@as(usize, 8), maxRows(24, 1));
+test "maxRows takes half the screen, at least a few rows" {
+    try testing.expectEqual(@as(usize, 12), maxRows(24, 1));
     try testing.expectEqual(@as(usize, 4), maxRows(9, 1));
     try testing.expectEqual(@as(usize, 2), maxRows(9, 7));
     try testing.expectEqual(@as(usize, 0), maxRows(5, 9));

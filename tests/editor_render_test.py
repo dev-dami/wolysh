@@ -5,7 +5,9 @@ wsh runs in a pty of a fixed size; a small VT100 emulator (below) applies
 its output to a character grid, and the tests compare the grid and the
 cursor with what the user should see. The emulator does only what the
 editor emits: text with deferred autowrap (wide characters wrap whole),
-CR, LF, BS and the CSI cursor, erase and SGR sequences."""
+CR, LF, BS and the CSI cursor, erase and SGR sequences. A resize either
+cuts rows as xterm does or re-wraps the text the way reflowing terminals
+(VTE, kitty, iTerm2, Windows Terminal) do."""
 import fcntl
 import os
 import pty
@@ -39,9 +41,12 @@ def cell_width(ch):
 
 
 class Screen:
-    def __init__(self, cols, rows):
+    def __init__(self, cols, rows, reflow=False):
         self.cols, self.rows = cols, rows
+        self.reflow = reflow
         self.grid = [[" "] * cols for _ in range(rows)]
+        # wrapped[r]: row r continues on row r + 1 (the text wrapped there).
+        self.wrapped = [False] * rows
         self.x = self.y = 0
         self.pending_wrap = False
         self.state = "text"
@@ -49,20 +54,81 @@ class Screen:
         self.utf8 = b""
 
     def resize(self, cols, rows):
-        """Like xterm: no reflow; rows are cut or padded."""
+        if self.reflow:
+            self.reflow_to(cols, rows)
+            return
+        # Like xterm: no reflow; rows are cut or padded.
         self.grid = [(r + [" "] * cols)[:cols] for r in self.grid]
         while len(self.grid) > rows and self.y >= rows:
             self.grid.pop(0)
+            self.wrapped.pop(0)
             self.y -= 1
         self.grid = self.grid[:rows] + [[" "] * cols for _ in range(rows - len(self.grid))]
+        self.wrapped = [False] * rows
         self.cols, self.rows = cols, rows
         self.x = min(self.x, cols - 1)
+        self.pending_wrap = False
+
+    def reflow_to(self, cols, rows):
+        """Re-wraps each logical line (rows joined by autowrap) at the new
+        width, keeping the cursor on its character, as VTE and kitty do.
+        Blank rows below the cursor are dropped and the top scrolls away
+        when the text no longer fits."""
+        lines, cursor = [], None
+        current = []
+        for r in range(self.rows):
+            if r == self.y:
+                cursor = (len(lines), len([c for c in current if c != ""]) + sum(
+                    1 for c in self.grid[r][:self.x] if c != ""))
+            current += self.grid[r]
+            if not self.wrapped[r]:
+                lines.append(current)
+                current = []
+        if current:
+            lines.append(current)
+        lines = [[c for c in line if c != ""] for line in lines]
+        lines = [line[:len("".join(line).rstrip())] for line in lines]
+        # The cursor may sit on blanks past the end of its line.
+        lines[cursor[0]] += [" "] * (cursor[1] - len(lines[cursor[0]]))
+        while len(lines) > cursor[0] + 1 and not lines[-1]:
+            lines.pop()
+        grid, wrapped, y, x = [], [], 0, 0
+        for index, line in enumerate(lines):
+            row, col = [], 0
+            for i, ch in enumerate(line + [None]):
+                if index == cursor[0] and i == cursor[1]:
+                    if col >= cols:
+                        grid.append(row + [" "] * (cols - len(row)))
+                        wrapped.append(True)
+                        row, col = [], 0
+                    y, x = len(grid), col
+                if ch is None:
+                    break
+                w = cell_width(ch)
+                if col + w > cols:
+                    grid.append(row + [" "] * (cols - len(row)))
+                    wrapped.append(True)
+                    row, col = [], 0
+                row.append(ch)
+                if w == 2:
+                    row.append("")
+                col += w
+            grid.append(row + [" "] * (cols - len(row)))
+            wrapped.append(False)
+        drop = max(0, min(len(grid) - rows, y))
+        grid, wrapped, y = grid[drop:][:rows], wrapped[drop:][:rows], y - drop
+        grid += [[" "] * cols for _ in range(rows - len(grid))]
+        wrapped += [False] * (rows - len(wrapped))
+        self.grid, self.wrapped, self.cols, self.rows = grid, wrapped, cols, rows
+        self.y, self.x = y, min(x, cols - 1)
         self.pending_wrap = False
 
     def line_feed(self):
         if self.y == self.rows - 1:
             self.grid.pop(0)
             self.grid.append([" "] * self.cols)
+            self.wrapped.pop(0)
+            self.wrapped.append(False)
         else:
             self.y += 1
 
@@ -71,8 +137,10 @@ class Screen:
         if w == 0:
             return
         if self.pending_wrap or self.x + w > self.cols:
+            self.wrapped[self.y] = True
             self.x = 0
             self.line_feed()
+            self.wrapped[self.y] = False
         self.pending_wrap = False
         self.grid[self.y][self.x] = ch
         if w == 2:
@@ -106,8 +174,10 @@ class Screen:
                 self.grid[self.y][self.x:] = [" "] * (self.cols - self.x)
                 for r in range(self.y + 1, self.rows):
                     self.grid[r] = [" "] * self.cols
+                self.wrapped[self.y:] = [False] * (self.rows - self.y)
             else:
                 self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                self.wrapped = [False] * self.rows
         elif final == "K":
             self.grid[self.y][self.x:] = [" "] * (self.cols - self.x)
         if final != "m":
@@ -167,7 +237,7 @@ class Screen:
 class Term:
     """wsh in a pty, with an empty config and the given history."""
 
-    def __init__(self, cols=20, rows=8, config="", history=None):
+    def __init__(self, cols=20, rows=8, config="", history=None, reflow=False, files=()):
         self.tmp = tempfile.TemporaryDirectory(prefix="wsh-render-")
         env = {k: v for k, v in os.environ.items() if not k.startswith("WSH")}
         env.update(TERM="xterm-256color", HOME=self.tmp.name, PS1="$ ",
@@ -182,7 +252,9 @@ class Term:
                 f.write("#wsh-history v2\n")
                 for entry in history:
                     f.write(entry.replace("\\", "\\\\").replace("\n", "\\n") + "\n")
-        self.screen = Screen(cols, rows)
+        for name in files:
+            open(os.path.join(self.tmp.name, name), "w").close()
+        self.screen = Screen(cols, rows, reflow)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(self.tmp.name)
@@ -395,6 +467,107 @@ class EditorRenderTests(unittest.TestCase):
         t.type("a")
         t.send(ESC)
         self.expect(t, ["$ if true {", "  …   echo a", "  … }"], (1, 11))
+
+    def test_vertical_moves_keep_the_column_through_a_short_line(self):
+        t = self.term()
+        t.type("if true {\recho abcdefghij\rx\recho abcdefghij")
+        lines = ["$ if true {", "  … echo abcdefghij", "  … x", "  … echo abcdefghij"]
+        self.expect(t, lines, (3, 19))
+        t.send(UP)
+        self.expect(t, lines, (2, 5))
+        t.send(UP)
+        self.expect(t, lines, (1, 19))
+        t.send(DOWN)
+        t.send(DOWN)
+        self.expect(t, lines, (3, 19))
+        # A horizontal move sets a new goal column.
+        t.send(LEFT * 3)
+        t.send(UP)
+        t.send(UP)
+        self.expect(t, lines, (1, 16))
+
+    def test_vi_j_and_k_keep_the_column_through_a_short_line(self):
+        t = self.term(config="set -o vi\n")
+        t.type("if true {\recho abcdefghij\rx\recho abcdefghij")
+        lines = ["$ if true {", "  … echo abcdefghij", "  … x", "  … echo abcdefghij"]
+        t.send(ESC)
+        self.expect(t, lines, (3, 18))
+        t.send(b"k")
+        self.expect(t, lines, (2, 4))
+        t.send(b"k")
+        self.expect(t, lines, (1, 18))
+        t.send(b"j")
+        t.send(b"j")
+        self.expect(t, lines, (3, 18))
+        # An edit sets a new goal column.
+        t.send(b"0")
+        t.send(b"x")
+        t.send(b"k")
+        t.send(b"k")
+        self.expect(t, lines[:1] + ["  … echo abcdefghij", "  … x", "  … cho abcdefghij"], (1, 4))
+
+    def test_a_bound_command_prints_right_below_a_full_width_line(self):
+        t = self.term(config="bind -x '\"\\C-t\": echo hi'\n")
+        t.type("echo " + "a" * 13)
+        t.send(b"\x14")
+        self.expect(t, ["$ echo " + "a" * 13, "hi", "$ echo " + "a" * 13, ""], (3, 0))
+
+    def resized(self, reflow, cols, new_cols, keys, expected, files=()):
+        """Types `keys` on a `cols` wide screen below some earlier output,
+        resizes it to `new_cols` and checks the frame reads `expected` once,
+        with no stale copy of the prompt or the command left anywhere.
+        Neither kind of terminal can be told from the other, so the redraw
+        starts as high as either needs: when the guess is wrong the row of
+        output above the prompt is given up instead of leaving a stale one."""
+        t = self.term(cols=cols, rows=12, reflow=reflow, files=files)
+        t.type("echo marker")
+        t.send(ENTER)
+        for key in keys:
+            t.type(key) if isinstance(key, str) else t.send(key)
+        t.resize(new_cols, 12)
+        t.settle(0.3)
+        lines = t.screen.lines()
+        mode = "reflow" if reflow else "xterm"
+        where = f"{mode} {cols} -> {new_cols}\n" + t.screen.dump()
+        self.assertEqual(sum(1 for line in lines if line.startswith("$ ")), 2, where)
+        if reflow == (new_cols < cols):
+            self.assertIn("marker", lines, where)
+        expected = [line.rstrip() for line in expected]
+        start = next(i for i, line in enumerate(lines) if line.startswith("$ ") and "marker" not in line)
+        self.assertEqual(lines[start:start + len(expected)], expected, where)
+        self.assertEqual([line for line in lines[start + len(expected):] if line], [], where)
+        return t
+
+    def test_resize_redraws_a_wrapped_command_once(self):
+        text = "printf zzzzzzzzzz zzzzzzzzzz zzzzzzzzzz zzzzzzzzz"
+        line = "$ " + text
+        for reflow in (False, True):
+            with self.subTest(reflow=reflow, to="narrower"):
+                self.resized(reflow, 30, 20, [text], [line[i:i + 20] for i in range(0, len(line), 20)])
+            with self.subTest(reflow=reflow, to="wider"):
+                self.resized(reflow, 20, 30, [text], [line[i:i + 30] for i in range(0, len(line), 30)])
+
+    def test_resize_redraws_a_multiline_command_once(self):
+        keys = ["if true {", ENTER, "echo zzzzzzzzzzzzzzzzzzzz", ENTER, "echo z"]
+        narrow = ["$ if true {", "  … echo zzzzzzzzzzz", "zzzzzzzzz", "  … echo z"]
+        wide = ["$ if true {", "  … echo zzzzzzzzzzzzzzzzzzzz", "  … echo z"]
+        for reflow in (False, True):
+            with self.subTest(reflow=reflow, to="narrower"):
+                self.resized(reflow, 30, 20, keys, narrow)
+            with self.subTest(reflow=reflow, to="wider"):
+                self.resized(reflow, 20, 30, keys, wide)
+
+    def test_resize_redraws_an_open_menu_once(self):
+        files = ("apple", "apricot", "avocado")
+        keys = ["cat " + "z" * 20 + " a", b"\t", b"\t"]
+        for reflow in (False, True):
+            for cols, new_cols in ((40, 20), (20, 40)):
+                with self.subTest(reflow=reflow, cols=cols, new_cols=new_cols):
+                    line = "$ cat " + "z" * 20 + " apple"
+                    rows = [line[i:i + new_cols] for i in range(0, len(line), new_cols)]
+                    t = self.resized(reflow, cols, new_cols, keys, rows + ["apple    avocado", "apricot"]
+                                     if new_cols == 20 else rows + ["apple  apricot  avocado"], files)
+                    self.assertEqual("\n".join(t.screen.lines()).count("avocado"), 1, t.screen.dump())
 
 
 if __name__ == "__main__":

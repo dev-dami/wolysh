@@ -23,7 +23,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   printing every candidate into the scrollback. Tab, Shift-Tab and the arrow
   keys move a highlighted selection that replaces the word as it moves, Enter
   keeps it, and Esc or `Ctrl-G` restores the typed word. The menu fits the
-  terminal width, is capped at about a third of the screen with an
+  terminal width, is capped at half the screen with an
   "…and N more" row, and is erased as soon as another key is pressed, so a
   second Tab no longer prints the list again.
 - Completing a command name no longer offers plain files such as
@@ -76,6 +76,22 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   documentation says.
 - Esc and the arrow keys end a Ctrl-R search on the match and keep it for
   editing, as in Bash, instead of dropping it.
+- The completion menu stays visible when a multi-line command fills the
+  screen: the command scrolls to keep the cursor's line and a few menu rows
+  in view, so Tab no longer changes the word with no menu shown. On a
+  screen under four rows Tab rings the bell instead of opening the menu.
+- Output from a `bind -x` command or Ctrl-X Ctrl-E starts right below a
+  command whose last line exactly fills the terminal width, without a blank
+  line in between.
+- Up and Down, and `j` and `k` in vi mode, remember the column they started
+  from, so moving through a shorter line no longer loses it, as in vim. Any
+  other move or an edit sets a new column.
+- Resizing the terminal no longer leaves a stale copy of the prompt behind
+  on terminals that re-wrap text when resized (GNOME Terminal and other VTE
+  terminals, kitty, iTerm2, Windows Terminal), and still works on terminals
+  that do not (xterm). Since the two cannot be told apart, the redraw starts
+  as high as either kind needs, which may clear a line or two of earlier
+  output just above the prompt.
 
 ## [0.6.0] - 2026-10-31
 
