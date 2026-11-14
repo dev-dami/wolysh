@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Alt-Enter inserts a new line without running the command.
+
 ### Changed
 
 - An ambiguous Tab opens a completion menu below the command line instead of
@@ -37,6 +41,32 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   error.
 - Shells sharing a history file take turns changing it. Before, a shell
   trimming the file could drop a command another shell had just saved.
+- Editing multi-line and wrapped commands draws correctly:
+  - Up and Down move one screen row at a time through a wrapped line,
+    keeping the column, and reach history only from the first or last row.
+    After recalling a multi-line command, Up goes on to the one before it
+    instead of climbing through its lines.
+  - Wide characters (CJK, emoji) at the right edge no longer put the cursor
+    one column off.
+  - With the cursor at the end of a line that exactly fills the width, the
+    cursor no longer appears at the start of the next line.
+  - A command taller than the terminal scrolls with the cursor instead of
+    redrawing lines twice and losing the cursor off the top.
+  - Ctrl-C with the cursor on an earlier line keeps the later lines on
+    screen, and `^C` appears after the whole command.
+  - A command that exactly fills the width is no longer followed by a blank
+    line before its output.
+  - Continuation prompts indent by how deeply the command is nested, not by
+    line number.
+  - Ctrl-L redraws every line of a multi-line prompt.
+- Home, End, Ctrl-A, Ctrl-E, Ctrl-K and Ctrl-U act on the current line of a
+  multi-line command. At the start or end of a line, Ctrl-U and Ctrl-K join it
+  to the line before or after. In vi mode, `j` and `k` move between lines,
+  and `0`, `^`, `$`, `I`, `A`, `D` and `C` act on the current line.
+- End and Ctrl-E at the end of the line accept the grey suggestion, as the
+  documentation says.
+- Esc and the arrow keys end a Ctrl-R search on the match and keep it for
+  editing, as in Bash, instead of dropping it.
 
 ## [0.6.0] - 2026-10-31
 
