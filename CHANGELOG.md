@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-14
+
 ### Added
 
 - Alt-Enter inserts a new line without running the command.
@@ -29,7 +31,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Completing a command name no longer offers plain files such as
   `README.md`, which cannot run. Directories are still offered, and inside a
   directory (`./`) so are executables, as fish does.
-
 - Inline suggestions rank history by context. Among commands that start with
   what you typed, wsh prefers one entered in the current directory right after
   the command you just ran, then one entered in the current directory, then the
@@ -379,7 +380,8 @@ POSIX drop-in; [docs/language.md](docs/language.md) lists what remains missing.
   the `zig build test` aggregator and now run.
 - `CHANGELOG.md` and `.editorconfig` added.
 
-[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/dev-dami/wolysh/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/dev-dami/wolysh/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dev-dami/wolysh/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dev-dami/wolysh/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dev-dami/wolysh/compare/v0.4.0...v0.4.1
