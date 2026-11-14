@@ -478,6 +478,34 @@ class MenuTests(unittest.TestCase):
         sh.send(ESC)
         self.assertScreen(sh, self.menu_rows(sh) == [], "the menu closes after a resize")
 
+    def test_menu_shows_when_the_command_fills_the_screen(self):
+        sh = self.start(cols=40, rows=8)
+        sh.type("if true {")
+        for i in range(8):
+            sh.send(ENTER)
+            sh.type(f"echo {i}")
+        sh.send(ENTER)
+        self.open_menu(sh)
+        self.assertScreen(sh, sh.lines()[sh.screen.y].endswith("cat a"), "the cursor's line stays in view")
+        below = " ".join(self.menu_rows(sh))
+        for name in ("apple", "apricot", "avocado"):
+            self.assertScreen(sh, name in below, f"{name} is listed below the line")
+        sh.send(TAB)
+        self.assertScreen(sh, sh.lines()[sh.screen.y].endswith("cat apple"), "Tab puts the first name in")
+        self.assertScreen(sh, sh.screen.reversed_text() == ["apple"], "the selection is visible")
+        sh.send(ESC)
+        self.assertScreen(sh, self.menu_rows(sh) == [], "the menu closes")
+        self.assertScreen(sh, sh.lines()[-1].endswith("cat a"), "the command fills the screen again")
+        self.assertScreen(sh, sh.lines()[0].endswith("echo 1"), "the window shows the rows above again")
+
+    def test_tiny_screen_rings_the_bell_instead_of_a_menu(self):
+        sh = self.start(cols=40, rows=3)
+        self.open_menu(sh)
+        self.assertScreen(sh, sh.lines()[sh.screen.y] == "$ cat a", "the word is unchanged")
+        self.assertScreen(sh, self.menu_rows(sh) == [], "no menu opens")
+        sh.send(TAB)
+        self.assertScreen(sh, sh.lines()[sh.screen.y] == "$ cat a", "Tab does not change the word unseen")
+
 
 if __name__ == "__main__":
     unittest.main()

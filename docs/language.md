@@ -153,7 +153,7 @@ run exited non-zero is suggested only when no successful command matches.
 
 | Key | Action |
 | --- | --- |
-| Up / Down | Move up or down a screen row; browse history from the first or last row |
+| Up / Down | Move up or down a screen row, keeping the column; browse history from the first or last row |
 | `Ctrl-P` / `Ctrl-N` | Browse history |
 | `Ctrl-R` | Search history (Esc or an arrow key keeps the match for editing) |
 | Tab | Complete commands, paths, and variables; open the completion menu |
@@ -179,7 +179,9 @@ ends with an "…and N more" row when the list is longer. While it is open:
 
 The selected candidate replaces the word in the line as you move. Enter with
 nothing selected closes the menu and runs the line. The menu is redrawn in
-place and erased when it closes, so it never stays in the scrollback.
+place and erased when it closes, so it never stays in the scrollback. When the
+command fills the screen, it scrolls to keep the cursor's line and a few rows
+of the menu in view. A screen under four rows has no menu: Tab rings the bell.
 
 `jobs`, `fg`, `bg`, and `wait` support `%1`, `%+`, and command prefixes.
 Foreground jobs receive the terminal and run in their own process groups.

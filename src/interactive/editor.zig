@@ -65,9 +65,12 @@ pub const Outcome = enum { handled, accept, cancel, eof };
 
 /// What the previous key did; consecutive kills append to one kill-ring
 /// entry, Alt-Y only follows a yank, and typed characters undo as a group.
-pub const Command = enum { other, insert, kill, yank, yank_arg, undo };
+pub const Command = enum { other, insert, kill, yank, yank_arg, undo, vertical };
 
 const kill_ring_max = 16;
+/// The fewest screen rows the completion menu opens on: one for the
+/// cursor's row and the rest for the menu.
+const menu_screen_min = 4;
 const undo_max = 256;
 
 /// Display width of `text` in terminal columns, ignoring ANSI escape
@@ -228,6 +231,47 @@ fn writeRows(out: *std.Io.Writer, frame: []const u8, width: usize, first: usize,
     }
 }
 
+/// The row the cursor is on, counted from the top of `drawn` (the bytes of
+/// a frame drawn `old_width` columns wide, with the cursor left at
+/// `cursor`), after a terminal that reflows on resize re-wraps it at
+/// `new_width`: each logical line (text between line feeds, joined across
+/// its wrapped rows) takes as many rows as its width needs, and the cursor
+/// keeps its place in its line. VTE, kitty, iTerm2 and Windows Terminal
+/// reflow like this; xterm leaves the rows as they were.
+fn reflowedCursorRow(drawn: []const u8, old_width: usize, new_width: usize, cursor: Pos) usize {
+    const new_w = @max(new_width, 1);
+    var pos: Pos = .{};
+    var line_top: usize = 0;
+    var line_cols: usize = 0;
+    var rows_before: usize = 0;
+    var i: usize = 0;
+    while (true) {
+        const at_end = i >= drawn.len;
+        if (at_end or drawn[i] == '\n') {
+            // The cursor is on this line when the next one starts below it.
+            if (at_end or pos.row >= cursor.row) {
+                const offset = (cursor.row -| line_top) * old_width + cursor.col;
+                return rows_before + offset / new_w;
+            }
+            rows_before += @max((line_cols + new_w - 1) / new_w, 1);
+            pos = .{ .row = pos.row + 1 };
+            line_top = pos.row;
+            line_cols = 0;
+            i += 1;
+            continue;
+        }
+        if (drawn[i] == '\r') {
+            pos.col = 0;
+            i += 1;
+            continue;
+        }
+        const step = layoutStep(pos, drawn, i, old_width, .prompt);
+        pos = step.pos;
+        i = step.next;
+        line_cols = @max(line_cols, (pos.row - line_top) * old_width + pos.col);
+    }
+}
+
 /// Word characters for the readline word commands (Alt-F/B/D, Alt-U/L/C):
 /// letters and digits, and every byte of a multi-byte character.
 fn isWordByte(c: u8) bool {
@@ -314,9 +358,20 @@ pub const Editor = struct {
     command_frame_active: bool = false,
     command_cursor_row: usize = 0,
     command_end_row: usize = 0,
-    /// The frame's last line filled its last row, so the cursor at the end
-    /// is already on the row below it.
-    end_wrapped: bool = false,
+    /// How the frame on screen was drawn, for a redraw after a resize: the
+    /// width, whether `body` (a window of rows) or `frame` holds the bytes,
+    /// and the cursor's cell counted from the top of what was drawn.
+    drawn_width: usize = 0,
+    drawn_window: bool = false,
+    drawn_cursor: Pos = .{},
+    /// The frame ends on a row of its own below its last line (that line
+    /// filled its last row), so output after the frame starts right there.
+    end_fresh: bool = false,
+    /// The screen column Up / Down and vi j / k aim for, kept across a run
+    /// of vertical moves so a short row on the way does not lose it, as vim
+    /// does; `goal_at` is where the last vertical move left the cursor.
+    goal_col: ?usize = null,
+    goal_at: usize = 0,
     /// Set when the last line was cancelled with Ctrl-C.
     interrupted: bool = false,
     /// Set when `term.wake_fd` ended the last edit. The line is kept, and
@@ -394,6 +449,7 @@ pub const Editor = struct {
         self.command_end_row = 0;
         self.view_top = 0;
         self.hints = true;
+        self.goal_col = null;
         self.pending_byte = null;
         self.last = .other;
         self.ctrl_x = false;
@@ -476,7 +532,7 @@ pub const Editor = struct {
                     // A line that filled the last row already moved the
                     // cursor to a fresh row; another newline would leave a
                     // blank line before the output.
-                    const below: usize = if (self.end_wrapped) 0 else 1;
+                    const below: usize = if (self.end_fresh) 0 else 1;
                     if (below == 1) self.write("\r\n");
                     if (is_complete) |check| {
                         if (!check(self.buf.items)) {
@@ -613,6 +669,12 @@ pub const Editor = struct {
             self.handleInsertKey(key);
 
         self.recordUndo(before_cursor);
+        // Any other move or an edit ends the run of vertical moves.
+        if (self.this_command == .vertical) {
+            self.goal_at = self.cursor;
+        } else if (self.cursor != self.goal_at or !std.mem.eql(u8, self.before.items, self.buf.items)) {
+            self.goal_col = null;
+        }
         self.last = self.this_command;
         return outcome;
     }
@@ -997,6 +1059,7 @@ pub const Editor = struct {
     /// the terminal cannot move the cursor above its top row to redraw it.
     fn renderFrame(self: *Editor, prompt_text: []const u8, text: []const u8, cursor: usize, decoration: Decoration) void {
         self.updateWidth();
+        if (self.command_frame_active and self.width != self.drawn_width) self.climbAfterResize();
         self.frame.writer.end = 0;
         const width = self.width;
 
@@ -1045,7 +1108,7 @@ pub const Editor = struct {
             // move to the next row so the row arithmetic holds.
             const room = pos.col >= width and (line_end == text.len or cursor == line_end);
             if (room) self.frame.writer.writeAll("\r\n") catch {};
-            self.end_wrapped = room;
+            self.end_fresh = room;
             end = if (room) pos.settled(width) else pos;
             if (line_end == text.len) break;
             self.frame.writer.writeAll("\r\n") catch {};
@@ -1062,20 +1125,31 @@ pub const Editor = struct {
         // A final frame (hints off: the line was submitted or cancelled) is
         // drawn whole, so all of it reaches the scrollback.
         const screen_rows = @max(self.height, 1);
+        // A screen too small for a menu (it shrank while one was open)
+        // keeps the selected word and drops the menu.
+        if (self.menu != null and screen_rows < menu_screen_min) self.closeMenu();
+        // While the menu is open it always keeps a few rows: the command is
+        // windowed around the cursor in what is left, so a command that
+        // fills the screen never hides the menu that Tab is cycling.
+        const menu_open = decoration == .full and self.menu != null;
+        const menu_room = if (menu_open) @min(pager.min_rows, screen_rows - 1, self.menuRowsWanted()) else 0;
+        const command_screen = screen_rows - menu_room;
         var first: usize = 0;
         var last = end.row;
-        if (self.hints and end.row >= screen_rows) {
-            first = @min(self.view_top, end.row + 1 - screen_rows);
+        if (self.hints and end.row >= command_screen) {
+            first = @min(self.view_top, end.row + 1 - command_screen);
             if (cursor_cell.row < first) first = cursor_cell.row;
-            if (cursor_cell.row >= first + screen_rows) first = cursor_cell.row + 1 - screen_rows;
-            last = first + screen_rows - 1;
+            if (cursor_cell.row >= first + command_screen) first = cursor_cell.row + 1 - command_screen;
+            last = first + command_screen - 1;
         }
         self.view_top = first;
-        // The completion menu is the frame's last rows, so the next redraw
-        // repaints or clears it like the rest of the frame. A command taller
-        // than the screen leaves it no room.
+        // The completion menu is the frame's last rows, below the rows on
+        // screen, so the next redraw repaints or clears it like the rest of
+        // the frame.
+        const command_len = self.frame.writer.end;
         var menu_rows: usize = 0;
-        if (decoration == .full and first == 0 and last == end.row) menu_rows = self.writeMenuRows(end.row + 1);
+        if (menu_open) menu_rows = self.writeMenuRows(last - first + 1);
+        self.end_fresh = self.end_fresh and last == end.row and menu_rows == 0;
 
         self.write("\r");
         if (self.command_frame_active and self.command_cursor_row > 0) {
@@ -1084,16 +1158,21 @@ pub const Editor = struct {
             self.write(sequence);
         }
         self.write("\x1b[J");
-        if (first == 0 and last == end.row) {
+        self.drawn_width = width;
+        self.drawn_window = !(first == 0 and last == end.row);
+        if (!self.drawn_window) {
             self.write(self.frame.writer.buffered());
         } else {
+            const frame = self.frame.writer.buffered();
             self.body.writer.end = 0;
-            writeRows(&self.body.writer, self.frame.writer.buffered(), width, first, last);
+            writeRows(&self.body.writer, frame[0..command_len], width, first, last);
+            tryWrite(&self.body.writer, frame[command_len..]);
             self.write(self.body.writer.buffered());
         }
 
         // Rows are counted from the top of what was drawn from here on.
         const cursor_row = cursor_cell.row - first;
+        self.drawn_cursor = .{ .row = cursor_row, .col = cursor_cell.col };
         var end_row = last - first + menu_rows;
         self.write("\r");
         var scratch: [64]u8 = undefined;
@@ -1121,6 +1200,20 @@ pub const Editor = struct {
         self.command_end_row = end_row;
     }
 
+    /// The width changed since the frame was drawn. A terminal that reflows
+    /// re-wrapped the frame's lines at the new width, one that does not (xterm)
+    /// kept its rows, and nothing tells the two apart. Climb to whichever top
+    /// row is higher, so no stale copy of the prompt is left above the
+    /// redraw: the reflowed count when narrower (lines take more rows), the
+    /// drawn count when wider (wrapped lines took more rows). The cost is
+    /// that the other kind of terminal loses as many rows of earlier output
+    /// above the prompt as the two counts differ.
+    fn climbAfterResize(self: *Editor) void {
+        const drawn = if (self.drawn_window) self.body.writer.buffered() else self.frame.writer.buffered();
+        const reflowed = reflowedCursorRow(drawn, self.drawn_width, self.width, self.drawn_cursor);
+        self.command_cursor_row = @max(self.command_cursor_row, reflowed);
+    }
+
     /// Moves below the current frame so output can follow it; the next render
     /// starts a fresh frame there.
     fn leaveFrame(self: *Editor) void {
@@ -1129,7 +1222,9 @@ pub const Editor = struct {
             const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}B", .{self.command_end_row - self.command_cursor_row}) catch "";
             self.write(sequence);
         }
-        self.write("\r\n");
+        // A last line that filled its row already moved to a fresh row, as
+        // when a command is submitted; another newline would leave a blank.
+        self.write(if (self.command_frame_active and self.end_fresh) "\r" else "\r\n");
         self.command_frame_active = false;
         self.command_cursor_row = 0;
     }
@@ -1397,6 +1492,7 @@ pub const Editor = struct {
         }
         if (self.verticalTarget(direction)) |target| {
             self.cursor = target;
+            self.this_command = .vertical;
         } else if (direction < 0) {
             self.historyPrev();
         } else {
@@ -1411,11 +1507,14 @@ pub const Editor = struct {
         return std.mem.eql(u8, self.buf.items, self.sh.hist.get(index));
     }
 
-    /// The offset one screen row up or down from the cursor at the same
+    /// The offset one screen row up or down from the cursor at the goal
     /// column (or the nearest one the row has), or null on the first or last
-    /// row of the line.
+    /// row of the line. The goal is the cursor's column unless a run of
+    /// vertical moves set it earlier (see `handleKey`).
     pub fn verticalTarget(self: *Editor, direction: i8) ?usize {
-        const here = self.cellOf(self.cursor);
+        var here = self.cellOf(self.cursor);
+        if (self.goal_col) |col| here.col = col;
+        self.goal_col = here.col;
         var walk: Walk = .init(self, self.prompt_text, self.buf.items, self.cursor);
         defer walk.deinit();
         var best: ?usize = null;
@@ -1778,14 +1877,30 @@ pub const Editor = struct {
         }
 
         // Ambiguous: open the menu below the line. Further keys go to
-        // `handleMenuKey` while it is open.
+        // `handleMenuKey` while it is open. A screen with no room for it
+        // only rings the bell, as Bash does before listing.
         self.closeMenu();
+        if (self.height < menu_screen_min) {
+            self.write("\x07");
+            return;
+        }
         self.menu = pager.Menu.init(self.sh.gpa, result.items, self.buf.items, result.start, self.cursor) catch return;
     }
 
     fn closeMenu(self: *Editor) void {
         if (self.menu) |*menu| menu.deinit();
         self.menu = null;
+    }
+
+    /// Rows the open menu needs to list every item on the current width,
+    /// laid out as `pager.draw` lays it out.
+    fn menuRowsWanted(self: *Editor) usize {
+        const menu = &(self.menu orelse return 0);
+        const gpa = self.sh.gpa;
+        const cells = gpa.alloc(usize, menu.items.len) catch return pager.min_rows;
+        defer gpa.free(cells);
+        for (menu.items, cells) |item, *cell| cell.* = pager.cellWidth(item);
+        return pager.layout(cells, self.width -| 1).rows;
     }
 
     /// Writes the menu rows below a frame that has `command_rows` rows and
@@ -2386,4 +2501,19 @@ test "line keys act on the current line of a multi-line command" {
     try testing.expectEqualStrings("if true {one}", ed.buf.items);
     _ = ed.handleKey(.{ .alt = '\r' }); // Alt-Enter splits it again
     try testing.expectEqualStrings("if true {\none}", ed.buf.items);
+}
+
+test "reflowedCursorRow re-wraps each drawn line at the new width" {
+    // "$ " and 48 columns on 30 columns take two rows, with the cursor at
+    // the end on row 1. At 20 columns the cursor is on row 2, at 60 on row 0.
+    const line = "$ " ++ "z" ** 48;
+    try testing.expectEqual(@as(usize, 2), reflowedCursorRow(line, 30, 20, .{ .row = 1, .col = 20 }));
+    try testing.expectEqual(@as(usize, 0), reflowedCursorRow(line, 30, 60, .{ .row = 1, .col = 20 }));
+    // Line feeds keep lines apart; escapes and carriage returns take no
+    // room. The first line fills its row exactly, so the row after it is a
+    // line of its own. At 5 columns the lines take 2, 1 and 1 rows.
+    const frame = "\x1b[1m$ " ++ "a" ** 8 ++ "\x1b[0m\r\n\r\n> bb\r\n> " ++ "c" ** 12;
+    try testing.expectEqual(@as(usize, 4), reflowedCursorRow(frame, 10, 5, .{ .row = 3, .col = 4 }));
+    try testing.expectEqual(@as(usize, 6), reflowedCursorRow(frame, 10, 5, .{ .row = 4, .col = 4 }));
+    try testing.expectEqual(@as(usize, 2), reflowedCursorRow(frame, 10, 5, .{ .row = 1, .col = 0 }));
 }
