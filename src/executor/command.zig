@@ -294,10 +294,25 @@ fn sourceError(sh: *Shell, name: []const u8, reason: []const u8) u8 {
 }
 
 fn builtinEval(sh: *Shell, argv: []const []const u8, run_source: RunSource) u8 {
-    if (argv.len < 2) return 0;
+    // Like Bash, `eval` takes no options but skips one leading `--` and
+    // rejects any other leading `-word` (a lone `-` is an ordinary word).
+    var args = argv[1..];
+    if (args.len != 0) {
+        const first = args[0];
+        if (std.mem.eql(u8, first, "--")) {
+            args = args[1..];
+        } else if (first.len > 1 and first[0] == '-') {
+            var buf: [256]u8 = undefined;
+            const shown = first[0..@min(first.len, 64)];
+            const msg = std.fmt.bufPrint(&buf, "wsh: eval: {s}: invalid option\neval: usage: eval [arg ...]\n", .{shown}) catch "wsh: eval: invalid option\n";
+            sys.writeStr(sh.default_err, msg);
+            return 2;
+        }
+    }
+    if (args.len == 0) return 0;
     const arena = sh.scratch();
     var joined: std.ArrayList(u8) = .empty;
-    for (argv[1..], 0..) |part, index| {
+    for (args, 0..) |part, index| {
         if (index != 0) joined.append(arena, ' ') catch return 1;
         joined.appendSlice(arena, part) catch return 1;
     }

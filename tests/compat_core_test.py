@@ -182,6 +182,19 @@ class CoreCompatTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn(b"missing-file.sh: No such file or directory", result.stderr)
 
+    def test_eval_takes_double_dash_and_rejects_options_like_bash(self):
+        # Starship's bash init is `eval -- "$(starship init bash ...)"`.
+        self.assert_output('eval -- "echo a b"; eval --; echo rc=$?', "a b\nrc=0\n")
+        result = run_shell("eval -- -- echo hi; echo rc=$?")
+        self.assertEqual(result.stdout, b"rc=127\n")
+        for option in ("-x", "-1"):
+            result = run_shell(f"eval {option} echo hi; echo rc=$?")
+            self.assertEqual(result.stdout, b"rc=2\n")
+            self.assertIn(f"eval: {option}: invalid option\neval: usage: eval [arg ...]\n".encode(), result.stderr)
+        # A lone `-` is an ordinary word, as in Bash.
+        result = run_shell("eval - 2>/dev/null; echo rc=$?")
+        self.assertEqual(result.stdout, b"rc=127\n")
+
     # --- 7. cd and pwd ------------------------------------------------------
 
     def make_tree(self, base):
