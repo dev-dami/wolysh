@@ -155,11 +155,28 @@ run exited non-zero is suggested only when no successful command matches.
 | --- | --- |
 | Up / Down | Browse history |
 | `Ctrl-R` | Search history |
-| Tab | Complete commands, paths, and variables |
+| Tab | Complete commands, paths, and variables; open the completion menu |
 | Right / End | Accept suggestion or move right |
 | `Ctrl-A` / `Ctrl-E` | Start / end of line |
 | `Ctrl-C` / `Ctrl-D` | Cancel line / exit on empty input |
 | `Ctrl-Z` | Suspend the foreground job |
+
+When Tab finds several candidates and no longer common prefix to insert, a
+completion menu opens below the command line. It lays the candidates out in
+columns that fit the terminal, takes at most about a third of the screen, and
+ends with an "…and N more" row when the list is longer. While it is open:
+
+| Key | Action |
+| --- | --- |
+| Tab / Shift-Tab, Down / Up | Select the next / previous candidate |
+| Right / Left | Select the candidate in the next / previous column |
+| Enter | Keep the selected candidate and close the menu (the line is not run) |
+| Esc / `Ctrl-G` | Close the menu and put back the word you typed |
+| Any other key | Close the menu, then act as usual |
+
+The selected candidate replaces the word in the line as you move. Enter with
+nothing selected closes the menu and runs the line. The menu is redrawn in
+place and erased when it closes, so it never stays in the scrollback.
 
 `jobs`, `fg`, `bg`, and `wait` support `%1`, `%+`, and command prefixes.
 Foreground jobs receive the terminal and run in their own process groups.

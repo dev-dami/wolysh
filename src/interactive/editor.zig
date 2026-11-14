@@ -25,6 +25,7 @@ const wcwidth = @import("wcwidth.zig");
 const histexpand = @import("histexpand.zig");
 const vi = @import("vi.zig");
 const bindings = @import("bindings.zig");
+const pager = @import("pager.zig");
 
 const Shell = shellmod.Shell;
 pub const IsComplete = *const fn ([]const u8) bool;
@@ -51,6 +52,8 @@ pub const Key = union(enum) {
     page_up,
     page_down,
     paste_start,
+    /// Shift-Tab (`CSI Z`).
+    back_tab,
     resize,
     unknown,
 };
@@ -131,6 +134,7 @@ pub const Editor = struct {
     /// The in-progress line, stashed when history browsing begins.
     stashed: std.ArrayList(u8) = .empty,
     width: usize = 80,
+    height: usize = 24,
     /// Scratch buffers reused between frames.
     body: std.Io.Writer.Allocating,
     frame: std.Io.Writer.Allocating,
@@ -168,6 +172,8 @@ pub const Editor = struct {
     ctrl_x: bool = false,
     quoted_insert: bool = false,
     vi: vi.State = .{},
+    /// The completion menu an ambiguous Tab opened, drawn below the line.
+    menu: ?pager.Menu = null,
 
     const Snapshot = struct { text: []u8, cursor: usize };
 
@@ -194,9 +200,11 @@ pub const Editor = struct {
         self.undo_stack.deinit(gpa);
         self.before.deinit(gpa);
         self.vi.deinit(gpa);
+        self.closeMenu();
     }
 
     fn resetLine(self: *Editor) void {
+        self.closeMenu();
         self.buf.clearRetainingCapacity();
         self.cursor = 0;
         self.hist_index = null;
@@ -402,13 +410,18 @@ pub const Editor = struct {
         }
         // A session request ended the key wait: leave the line exactly as it
         // is (vi's normal mode would otherwise treat the end as a key).
-        if (key == .eof and self.woken) return .eof;
+        if (key == .eof and self.woken) {
+            if (self.menu != null) _ = self.dismissMenu();
+            return .eof;
+        }
         self.before.clearRetainingCapacity();
         self.before.appendSlice(self.sh.gpa, self.buf.items) catch {};
         const before_cursor = self.cursor;
         self.this_command = .other;
 
-        const outcome = if (self.sh.options.vi and self.vi.mode == .normal)
+        const outcome = if (self.menu != null and self.handleMenuKey(key))
+            .handled
+        else if (self.sh.options.vi and self.vi.mode == .normal)
             vi.handleNormal(self, key)
         else
             self.handleInsertKey(key);
@@ -485,7 +498,7 @@ pub const Editor = struct {
             .up => self.moveVertical(-1),
             .down => self.moveVertical(1),
             .paste_start => self.readPaste(),
-            .page_up, .page_down, .resize, .unknown => {},
+            .page_up, .page_down, .back_tab, .resize, .unknown => {},
         }
         return .handled;
     }
@@ -641,8 +654,12 @@ pub const Editor = struct {
     // --- rendering ----------------------------------------------------------
 
     fn updateWidth(self: *Editor) void {
-        if (sys.windowSize(self.out_fd)) |ws| self.width = ws.cols;
+        if (sys.windowSize(self.out_fd)) |ws| {
+            self.width = ws.cols;
+            self.height = ws.rows;
+        }
         if (self.width == 0) self.width = 80;
+        if (self.height == 0) self.height = 24;
     }
 
     fn render(self: *Editor) void {
@@ -763,6 +780,9 @@ pub const Editor = struct {
             cursor_row = end_row;
             cursor_col = end_col;
         }
+        // The completion menu is the frame's last rows, so the next redraw
+        // repaints or clears it like the rest of the frame.
+        if (decoration == .full) end_row += self.writeMenuRows(end_row + 1);
 
         self.write("\r");
         if (self.command_frame_active and self.command_cursor_row > 0) {
@@ -902,7 +922,7 @@ pub const Editor = struct {
             'D' => if (ctrl or alt) .word_left else .left,
             'H' => .home,
             'F' => .end,
-            'Z' => .unknown,
+            'Z' => .back_tab,
             '~' => blk: {
                 const number = std.fmt.parseInt(u32, params, 10) catch 0;
                 break :blk switch (number) {
@@ -1389,21 +1409,72 @@ pub const Editor = struct {
             return;
         }
 
-        // Ambiguous: list the candidates below the line, then repaint.
-        self.leaveFrame();
-        var col: usize = 0;
-        for (result.items) |item| {
-            const label = std.mem.trimEnd(u8, item, " ");
-            const label_width = wcwidth.width(label);
-            if (col != 0 and col + label_width + 2 > self.width) {
-                self.write("\r\n");
-                col = 0;
-            }
-            self.write(self.visible(label));
-            self.write("  ");
-            col += label_width + 2;
-        }
-        self.write("\r\n");
+        // Ambiguous: open the menu below the line. Further keys go to
+        // `handleMenuKey` while it is open.
+        self.closeMenu();
+        self.menu = pager.Menu.init(self.sh.gpa, result.items, self.buf.items, result.start, self.cursor) catch return;
+    }
+
+    fn closeMenu(self: *Editor) void {
+        if (self.menu) |*menu| menu.deinit();
+        self.menu = null;
+    }
+
+    /// Writes the menu rows below a frame that has `command_rows` rows and
+    /// returns how many it wrote.
+    fn writeMenuRows(self: *Editor, command_rows: usize) usize {
+        const menu = &(self.menu orelse return 0);
+        return pager.draw(&self.frame.writer, menu, self.width, pager.maxRows(self.height, command_rows));
+    }
+
+    /// A key while the menu is open. Tab, Shift-Tab and the arrows move the
+    /// selection, which replaces the word in the line as it moves; Enter
+    /// keeps it and Esc or Ctrl-G puts the typed word back. Any other key
+    /// closes the menu, erases it, and returns false so the key then does
+    /// what it normally does.
+    fn handleMenuKey(self: *Editor, key: Key) bool {
+        const menu = &(self.menu.?);
+        const rows: isize = @intCast(@max(menu.rows, 1));
+        const step: isize = switch (key) {
+            .byte => |b| switch (b) {
+                '\t' => 1,
+                '\r', '\n' => {
+                    if (menu.selected == null) return self.dismissMenu();
+                    self.closeMenu();
+                    return true;
+                },
+                7 => return self.cancelMenu(), // Ctrl-G
+                else => return self.dismissMenu(),
+            },
+            .escape => return self.cancelMenu(),
+            .back_tab, .up => -1,
+            .down => 1,
+            .left => -rows,
+            .right => rows,
+            .resize => return true,
+            else => return self.dismissMenu(),
+        };
+        const index = menu.stepped(step);
+        menu.selected = index;
+        self.replaceRange(menu.start, menu.end, menu.items[index].text);
+        menu.end = self.cursor;
+        return true;
+    }
+
+    fn cancelMenu(self: *Editor) bool {
+        const menu = &(self.menu.?);
+        self.replaceRange(menu.start, menu.end, menu.original);
+        self.closeMenu();
+        return true;
+    }
+
+    /// Closes the menu and redraws without it, so whatever the key does next
+    /// (print `^C`, run a bound command, submit the line) starts below the
+    /// command line with no menu rows left on screen.
+    fn dismissMenu(self: *Editor) bool {
+        self.closeMenu();
+        if (self.command_frame_active) self.render();
+        return false;
     }
 
     // --- incremental reverse search ----------------------------------------
@@ -1765,4 +1836,61 @@ test "control characters render in caret notation" {
 
     try testing.expectEqualStrings("a^Ib", ed.visible("a\tb"));
     try testing.expectEqual(@as(usize, 4), wcwidth.width("a\tb"));
+}
+
+test "the completion menu replaces the word as the selection moves" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    var ed = Editor.init(&sh, -1, -1);
+    defer ed.deinit();
+
+    typeText(&ed, "cat a | wc");
+    ed.cursor = 5;
+    ed.menu = try pager.Menu.init(testing.allocator, &.{ "apple ", "apricot ", "avocado " }, ed.buf.items, 4, 5);
+    _ = ed.handleKey(.{ .byte = '\t' });
+    try testing.expectEqualStrings("cat apple  | wc", ed.buf.items);
+    try testing.expectEqual(@as(usize, 10), ed.cursor);
+    _ = ed.handleKey(.{ .byte = '\t' });
+    try testing.expectEqualStrings("cat apricot  | wc", ed.buf.items);
+    _ = ed.handleKey(.back_tab);
+    _ = ed.handleKey(.up);
+    try testing.expectEqualStrings("cat avocado  | wc", ed.buf.items);
+    // Esc puts the typed word back and closes the menu.
+    _ = ed.handleKey(.escape);
+    try testing.expectEqualStrings("cat a | wc", ed.buf.items);
+    try testing.expectEqual(@as(usize, 5), ed.cursor);
+    try testing.expect(ed.menu == null);
+}
+
+test "Enter keeps the menu selection and other keys close the menu" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    var ed = Editor.init(&sh, -1, -1);
+    defer ed.deinit();
+
+    typeText(&ed, "cat a");
+    ed.menu = try pager.Menu.init(testing.allocator, &.{ "apple ", "apricot " }, ed.buf.items, 4, 5);
+    _ = ed.handleKey(.{ .byte = '\t' });
+    try testing.expectEqual(Outcome.handled, ed.handleKey(.{ .byte = '\r' }));
+    try testing.expectEqualStrings("cat apple ", ed.buf.items);
+    try testing.expect(ed.menu == null);
+
+    // With nothing selected, Enter closes the menu and submits the line.
+    ed.menu = try pager.Menu.init(testing.allocator, &.{ "x", "y" }, ed.buf.items, 10, 10);
+    try testing.expectEqual(Outcome.accept, ed.handleKey(.{ .byte = '\r' }));
+    try testing.expect(ed.menu == null);
+
+    // A typed key closes the menu and is inserted.
+    ed.menu = try pager.Menu.init(testing.allocator, &.{ "x", "y" }, ed.buf.items, 10, 10);
+    _ = ed.handleKey(.{ .byte = '\t' });
+    _ = ed.handleKey(.{ .byte = 'z' });
+    try testing.expectEqualStrings("cat apple xz", ed.buf.items);
+    try testing.expect(ed.menu == null);
+
+    // Ctrl-G restores the word like Esc.
+    ed.menu = try pager.Menu.init(testing.allocator, &.{ "q1", "q2" }, ed.buf.items, 10, 12);
+    _ = ed.handleKey(.{ .byte = '\t' });
+    try testing.expectEqualStrings("cat apple q1", ed.buf.items);
+    _ = ed.handleKey(.{ .byte = 7 });
+    try testing.expectEqualStrings("cat apple xz", ed.buf.items);
 }
