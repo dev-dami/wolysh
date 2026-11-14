@@ -144,15 +144,63 @@ before bounded edit-distance checks; regular command lookup does not run it.
 The shell caches up to 64 recent failed command names per session and can show
 their best correction inline; press Right to accept it.
 
+History suggestions are ranked by context. Among history entries that start
+with what you typed, wsh picks the newest one entered in the current directory
+right after the command you just ran; failing that, the newest entered in the
+current directory; failing that, the newest anywhere. A command whose latest
+run exited non-zero is suggested only when no successful command matches.
+`let suggest = "recent"` always takes the newest match instead.
+
 | Key | Action |
 | --- | --- |
-| Up / Down | Browse history |
-| `Ctrl-R` | Search history |
-| Tab | Complete commands, paths, and variables |
-| Right / End | Accept suggestion or move right |
-| `Ctrl-A` / `Ctrl-E` | Start / end of line |
+| Up / Down | Move up or down a screen row, keeping the column; browse history from the first or last row |
+| `Ctrl-P` / `Ctrl-N` | Browse history |
+| `Ctrl-R` | Search history (Esc or an arrow key keeps the match for editing) |
+| Tab | Complete commands, paths, and variables; open the completion menu |
+| Right | Accept suggestion or move right |
+| Home / End, `Ctrl-A` / `Ctrl-E` | Start / end of the current line; End and `Ctrl-E` at the end accept the suggestion |
+| `Ctrl-U` / `Ctrl-K` | Kill to the start / end of the current line |
+| Alt-Enter | Insert a new line without running the command |
 | `Ctrl-C` / `Ctrl-D` | Cancel line / exit on empty input |
 | `Ctrl-Z` | Suspend the foreground job |
+
+When Tab finds several candidates and no longer common prefix to insert, a
+completion menu opens below the command line. It lays the candidates out in
+columns that fit the terminal, takes at most half the screen, and
+ends with an "…and N more" row when the list is longer. While it is open:
+
+| Key | Action |
+| --- | --- |
+| Tab / Shift-Tab, Down / Up | Select the next / previous candidate |
+| Right / Left | Select the candidate in the next / previous column |
+| Enter | Keep the selected candidate and close the menu (the line is not run) |
+| Esc / `Ctrl-G` | Close the menu and put back the word you typed |
+| Any other key | Close the menu, then act as usual |
+
+The selected candidate replaces the word in the line as you move. Enter with
+nothing selected closes the menu and runs the line. The menu is redrawn in
+place and erased when it closes, so it never stays in the scrollback. When the
+command fills the screen, it scrolls to keep the cursor's line and a few rows
+of the menu in view. A screen under four rows has no menu: Tab rings the bell.
+
+Candidates the shell knows something about get a dimmed description in
+parentheses, lined up after the names:
+
+| Candidate | Description |
+| --- | --- |
+| Builtin | Its one-line summary, as `help` lists it |
+| Function / keyword | `function` / `keyword` |
+| Alias | `alias: ` and its text |
+| Command on `PATH` | `command` |
+| Variable (`$HO<Tab>`) | Its value, cut to fit, with control characters shown as `^X` |
+| Directory / symlink / executable file | `directory` / `link` / `executable` (a plain file has none) |
+
+Descriptions use fewer columns, so the menu may need more rows. When the
+terminal is too narrow for them, they are dropped before any name is cut.
+Words from `complete` / `compgen` specs and the other argument completers
+have no descriptions. Only the menu shows them; a single match or a common
+prefix is inserted as before. Command completion also offers reserved words
+such as `while` and `done`, as Bash's does.
 
 `jobs`, `fg`, `bg`, and `wait` support `%1`, `%+`, and command prefixes.
 Foreground jobs receive the terminal and run in their own process groups.

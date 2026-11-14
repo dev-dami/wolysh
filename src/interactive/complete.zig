@@ -23,6 +23,7 @@ const command_suggest = @import("../command_suggest.zig");
 const bindings = @import("bindings.zig");
 const set_builtin = @import("../builtins/set.zig");
 const shopt_builtin = @import("../builtins/shopt.zig");
+const type_builtin = @import("../builtins/describe.zig");
 
 const Shell = shellmod.Shell;
 const Allocator = std.mem.Allocator;
@@ -33,6 +34,21 @@ pub const Result = struct {
     start: usize,
     /// Complete replacement words, in the order they should be shown.
     items: []const []const u8,
+    /// Where the words came from, which tells `describe` what they are.
+    kind: Kind = .other,
+};
+
+/// The completion source behind a `Result`.
+pub const Kind = enum {
+    /// Programmable, git, make, hosts, jobs, options...: nothing to describe.
+    other,
+    /// `$name` references.
+    variables,
+    /// A command name: builtins, functions, aliases, keywords, `PATH`, and
+    /// the paths a command position also completes.
+    commands,
+    /// Paths only.
+    paths,
 };
 
 const helper_timeout_ms = 1000;
@@ -302,12 +318,13 @@ pub fn complete(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize) !
     const ctx = try parseLine(arena, line, cursor);
     var items: std.ArrayList([]const u8) = .empty;
     var sort = true;
+    var kind: Kind = .other;
 
     if (variableReference(ctx.raw)) |dollar| {
         const at_start = dollar == 0;
         try completeVariables(sh, arena, ctx.raw[dollar + 1 ..], if (at_start) " " else "", &items);
         sortItems(items.items);
-        return .{ .start = ctx.start + dollar, .items = try dedupe(arena, items.items) };
+        return .{ .start = ctx.start + dollar, .items = try dedupe(arena, items.items), .kind = .variables };
     }
 
     // `complete -E` covers an empty line, `complete -I` an initial word.
@@ -319,6 +336,7 @@ pub fn complete(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize) !
     if (initial_spec) |spec| {
         sort = try programmable(sh, arena, line, cursor, ctx, spec, &items);
     } else if (ctx.command_index == null and !ctx.redirect) {
+        kind = .commands;
         const word = ctx.raw;
         const command_count = items.items.len;
         try completeCommands(sh, arena, word, &items);
@@ -330,13 +348,13 @@ pub fn complete(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize) !
                 for (matches) |match| try items.append(arena, try std.fmt.allocPrint(arena, "{s} ", .{match.name}));
             }
         }
-        try completePaths(sh, arena, ctx.raw, .all, &items);
+        try completePaths(sh, arena, ctx.raw, .runnable, &items);
     } else {
-        sort = try completeArgument(sh, arena, line, cursor, ctx, &items);
+        sort = try completeArgument(sh, arena, line, cursor, ctx, &items, &kind);
     }
 
     if (sort) sortItems(items.items);
-    return .{ .start = ctx.start, .items = try dedupe(arena, items.items) };
+    return .{ .start = ctx.start, .items = try dedupe(arena, items.items), .kind = kind };
 }
 
 /// Index of a trailing `$name` reference in `raw`, if the word ends in one.
@@ -454,6 +472,15 @@ fn commandNames(sh: *Shell, arena: Allocator, prefix: []const u8, out: *std.Arra
         try out.append(arena, try arena.dupe(u8, name.*));
     }
 
+    // Reserved words complete too, as `compgen -c` does in Bash; the
+    // punctuation ones (`[[`, `{`, `!`) are left out.
+    for (type_builtin.keywords) |word| {
+        if (!std.ascii.isAlphabetic(word[0])) continue;
+        if (!std.mem.startsWith(u8, word, prefix) or seen.contains(word)) continue;
+        try seen.put(word, {});
+        try out.append(arena, word);
+    }
+
     if (prefix.len == 0) return;
 
     var dirs = std.mem.splitScalar(u8, sh.pathEnv(), ':');
@@ -484,9 +511,118 @@ fn completeCommands(sh: *Shell, arena: Allocator, prefix: []const u8, items: *st
     for (names.items) |name| try items.append(arena, try std.fmt.allocPrint(arena, "{s} ", .{name}));
 }
 
+// --- menu descriptions -------------------------------------------------------------------
+
+/// Most candidates `describe` looks at; later ones get no description, so a
+/// huge directory costs at most this many `statx` calls.
+pub const describe_limit = 256;
+/// Longest description kept, in bytes; the menu cuts it to the screen.
+const description_max = 120;
+
+/// One-line descriptions for the completion menu, parallel to
+/// `result.items`, or empty when the source has none. They come only from
+/// what the shell already knows, fish-style: a builtin's summary,
+/// `function`, `alias: <text>`, `keyword`, `command` for `PATH`, a
+/// variable's value, and `directory` / `link` / `executable` for paths (a
+/// plain file gets none). Only the menu calls this, once it opens.
+pub fn describe(sh: *Shell, arena: Allocator, result: Result) Allocator.Error![]const []const u8 {
+    if (result.kind == .other) return &.{};
+    const out = try arena.alloc([]const u8, result.items.len);
+    for (result.items, out, 0..) |item, *description, index| {
+        description.* = if (index >= describe_limit) "" else switch (result.kind) {
+            .other => "",
+            .variables => try describeVariable(sh, arena, item),
+            .commands => try describeCommand(sh, arena, item),
+            .paths => try describePath(sh, arena, item),
+        };
+    }
+    return out;
+}
+
+fn describeVariable(sh: *Shell, arena: Allocator, item: []const u8) Allocator.Error![]const u8 {
+    const reference = std.mem.trimEnd(u8, item, " ");
+    if (reference.len < 2 or reference[0] != '$') return "";
+    const name = reference[1..];
+    // Rendered into a bounded buffer: a huge array costs no more than a
+    // short string. A full buffer just means the value is cut.
+    var buf: [description_max * 2]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    if (sh.vars.get(sh.deref(name))) |val| {
+        val.render(&writer) catch {};
+    } else if (sh.getEnv(name)) |text| {
+        writer.writeAll(text) catch {};
+    }
+    return visible(arena, writer.buffered());
+}
+
+fn describeCommand(sh: *Shell, arena: Allocator, item: []const u8) Allocator.Error![]const u8 {
+    // Paths complete in command position too.
+    if (std.mem.indexOfScalar(u8, item, '/') != null) return describePath(sh, arena, item);
+    const name = std.mem.trimEnd(u8, item, " ");
+    // In the order `type` reports them, except that a builtin's summary says
+    // more than `keyword` for the names that are both (`alias`).
+    if (sh.getAlias(name)) |text| return std.mem.concat(arena, u8, &.{ "alias: ", try visible(arena, text) });
+    if (sh.getFunc(name) != null) return "function";
+    if (builtins.lookup(name)) |b| return b.summary;
+    if (type_builtin.isKeyword(name)) return "keyword";
+    // Anything else came from PATH, unless it is a file here that PATH
+    // does not have.
+    const plain = try dequote(arena, name);
+    const z = try arena.dupeZ(u8, plain);
+    if (fs.linkMode(z) == null or onPath(sh, plain)) return "command";
+    return describePath(sh, arena, item);
+}
+
+fn onPath(sh: *Shell, name: []const u8) bool {
+    var dirs = std.mem.splitScalar(u8, sh.pathEnv(), ':');
+    while (dirs.next()) |dir| {
+        if (dir.len == 0 or dir.len + name.len + 2 > linux.PATH_MAX) continue;
+        var buf: [linux.PATH_MAX]u8 = undefined;
+        const full = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
+        if (fs.isExecutable(full)) return true;
+    }
+    return false;
+}
+
+fn describePath(sh: *Shell, arena: Allocator, item: []const u8) Allocator.Error![]const u8 {
+    var path = try dequote(arena, std.mem.trimEnd(u8, item, " "));
+    // Without the trailing slash, so a link to a directory is not followed.
+    if (path.len > 1 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
+    path = try sh.tildeExpand(arena, path);
+    const mode = fs.linkMode(try arena.dupeZ(u8, path)) orelse return "";
+    return switch (mode & linux.S.IFMT) {
+        linux.S.IFDIR => "directory",
+        linux.S.IFLNK => "link",
+        linux.S.IFREG => if (mode & 0o111 != 0) "executable" else "",
+        else => "",
+    };
+}
+
+/// `text` cut to `description_max` bytes (on a character boundary) with
+/// control characters shown in caret notation, as `cat -v` does.
+fn visible(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (text) |c| {
+        if (out.items.len >= description_max and c & 0xc0 != 0x80) {
+            try out.appendSlice(arena, "…");
+            break;
+        }
+        if (c < 0x20 or c == 0x7f) {
+            try out.appendSlice(arena, &.{ '^', c ^ 0x40 });
+        } else {
+            try out.append(arena, c);
+        }
+    }
+    return out.items;
+}
+
 // --- paths -------------------------------------------------------------------------------
 
-const PathKind = enum { all, dirs };
+/// Which entries a path completion offers. `runnable` is for a command
+/// position: directories, and executables once the word names a directory
+/// (`./run`), since only then can a file there run. A plain file never can,
+/// as fish also judges.
+const PathKind = enum { all, dirs, runnable };
 
 fn entryIsDir(arena: Allocator, dir: []const u8, entry: fs.Entry) bool {
     switch (entry.kind) {
@@ -523,6 +659,11 @@ fn completePaths(sh: *Shell, arena: Allocator, raw: []const u8, kind: PathKind, 
         if (!startsWithIgnoreCase(entry.name, base)) continue;
         const is_dir = entryIsDir(arena, dir, entry);
         if (kind == .dirs and !is_dir) continue;
+        if (kind == .runnable and !is_dir) {
+            if (slash == null) continue;
+            const full = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, entry.name }, 0);
+            if (!fs.isExecutable(full)) continue;
+        }
 
         const name = if (quote_char) |q| try quoteInside(arena, entry.name, q) else try quote(arena, entry.name);
         const suffix: []const u8 = if (is_dir) "/" else if (quote_char) |q| (if (q == '"') "\" " else "' ") else " ";
@@ -569,8 +710,9 @@ fn appendWithSuffix(arena: Allocator, items: *std.ArrayList([]const u8), names: 
 
 /// Completes a word in argument position. Returns false when the candidates
 /// must keep their generated order (`-o nosort`).
-fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize, ctx: Context, items: *std.ArrayList([]const u8)) !bool {
+fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize, ctx: Context, items: *std.ArrayList([]const u8), kind: *Kind) !bool {
     if (ctx.redirect) {
+        kind.* = .paths;
         try completePaths(sh, arena, ctx.raw, .all, items);
         return true;
     }
@@ -592,6 +734,7 @@ fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usiz
     if (compspec.lookup("-D")) |spec| return programmable(sh, arena, line, cursor, ctx, spec, items);
 
     if (eql(name, "cd") or eql(name, "pushd")) {
+        kind.* = .paths;
         try completePaths(sh, arena, ctx.raw, .dirs, items);
         return true;
     }
@@ -603,7 +746,10 @@ fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usiz
         var targets: std.ArrayList([]const u8) = .empty;
         try makeTargets(sh, arena, ctx, &targets);
         try appendWithSuffix(arena, items, targets.items, word, " ");
-        if (items.items.len == 0) try completePaths(sh, arena, ctx.raw, .all, items);
+        if (items.items.len == 0) {
+            kind.* = .paths;
+            try completePaths(sh, arena, ctx.raw, .all, items);
+        }
         return true;
     }
     if (eql(name, "ssh") or eql(name, "sftp") or eql(name, "scp") or eql(name, "rsync")) {
@@ -623,6 +769,7 @@ fn completeArgument(sh: *Shell, arena: Allocator, line: []const u8, cursor: usiz
         try appendOptions(arena, items, options, word);
         if (items.items.len > 0) return true;
     }
+    kind.* = .paths;
     try completePaths(sh, arena, ctx.raw, .all, items);
     return true;
 }
@@ -1425,6 +1572,30 @@ test "completion finds files and commands" {
     try testing.expectEqualStrings("src/", dirs.items[0]);
 }
 
+test "a command position offers directories and runnable files, not plain files" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // README.md cannot run, so it is not offered as a command.
+    for ((try complete(&sh, arena, "READ", 4)).items) |item| {
+        try testing.expect(!std.mem.startsWith(u8, item, "README"));
+    }
+    // A directory still is, to reach what is inside it.
+    var found_src = false;
+    for ((try complete(&sh, arena, "sr", 2)).items) |item| {
+        if (std.mem.eql(u8, item, "src/")) found_src = true;
+    }
+    try testing.expect(found_src);
+    // Inside a directory, only executables and directories.
+    for ((try complete(&sh, arena, "./src/l", 7)).items) |item| {
+        try testing.expect(!std.mem.endsWith(u8, item, ".zig "));
+    }
+}
+
 test "completion of variables" {
     var sh = try Shell.initBare(testing.allocator);
     defer sh.deinit();
@@ -1589,4 +1760,95 @@ test "long options of a command come from its --help" {
     try testing.expectEqual(@as(usize, 1), res.items.len);
     try testing.expectEqualStrings("--almost-all ", res.items[0]);
     try testing.expect(option_cache.get("ls") != null);
+}
+
+test "menu descriptions name each command's kind" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    try sh.defineFunc("myfunc", "{ :; }");
+    try sh.setAlias("ll", "ls -l --color=auto");
+    try sh.setAlias("multi", "echo a\necho b");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result: Result = .{
+        .start = 0,
+        .kind = .commands,
+        .items = &.{ "cd ", "myfunc ", "ll ", "multi ", "if ", "ls ", "src/", "README.md " },
+    };
+    const descriptions = try describe(&sh, arena, result);
+    try testing.expectEqual(result.items.len, descriptions.len);
+    // A builtin shows its one-line summary from the builtin table.
+    try testing.expectEqualStrings(builtins.lookup("cd").?.summary, descriptions[0]);
+    try testing.expectEqualStrings("function", descriptions[1]);
+    try testing.expectEqualStrings("alias: ls -l --color=auto", descriptions[2]);
+    try testing.expectEqualStrings("alias: echo a^Jecho b", descriptions[3]);
+    try testing.expectEqualStrings("keyword", descriptions[4]);
+    try testing.expectEqualStrings("command", descriptions[5]);
+    try testing.expectEqualStrings("directory", descriptions[6]);
+    try testing.expectEqualStrings("", descriptions[7]);
+}
+
+test "command completion offers keywords, as Bash does" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const res = try complete(&sh, arena_state.allocator(), "whil", 4);
+    try testing.expectEqualStrings("while ", res.items[0]);
+    try testing.expectEqual(Kind.commands, res.kind);
+}
+
+test "menu descriptions show variable values with control characters visible" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    try sh.setVar("greeting", .{ .string = "hi\tthere\x1b" });
+    try sh.setEnv("ENVONLY", "from env");
+    var long: [300]u8 = undefined;
+    @memset(&long, 'x');
+    try sh.setVar("big", .{ .string = &long });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try complete(&sh, arena, "echo $gree", 10);
+    try testing.expectEqual(Kind.variables, res.kind);
+    const result: Result = .{ .start = 0, .kind = .variables, .items = &.{ "$greeting ", "$ENVONLY", "$big ", "$unset_here " } };
+    const descriptions = try describe(&sh, arena, result);
+    try testing.expectEqualStrings("hi^Ithere^[", descriptions[0]);
+    try testing.expectEqualStrings("from env", descriptions[1]);
+    // Long values are cut; the menu cuts them further to the screen.
+    try testing.expect(descriptions[2].len < 200);
+    try testing.expect(std.mem.endsWith(u8, descriptions[2], "…"));
+    try testing.expectEqualStrings("", descriptions[3]);
+}
+
+test "menu descriptions mark directories, links and executables" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try complete(&sh, arena, "cat src/", 8);
+    try testing.expectEqual(Kind.paths, res.kind);
+    const result: Result = .{
+        .start = 0,
+        .kind = .paths,
+        .items = &.{ "/etc/", "/proc/self/", "/usr/bin/env ", "/etc/passwd ", "\"/etc/passwd\" ", "/no/such/file " },
+    };
+    const descriptions = try describe(&sh, arena, result);
+    try testing.expectEqualStrings("directory", descriptions[0]);
+    try testing.expectEqualStrings("link", descriptions[1]);
+    try testing.expectEqualStrings("executable", descriptions[2]);
+    try testing.expectEqualStrings("", descriptions[3]);
+    try testing.expectEqualStrings("", descriptions[4]);
+    try testing.expectEqualStrings("", descriptions[5]);
+
+    // Sources without descriptions of their own get none.
+    const other: Result = .{ .start = 0, .kind = .other, .items = &.{ "alpha ", "beta " } };
+    try testing.expectEqual(@as(usize, 0), (try describe(&sh, arena, other)).len);
 }

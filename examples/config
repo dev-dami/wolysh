@@ -28,6 +28,7 @@ let git_prompt = true
 # --- interactive behaviour --------------------------------------------------
 
 # let autosuggest = true      # inline history suggestions
+# let suggest = "context"     # rank them by directory and previous command; "recent" = newest match
 # let highlight = true        # syntax highlighting
 # let completion = true       # tab completion
 

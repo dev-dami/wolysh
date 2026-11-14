@@ -237,8 +237,8 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(s.wait_exit(), 0)
 
         raw = self.history_file.read_text()
-        self.assertTrue(raw.startswith("#wsh-history v2\n"), raw)
-        self.assertIn("if true {\\necho ml-one\\n}\n", raw)
+        self.assertTrue(raw.startswith("#wsh-history v3\n"), raw)
+        self.assertIn("\tif true {\\necho ml-one\\n}\n", raw)
 
         s2 = self.start()
         status, output = s2.run("history")

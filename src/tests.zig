@@ -62,6 +62,7 @@ test {
     _ = @import("interactive/term.zig");
     _ = @import("interactive/vi.zig");
     _ = @import("interactive/complete.zig");
+    _ = @import("interactive/pager.zig");
     _ = @import("builtins/complete.zig");
     _ = @import("agent/state.zig");
     _ = @import("agent/wire.zig");

@@ -88,6 +88,15 @@ pub fn kind(path: [:0]const u8) ?Kind {
     return kindFromMode(st.mode);
 }
 
+/// The `st_mode` of a path itself, without following a final symlink, or
+/// null when it does not exist.
+pub fn linkMode(path: [:0]const u8) ?u16 {
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true }, &st);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return st.mode;
+}
+
 /// Kind of a path, following symlinks and reporting `.symlink` only when the
 /// target itself is missing.
 pub fn kindFollow(path: [:0]const u8) ?Kind {

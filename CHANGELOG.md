@@ -7,6 +7,92 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Alt-Enter inserts a new line without running the command.
+- The completion menu describes candidates, fish-style: a builtin's summary,
+  `function`, `alias: <text>`, `keyword` and `command` for command names, the
+  value of a variable, and `directory`, `link` or `executable` for paths.
+  Descriptions line up after the names and are dropped on a terminal too
+  narrow for them. Command completion also offers reserved words such as
+  `while`, as Bash does.
+
+### Changed
+
+- An ambiguous Tab opens a completion menu below the command line instead of
+  printing every candidate into the scrollback. Tab, Shift-Tab and the arrow
+  keys move a highlighted selection that replaces the word as it moves, Enter
+  keeps it, and Esc or `Ctrl-G` restores the typed word. The menu fits the
+  terminal width, is capped at half the screen with an
+  "…and N more" row, and is erased as soon as another key is pressed, so a
+  second Tab no longer prints the list again.
+- Completing a command name no longer offers plain files such as
+  `README.md`, which cannot run. Directories are still offered, and inside a
+  directory (`./`) so are executables, as fish does.
+
+- Inline suggestions rank history by context. Among commands that start with
+  what you typed, wsh prefers one entered in the current directory right after
+  the command you just ran, then one entered in the current directory, then the
+  newest anywhere. A command whose latest run failed is suggested only when no
+  successful one matches. `let suggest = "recent"` restores the old
+  newest-match behaviour.
+- The history file moves to format v3, which records each entry's time,
+  directory and previous command, plus its exit status and duration once it
+  finishes. Older files load unchanged and are upgraded on the first new
+  entry. wsh 0.6.0 and earlier read a v3 file wrongly, so avoid running old
+  and new versions against the same history file at once. Entry times now
+  survive a restart, so `HISTTIMEFORMAT` shows when commands were entered.
+
+### Fixed
+
+- `eval` skips a leading `--` and rejects other options, as Bash does. Among
+  other things, this makes `eval "$(starship init bash)"` start without an
+  error.
+- Shells sharing a history file take turns changing it. Before, a shell
+  trimming the file could drop a command another shell had just saved.
+- Editing multi-line and wrapped commands draws correctly:
+  - Up and Down move one screen row at a time through a wrapped line,
+    keeping the column, and reach history only from the first or last row.
+    After recalling a multi-line command, Up goes on to the one before it
+    instead of climbing through its lines.
+  - Wide characters (CJK, emoji) at the right edge no longer put the cursor
+    one column off.
+  - With the cursor at the end of a line that exactly fills the width, the
+    cursor no longer appears at the start of the next line.
+  - A command taller than the terminal scrolls with the cursor instead of
+    redrawing lines twice and losing the cursor off the top.
+  - Ctrl-C with the cursor on an earlier line keeps the later lines on
+    screen, and `^C` appears after the whole command.
+  - A command that exactly fills the width is no longer followed by a blank
+    line before its output.
+  - Continuation prompts indent by how deeply the command is nested, not by
+    line number.
+  - Ctrl-L redraws every line of a multi-line prompt.
+- Home, End, Ctrl-A, Ctrl-E, Ctrl-K and Ctrl-U act on the current line of a
+  multi-line command. At the start or end of a line, Ctrl-U and Ctrl-K join it
+  to the line before or after. In vi mode, `j` and `k` move between lines,
+  and `0`, `^`, `$`, `I`, `A`, `D` and `C` act on the current line.
+- End and Ctrl-E at the end of the line accept the grey suggestion, as the
+  documentation says.
+- Esc and the arrow keys end a Ctrl-R search on the match and keep it for
+  editing, as in Bash, instead of dropping it.
+- The completion menu stays visible when a multi-line command fills the
+  screen: the command scrolls to keep the cursor's line and a few menu rows
+  in view, so Tab no longer changes the word with no menu shown. On a
+  screen under four rows Tab rings the bell instead of opening the menu.
+- Output from a `bind -x` command or Ctrl-X Ctrl-E starts right below a
+  command whose last line exactly fills the terminal width, without a blank
+  line in between.
+- Up and Down, and `j` and `k` in vi mode, remember the column they started
+  from, so moving through a shorter line no longer loses it, as in vim. Any
+  other move or an edit sets a new column.
+- Resizing the terminal no longer leaves a stale copy of the prompt behind
+  on terminals that re-wrap text when resized (GNOME Terminal and other VTE
+  terminals, kitty, iTerm2, Windows Terminal), and still works on terminals
+  that do not (xterm). Since the two cannot be told apart, the redraw starts
+  as high as either kind needs, which may clear a line or two of earlier
+  output just above the prompt.
+
 ## [0.6.0] - 2026-10-31
 
 ### Added
