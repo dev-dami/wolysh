@@ -6,6 +6,9 @@
 //! previous frame occupied, moves back to the start of the input, clears, and
 //! repaints — then walks the cursor to its logical position. That keeps wrapped
 //! lines and long histories correct without incremental-diff bookkeeping.
+//! Positions come from `layout`, which wraps exactly as the terminal does, and
+//! a frame taller than the screen is drawn as a screen-high window around the
+//! cursor. Up and Down use the same layout to move by screen row.
 //!
 //! The buffer is UTF-8. Every cursor movement and deletion steps over whole
 //! characters (a code point plus its combining marks), and widths come from
@@ -110,6 +113,118 @@ fn isControl(c: u8) bool {
     return c < 0x20 or c == 0x7f;
 }
 
+/// A spot in a frame, in rows below the first prompt row and columns. `col
+/// == width` is a row filled to the right margin: the terminal keeps the
+/// cursor on the last column until the next character wraps it.
+pub const Pos = struct {
+    row: usize = 0,
+    col: usize = 0,
+
+    /// Where a character `w` columns wide starts from here. One that does
+    /// not fit wraps whole to the next row, so a wide character at the
+    /// margin leaves the last column empty, as terminals draw it.
+    fn place(self: Pos, w: usize, width: usize) Pos {
+        if (self.col > 0 and self.col + w > width) return .{ .row = self.row + 1 };
+        return self;
+    }
+
+    /// The pending wrap made real: a full row ends on the next row's first
+    /// column, where the frame puts the cursor and the next line.
+    fn settled(self: Pos, width: usize) Pos {
+        if (self.col >= width) return .{ .row = self.row + 1 };
+        return self;
+    }
+};
+
+/// How text is measured. A prompt is written as it is, so escape sequences
+/// and control bytes take no room; buffer text is drawn with each control
+/// character in caret notation, two one-column characters.
+const Measure = enum { prompt, buffer };
+
+/// One step of `layout`: the character at `text[i]` drawn from `pos`.
+const Step = struct { pos: Pos, next: usize };
+
+fn layoutStep(pos: Pos, text: []const u8, i: usize, width: usize, measure: Measure) Step {
+    const c = text[i];
+    if (isControl(c)) {
+        if (measure == .prompt) {
+            return .{ .pos = pos, .next = if (c == 0x1b) escapeEnd(text, i) else i + 1 };
+        }
+        // `^` and the letter wrap independently, like any two characters.
+        var at = pos.place(1, width);
+        at.col += 1;
+        at = at.place(1, width);
+        at.col += 1;
+        return .{ .pos = at, .next = i + 1 };
+    }
+    const next = wcwidth.nextCluster(text, i);
+    const w = wcwidth.width(text[i..next]);
+    if (w == 0) return .{ .pos = pos, .next = next };
+    var at = pos.place(w, width);
+    at.col += w;
+    return .{ .pos = at, .next = next };
+}
+
+/// Where drawing `text` from `start` leaves the cursor on a terminal
+/// `width` columns wide.
+fn layout(start: Pos, text: []const u8, width: usize, measure: Measure) Pos {
+    var pos = start;
+    var i: usize = 0;
+    while (i < text.len) {
+        const step = layoutStep(pos, text, i, width, measure);
+        pos = step.pos;
+        i = step.next;
+    }
+    return pos;
+}
+
+/// Where the cursor shows in front of `text[i]` (buffer text) when the
+/// text before it ends at `before`: on the character's cell, which for a
+/// character that wraps is the next row, or after the end of the line.
+fn cursorCell(before: Pos, text: []const u8, i: usize, width: usize) Pos {
+    if (i < text.len and text[i] != '\n') {
+        const w = if (isControl(text[i])) 1 else wcwidth.width(text[i..wcwidth.nextCluster(text, i)]);
+        if (w > 0) return before.place(w, width);
+    }
+    return before.settled(width);
+}
+
+/// Copies a frame to `out`, keeping only rows `first..last` (inclusive) of
+/// the layout. Escape sequences are always copied so colours stay right;
+/// the line breaks and characters outside the window are dropped, so the
+/// window is drawn from the current cursor row without scrolling past the
+/// bottom of the screen.
+fn writeRows(out: *std.Io.Writer, frame: []const u8, width: usize, first: usize, last: usize) void {
+    var pos: Pos = .{};
+    var i: usize = 0;
+    while (i < frame.len) {
+        const c = frame[i];
+        if (c == 0x1b) {
+            const end = escapeEnd(frame, i);
+            out.writeAll(frame[i..end]) catch {};
+            i = end;
+            continue;
+        }
+        if (c == '\r') {
+            pos.col = 0;
+            if (pos.row >= first and pos.row <= last) out.writeByte('\r') catch {};
+            i += 1;
+            continue;
+        }
+        if (c == '\n') {
+            if (pos.row >= first and pos.row < last) out.writeByte('\n') catch {};
+            pos = .{ .row = pos.row + 1 };
+            i += 1;
+            continue;
+        }
+        // A character ends on the row it was drawn on.
+        const step = layoutStep(pos, frame, i, width, .prompt);
+        if (step.pos.row >= first and step.pos.row <= last) out.writeAll(frame[i..step.next]) catch {};
+        pos = step.pos;
+        i = step.next;
+    }
+}
+
 /// Word characters for the readline word commands (Alt-F/B/D, Alt-U/L/C):
 /// letters and digits, and every byte of a multi-byte character.
 fn isWordByte(c: u8) bool {
@@ -119,6 +234,60 @@ fn isWordByte(c: u8) bool {
 fn isBlank(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n';
 }
+
+/// How deeply the next line of a multi-line command nests, for the indent of
+/// its continuation prompt: brackets and `then`/`do` blocks the lines so far
+/// left open. Quotes and comments are skipped. It is an estimate for display,
+/// not a parse, and never goes below zero.
+const Nesting = struct {
+    depth: usize = 0,
+    /// The quote of a string still open at the end of the last line.
+    quote: u8 = 0,
+
+    fn feed(self: *Nesting, line: []const u8) void {
+        var i: usize = 0;
+        while (i < line.len) {
+            const c = line[i];
+            if (self.quote != 0) {
+                if (c == '\\' and self.quote == '"') {
+                    i += 2;
+                    continue;
+                }
+                if (c == self.quote) self.quote = 0;
+                i += 1;
+                continue;
+            }
+            const word_start = i == 0 or isSeparator(line[i - 1]);
+            switch (c) {
+                '\\' => {
+                    i += 2;
+                    continue;
+                },
+                '\'', '"' => self.quote = c,
+                '#' => if (word_start) return,
+                '{', '(' => self.depth += 1,
+                '}', ')' => self.depth -|= 1,
+                'a'...'z' => if (word_start) {
+                    var end = i;
+                    while (end < line.len and std.ascii.isAlphanumeric(line[end])) end += 1;
+                    if (end == line.len or isSeparator(line[end])) {
+                        const word = line[i..end];
+                        if (std.mem.eql(u8, word, "then") or std.mem.eql(u8, word, "do")) self.depth += 1;
+                        if (std.mem.eql(u8, word, "fi") or std.mem.eql(u8, word, "done")) self.depth -|= 1;
+                    }
+                    i = end;
+                    continue;
+                },
+                else => {},
+            }
+            i += 1;
+        }
+    }
+
+    fn isSeparator(c: u8) bool {
+        return isBlank(c) or c == ';' or c == '&' or c == '|' or c == '(' or c == ')';
+    }
+};
 
 pub const Editor = struct {
     sh: *Shell,
@@ -131,6 +300,10 @@ pub const Editor = struct {
     /// The in-progress line, stashed when history browsing begins.
     stashed: std.ArrayList(u8) = .empty,
     width: usize = 80,
+    height: usize = 24,
+    /// The first frame row on screen when the frame is taller than the
+    /// screen; kept between frames so the window only scrolls as needed.
+    view_top: usize = 0,
     /// Scratch buffers reused between frames.
     body: std.Io.Writer.Allocating,
     frame: std.Io.Writer.Allocating,
@@ -138,6 +311,9 @@ pub const Editor = struct {
     command_frame_active: bool = false,
     command_cursor_row: usize = 0,
     command_end_row: usize = 0,
+    /// The frame's last line filled its last row, so the cursor at the end
+    /// is already on the row below it.
+    end_wrapped: bool = false,
     /// Set when the last line was cancelled with Ctrl-C.
     interrupted: bool = false,
     /// Set when `term.wake_fd` ended the last edit. The line is kept, and
@@ -145,6 +321,10 @@ pub const Editor = struct {
     woken: bool = false,
 
     prompt_text: []const u8 = "",
+    /// The lines of a multi-line prompt before its last line. They are
+    /// printed once, before editing starts, and again after Ctrl-L clears
+    /// the screen.
+    prompt_head: []const u8 = "",
     write_continuation: ?WriteContinuationPrompt = null,
     /// False for the final frame of a submitted line, which drops hints.
     hints: bool = true,
@@ -205,6 +385,7 @@ pub const Editor = struct {
         self.command_frame_active = false;
         self.command_cursor_row = 0;
         self.command_end_row = 0;
+        self.view_top = 0;
         self.hints = true;
         self.pending_byte = null;
         self.last = .other;
@@ -254,6 +435,8 @@ pub const Editor = struct {
         }
         self.prompt_text = prompt_text;
         self.write_continuation = write_continuation;
+        // The head belongs to this prompt only; `read -e` has none.
+        defer self.prompt_head = "";
 
         if (self.isDumbTerminal() and sys.isTty(self.in_fd)) return self.readDumb(is_complete);
         var raw = term.RawMode.enable(self.in_fd) orelse return self.readPlain(is_complete);
@@ -283,7 +466,11 @@ pub const Editor = struct {
                     self.hints = false;
                     self.render();
                     self.hints = true;
-                    self.write("\r\n");
+                    // A line that filled the last row already moved the
+                    // cursor to a fresh row; another newline would leave a
+                    // blank line before the output.
+                    const below: usize = if (self.end_wrapped) 0 else 1;
+                    if (below == 1) self.write("\r\n");
                     if (is_complete) |check| {
                         if (!check(self.buf.items)) {
                             // Each continuation line starts in vi insert mode.
@@ -291,7 +478,7 @@ pub const Editor = struct {
                             self.buf.append(self.sh.gpa, '\n') catch return null;
                             self.cursor = self.buf.items.len;
                             self.hist_index = null;
-                            self.command_cursor_row = self.command_end_row + 1;
+                            self.command_cursor_row = self.command_end_row + below;
                             self.command_frame_active = true;
                             self.render();
                             continue;
@@ -473,12 +660,18 @@ pub const Editor = struct {
                 'u', 'U' => self.changeWordCase(.upper),
                 'l', 'L' => self.changeWordCase(.lower),
                 'c', 'C' => self.changeWordCase(.capital),
+                // Alt-Enter: a new line at the cursor, without running the
+                // command, as fish does.
+                '\r', '\n' => {
+                    self.insertSlice("\n");
+                    self.this_command = .insert;
+                },
                 else => {},
             },
             .left => self.moveLeft(),
             .right => self.acceptSuggestionOrMoveRight(),
-            .home => self.cursor = 0,
-            .end => self.cursor = self.buf.items.len,
+            .home => self.moveLineStart(),
+            .end => self.moveLineEnd(),
             .delete => self.deleteAtCursor(),
             .word_left => self.moveWordLeft(),
             .word_right => self.moveWordRight(),
@@ -510,16 +703,16 @@ pub const Editor = struct {
             .backward_delete_char => self.deleteBefore(),
             .backward_kill_word => self.killWordBackward(),
             .backward_word => self.moveWordLeft(),
-            .beginning_of_line => self.cursor = 0,
+            .beginning_of_line => self.moveLineStart(),
             .capitalize_word => self.changeWordCase(.capital),
             .clear_screen => self.clearScreen(),
             .complete => self.handleTab(),
             .delete_char => self.deleteAtCursor(),
             .downcase_word => self.changeWordCase(.lower),
-            .end_of_line => self.cursor = self.buf.items.len,
+            .end_of_line => self.moveLineEnd(),
             .forward_char => self.moveRight(),
             .forward_word => self.moveWordRight(),
-            .kill_line => self.killRange(self.cursor, self.buf.items.len, .forward, true),
+            .kill_line => self.killLine(),
             .kill_word => self.killWordForward(),
             .next_history => self.historyNext(),
             .previous_history => self.historyPrev(),
@@ -537,7 +730,7 @@ pub const Editor = struct {
             },
             .transpose_chars => self.transpose(),
             .undo => self.undo(),
-            .unix_line_discard => self.killRange(0, self.cursor, .backward, true),
+            .unix_line_discard => self.killLineBackward(),
             .unix_word_rubout => self.killWordBackwardUnix(),
             .upcase_word => self.changeWordCase(.upper),
             .yank => self.yank(),
@@ -585,12 +778,12 @@ pub const Editor = struct {
             '\r', '\n' => return .accept,
             3 => return self.cancelLine(),
             4 => return self.endOfInput(), // Ctrl-D
-            1 => self.cursor = 0, // Ctrl-A
-            5 => self.cursor = self.buf.items.len, // Ctrl-E
+            1 => self.moveLineStart(), // Ctrl-A
+            5 => self.moveLineEnd(), // Ctrl-E
             2 => self.moveLeft(), // Ctrl-B
             6 => self.moveRight(), // Ctrl-F
-            11 => self.killRange(self.cursor, self.buf.items.len, .forward, true), // Ctrl-K
-            21 => self.killRange(0, self.cursor, .backward, true), // Ctrl-U
+            11 => self.killLine(), // Ctrl-K
+            21 => self.killLineBackward(), // Ctrl-U
             23 => self.killWordBackwardUnix(), // Ctrl-W
             25 => self.yank(), // Ctrl-Y
             31 => self.undo(), // Ctrl-_
@@ -623,6 +816,15 @@ pub const Editor = struct {
 
     /// Ctrl-C: abandon the line and give a fresh prompt.
     pub fn cancelLine(self: *Editor) Outcome {
+        // Redraw with the cursor at the end, without hints, so `^C` follows
+        // the whole command instead of overwriting the lines after the
+        // cursor (Bash also moves to the last row first).
+        if (self.command_frame_active) {
+            self.cursor = self.buf.items.len;
+            self.hints = false;
+            self.render();
+            self.hints = true;
+        }
         self.write("^C\r\n");
         self.buf.clearRetainingCapacity();
         self.cursor = 0;
@@ -634,6 +836,14 @@ pub const Editor = struct {
 
     pub fn clearScreen(self: *Editor) void {
         self.write("\x1b[2J\x1b[H");
+        // Raw mode leaves newlines alone, so each needs its carriage return.
+        var lines = std.mem.splitScalar(u8, self.prompt_head, '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) self.write("\r\n");
+            first = false;
+            self.write(line);
+        }
         self.command_frame_active = false;
         self.command_cursor_row = 0;
     }
@@ -641,8 +851,12 @@ pub const Editor = struct {
     // --- rendering ----------------------------------------------------------
 
     fn updateWidth(self: *Editor) void {
-        if (sys.windowSize(self.out_fd)) |ws| self.width = ws.cols;
+        if (sys.windowSize(self.out_fd)) |ws| {
+            self.width = ws.cols;
+            self.height = ws.rows;
+        }
         if (self.width == 0) self.width = 80;
+        if (self.height == 0) self.height = 24;
     }
 
     fn render(self: *Editor) void {
@@ -672,52 +886,126 @@ pub const Editor = struct {
         return self.visible_scratch.items;
     }
 
-    fn rowsFor(self: *const Editor, columns: usize) usize {
-        if (columns == 0) return 1;
-        return (columns + self.width - 1) / self.width;
+    /// The prompt drawn before logical line `index` of a frame: `first` for
+    /// the first line, after that the continuation prompt, indented by how
+    /// deeply the lines before it nest.
+    fn linePrompt(self: *Editor, first: []const u8, index: usize, nesting: Nesting, scratch: *std.Io.Writer.Allocating) []const u8 {
+        if (index == 0) return first;
+        scratch.writer.end = 0;
+        if (self.write_continuation) |write_prompt| write_prompt(&scratch.writer, self.sh, @max(nesting.depth, 1)) catch {};
+        return scratch.writer.buffered();
+    }
+
+    /// Walks the cursor offsets of a frame (`prompt_text` and then `text`,
+    /// continuation prompts before later lines) in order, with the cell the
+    /// cursor shows on at each. Rendering and vertical motion share it, so
+    /// Up and Down land where the eye expects.
+    const Walk = struct {
+        ed: *Editor,
+        prompt_text: []const u8,
+        text: []const u8,
+        /// The cursor offset the frame makes room for (see `renderFrame`).
+        cursor: usize,
+        width: usize,
+        scratch: std.Io.Writer.Allocating,
+        offset: usize = 0,
+        line_index: usize = 0,
+        line_start: usize = 0,
+        nesting: Nesting = .{},
+        /// Where the text before `offset` ends.
+        before: Pos = .{},
+
+        fn init(ed: *Editor, prompt_text: []const u8, text: []const u8, cursor: usize) Walk {
+            return .{
+                .ed = ed,
+                .prompt_text = prompt_text,
+                .text = text,
+                .cursor = cursor,
+                .width = ed.width,
+                .scratch = .init(ed.sh.gpa),
+                .before = layout(.{}, prompt_text, ed.width, .prompt),
+            };
+        }
+
+        fn deinit(self: *Walk) void {
+            self.scratch.deinit();
+        }
+
+        fn cell(self: *const Walk) Pos {
+            // The end of a full row that has no room after it: the last
+            // cell of that row, after every other.
+            if (!self.roomAfter()) return self.before;
+            return cursorCell(self.before, self.text, self.offset, self.width);
+        }
+
+        /// False at the end of an earlier line that fills its last row
+        /// without the cursor after it, so the next line follows directly.
+        fn roomAfter(self: *const Walk) bool {
+            if (self.offset >= self.text.len or self.text[self.offset] != '\n') return true;
+            return self.before.col < self.width or self.offset == self.cursor;
+        }
+
+        /// Steps to the next cursor offset; false at the end of the text.
+        fn next(self: *Walk) bool {
+            if (self.offset >= self.text.len) return false;
+            if (self.text[self.offset] == '\n') {
+                const end = if (self.roomAfter()) self.before.settled(self.width) else self.before;
+                self.nesting.feed(self.text[self.line_start..self.offset]);
+                self.line_index += 1;
+                self.offset += 1;
+                self.line_start = self.offset;
+                const prompt_text = self.ed.linePrompt(self.prompt_text, self.line_index, self.nesting, &self.scratch);
+                self.before = layout(.{ .row = end.row + 1 }, prompt_text, self.width, .prompt);
+                return true;
+            }
+            const step = layoutStep(self.before, self.text, self.offset, self.width, .buffer);
+            self.before = step.pos;
+            self.offset = step.next;
+            return true;
+        }
+    };
+
+    /// The cell the cursor shows on at `offset` of the edited line.
+    fn cellOf(self: *Editor, offset: usize) Pos {
+        var walk: Walk = .init(self, self.prompt_text, self.buf.items, self.cursor);
+        defer walk.deinit();
+        while (walk.offset < offset and walk.next()) {}
+        return walk.cell();
     }
 
     const Decoration = enum { plain, highlighted, full };
 
+    /// Draws the prompt and `text` with the cursor at `cursor`, replacing
+    /// the previous frame. Positions come from `layout`, which wraps the
+    /// way the terminal does (wide characters included). A line that fills
+    /// its last row exactly gets an empty row after it when the cursor is at
+    /// its end, so the cursor never shows on the following line (or past the
+    /// margin); the last line always has it. A frame taller than the
+    /// screen is drawn as a screen-high window around the cursor, because
+    /// the terminal cannot move the cursor above its top row to redraw it.
     fn renderFrame(self: *Editor, prompt_text: []const u8, text: []const u8, cursor: usize, decoration: Decoration) void {
         self.updateWidth();
         self.frame.writer.end = 0;
+        const width = self.width;
 
         var continuation: std.Io.Writer.Allocating = .init(self.sh.gpa);
         defer continuation.deinit();
 
         var line_start: usize = 0;
         var line_index: usize = 0;
-        var visual_start: usize = 0;
-        var cursor_row: usize = 0;
-        var cursor_col: usize = 0;
-        var cursor_found = false;
-        var end_row: usize = 0;
-        var end_col: usize = 0;
+        var line_pos: Pos = .{};
+        var end: Pos = .{};
+        var nesting: Nesting = .{};
         const multiline = std.mem.indexOfScalar(u8, text, '\n') != null;
         const colour = decoration != .plain and self.sh.config.highlight;
 
-        while (line_start <= text.len) : (line_index += 1) {
+        while (true) : (line_index += 1) {
             const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
             const line = text[line_start..line_end];
-            continuation.writer.end = 0;
-            if (line_index == 0) {
-                tryWrite(&self.frame.writer, prompt_text);
-            } else if (self.write_continuation) |write_prompt| {
-                write_prompt(&continuation.writer, self.sh, line_index) catch {};
-                tryWrite(&self.frame.writer, continuation.writer.buffered());
-            }
-            const prompt_width = if (line_index == 0)
-                displayWidth(prompt_text)
-            else
-                displayWidth(continuation.writer.buffered());
-
-            if (!cursor_found and cursor >= line_start and cursor <= line_end) {
-                const position = prompt_width + wcwidth.width(text[line_start..cursor]);
-                cursor_row = visual_start + position / self.width;
-                cursor_col = position % self.width;
-                cursor_found = true;
-            }
+            const line_prompt = self.linePrompt(prompt_text, line_index, nesting, &continuation);
+            tryWrite(&self.frame.writer, line_prompt);
+            var pos = layout(line_pos, line_prompt, width, .prompt);
+            pos = layout(pos, line, width, .buffer);
 
             const shown = self.visible(line);
             if (colour) {
@@ -726,43 +1014,51 @@ pub const Editor = struct {
                 self.frame.writer.writeAll(shown) catch {};
             }
 
-            const line_width = prompt_width + wcwidth.width(line);
-            if (line_end < text.len) {
-                self.frame.writer.writeAll("\r\n") catch {};
-                visual_start += self.rowsFor(line_width);
-                line_start = line_end + 1;
-                continue;
-            }
-
-            var correction_text: [320]u8 = undefined;
-            const suggestion = if (decoration == .full and !multiline) blk: {
-                if (self.currentCachedCorrection()) |name| {
-                    break :blk std.fmt.bufPrint(&correction_text, "  => {s}", .{name}) catch null;
+            if (line_end == text.len) {
+                var correction_text: [320]u8 = undefined;
+                const suggestion = if (decoration == .full and !multiline) blk: {
+                    if (self.currentCachedCorrection()) |name| {
+                        break :blk std.fmt.bufPrint(&correction_text, "  => {s}", .{name}) catch null;
+                    }
+                    break :blk self.currentSuggestion();
+                } else null;
+                if (suggestion) |hint_text| {
+                    pos = layout(pos, hint_text, width, .buffer);
+                    self.frame.writer.writeAll(if (highlight.colorEnabled(self.sh)) highlight.gray else highlight.dim) catch {};
+                    self.frame.writer.writeAll(self.visible(hint_text)) catch {};
+                    self.frame.writer.writeAll(highlight.reset) catch {};
                 }
-                break :blk self.currentSuggestion();
-            } else null;
-            var hint_width: usize = 0;
-            if (suggestion) |hint_text| {
-                const hint = self.visible(hint_text);
-                hint_width = wcwidth.width(hint_text);
-                self.frame.writer.writeAll(if (highlight.colorEnabled(self.sh)) highlight.gray else highlight.dim) catch {};
-                self.frame.writer.writeAll(hint) catch {};
-                self.frame.writer.writeAll(highlight.reset) catch {};
             }
-
-            const final_width = line_width + hint_width;
-            end_row = visual_start + final_width / self.width;
-            end_col = final_width % self.width;
             // At the exact right margin the terminal has not wrapped yet;
-            // force the wrap so the row arithmetic holds.
-            if (final_width > 0 and end_col == 0) self.frame.writer.writeAll("\r\n") catch {};
-            break;
+            // move to the next row so the row arithmetic holds.
+            const room = pos.col >= width and (line_end == text.len or cursor == line_end);
+            if (room) self.frame.writer.writeAll("\r\n") catch {};
+            self.end_wrapped = room;
+            end = if (room) pos.settled(width) else pos;
+            if (line_end == text.len) break;
+            self.frame.writer.writeAll("\r\n") catch {};
+            nesting.feed(line);
+            line_pos = .{ .row = end.row + 1 };
+            line_start = line_end + 1;
         }
 
-        if (!cursor_found) {
-            cursor_row = end_row;
-            cursor_col = end_col;
+        var walk: Walk = .init(self, prompt_text, text, cursor);
+        defer walk.deinit();
+        while (walk.offset < cursor and walk.next()) {}
+        const cursor_cell = walk.cell();
+
+        // A final frame (hints off: the line was submitted or cancelled) is
+        // drawn whole, so all of it reaches the scrollback.
+        const screen_rows = @max(self.height, 1);
+        var first: usize = 0;
+        var last = end.row;
+        if (self.hints and end.row >= screen_rows) {
+            first = @min(self.view_top, end.row + 1 - screen_rows);
+            if (cursor_cell.row < first) first = cursor_cell.row;
+            if (cursor_cell.row >= first + screen_rows) first = cursor_cell.row + 1 - screen_rows;
+            last = first + screen_rows - 1;
         }
+        self.view_top = first;
 
         self.write("\r");
         if (self.command_frame_active and self.command_cursor_row > 0) {
@@ -771,8 +1067,17 @@ pub const Editor = struct {
             self.write(sequence);
         }
         self.write("\x1b[J");
-        self.write(self.frame.writer.buffered());
+        if (first == 0 and last == end.row) {
+            self.write(self.frame.writer.buffered());
+        } else {
+            self.body.writer.end = 0;
+            writeRows(&self.body.writer, self.frame.writer.buffered(), width, first, last);
+            self.write(self.body.writer.buffered());
+        }
 
+        // Rows are counted from the top of what was drawn from here on.
+        const cursor_row = cursor_cell.row - first;
+        var end_row = last - first;
         self.write("\r");
         var scratch: [64]u8 = undefined;
         if (end_row > cursor_row) {
@@ -782,13 +1087,20 @@ pub const Editor = struct {
             const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}B", .{cursor_row - end_row}) catch "";
             self.write(sequence);
         }
-        if (cursor_col > 0) {
-            const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}C", .{cursor_col}) catch "";
+        if (cursor_cell.col > 0) {
+            const sequence = std.fmt.bufPrint(&scratch, "\x1b[{d}C", .{cursor_cell.col}) catch "";
             self.write(sequence);
         }
 
+        // A whole frame taller than the screen scrolled its top away: the
+        // next redraw can only climb to the top row of the screen.
+        var top_row = cursor_row;
+        if (end_row >= screen_rows) {
+            top_row = (screen_rows - 1) -| (end_row - cursor_row);
+            end_row = top_row + (end_row - cursor_row);
+        }
         self.command_frame_active = true;
-        self.command_cursor_row = cursor_row;
+        self.command_cursor_row = top_row;
         self.command_end_row = end_row;
     }
 
@@ -1014,46 +1326,100 @@ pub const Editor = struct {
         self.cursor = wcwidth.nextCluster(self.buf.items, self.cursor);
     }
 
-    fn moveVertical(self: *Editor, direction: i8) void {
-        const previous_newline = std.mem.lastIndexOfScalar(u8, self.buf.items[0..self.cursor], '\n');
-        const line_start = if (previous_newline) |index| index + 1 else 0;
-        const line_end = std.mem.indexOfScalarPos(u8, self.buf.items, line_start, '\n') orelse self.buf.items.len;
-        const column = wcwidth.width(self.buf.items[line_start..self.cursor]);
-
-        if (direction < 0) {
-            if (line_start == 0) {
-                self.historyPrev();
-                return;
-            }
-            const previous_end = line_start - 1;
-            const previous_start = if (std.mem.lastIndexOfScalar(u8, self.buf.items[0..previous_end], '\n')) |index|
-                index + 1
-            else
-                0;
-            self.cursor = previous_start + byteOffsetAtColumn(self.buf.items[previous_start..previous_end], column);
-            return;
-        }
-
-        if (line_end == self.buf.items.len) {
-            self.historyNext();
-            return;
-        }
-        const next_start = line_end + 1;
-        const next_end = std.mem.indexOfScalarPos(u8, self.buf.items, next_start, '\n') orelse self.buf.items.len;
-        self.cursor = next_start + byteOffsetAtColumn(self.buf.items[next_start..next_end], column);
+    /// Start of the logical line (between newlines) holding `at`.
+    pub fn lineStartOf(self: *const Editor, at: usize) usize {
+        const newline = std.mem.lastIndexOfScalar(u8, self.buf.items[0..at], '\n') orelse return 0;
+        return newline + 1;
     }
 
-    fn byteOffsetAtColumn(text: []const u8, column: usize) usize {
-        var offset: usize = 0;
-        var current_column: usize = 0;
-        while (offset < text.len) {
-            const next = wcwidth.nextCluster(text, offset);
-            const next_column = current_column + wcwidth.width(text[offset..next]);
-            if (next_column > column) break;
-            offset = next;
-            current_column = next_column;
+    /// End of the logical line holding `at`, before its newline.
+    pub fn lineEndOf(self: *const Editor, at: usize) usize {
+        return std.mem.indexOfScalarPos(u8, self.buf.items, at, '\n') orelse self.buf.items.len;
+    }
+
+    /// Home / Ctrl-A: the start of the current line of a multi-line command.
+    fn moveLineStart(self: *Editor) void {
+        self.cursor = self.lineStartOf(self.cursor);
+    }
+
+    /// End / Ctrl-E: the end of the current line. At the end of the command
+    /// it accepts the suggestion, as Right does (and as fish does).
+    fn moveLineEnd(self: *Editor) void {
+        if (self.cursor == self.buf.items.len) {
+            _ = self.acceptSuggestion();
+            return;
         }
-        return offset;
+        self.cursor = self.lineEndOf(self.cursor);
+    }
+
+    /// Ctrl-K: kill to the end of the current line, or join the next line
+    /// when the cursor is already at the end, as Emacs and fish do.
+    fn killLine(self: *Editor) void {
+        const end = self.lineEndOf(self.cursor);
+        const stop = if (end == self.cursor and end < self.buf.items.len) end + 1 else end;
+        self.killRange(self.cursor, stop, .forward, true);
+    }
+
+    /// Ctrl-U: kill back to the start of the current line, or join the
+    /// previous line when the cursor is already at the start.
+    fn killLineBackward(self: *Editor) void {
+        const start = self.lineStartOf(self.cursor);
+        const from = if (start == self.cursor and start > 0) start - 1 else start;
+        self.killRange(from, self.cursor, .backward, true);
+    }
+
+    /// Up / Down: move to the screen row above or below, keeping the column,
+    /// so a wrapped line is walked row by row. From the first or last row,
+    /// or while a recalled history entry is still unedited, browse history
+    /// instead, as fish does; a long recalled command does not have to be
+    /// climbed through to reach the one before it.
+    pub fn moveVertical(self: *Editor, direction: i8) void {
+        if (self.browsingHistory()) {
+            if (direction < 0) self.historyPrev() else self.historyNext();
+            return;
+        }
+        if (self.verticalTarget(direction)) |target| {
+            self.cursor = target;
+        } else if (direction < 0) {
+            self.historyPrev();
+        } else {
+            self.historyNext();
+        }
+    }
+
+    /// True while the line is a history entry shown as it was recalled.
+    fn browsingHistory(self: *Editor) bool {
+        const index = self.hist_index orelse return false;
+        if (index >= self.sh.hist.count()) return false;
+        return std.mem.eql(u8, self.buf.items, self.sh.hist.get(index));
+    }
+
+    /// The offset one screen row up or down from the cursor at the same
+    /// column (or the nearest one the row has), or null on the first or last
+    /// row of the line.
+    pub fn verticalTarget(self: *Editor, direction: i8) ?usize {
+        const here = self.cellOf(self.cursor);
+        var walk: Walk = .init(self, self.prompt_text, self.buf.items, self.cursor);
+        defer walk.deinit();
+        var best: ?usize = null;
+        var best_cell: Pos = .{};
+        while (true) {
+            const cell = walk.cell();
+            const wanted = if (direction < 0) cell.row < here.row else cell.row > here.row;
+            if (wanted) {
+                if (best == null or
+                    (direction < 0 and cell.row > best_cell.row) or
+                    (cell.row == best_cell.row and cell.col <= here.col))
+                {
+                    best = walk.offset;
+                    best_cell = cell;
+                }
+                // Rows only grow: past the row below, nothing nearer follows.
+                if (direction > 0 and cell.row > best_cell.row) break;
+            }
+            if (!walk.next()) break;
+        }
+        return best;
     }
 
     fn wordStartBefore(self: *const Editor, from: usize) usize {
@@ -1348,15 +1714,20 @@ pub const Editor = struct {
     }
 
     fn acceptSuggestionOrMoveRight(self: *Editor) void {
+        if (!self.acceptSuggestion()) self.moveRight();
+    }
+
+    /// Takes the shown correction or history suggestion into the line.
+    fn acceptSuggestion(self: *Editor) bool {
         if (self.currentCachedCorrection()) |command| {
             self.setLine(command);
-            return;
+            return true;
         }
         if (self.currentSuggestion()) |remaining| {
             self.insertSlice(remaining);
-            return;
+            return true;
         }
-        self.moveRight();
+        return false;
     }
 
     fn currentCachedCorrection(self: *Editor) ?[]const u8 {
@@ -1450,6 +1821,12 @@ pub const Editor = struct {
                     else => if (b >= 0x20) {
                         query.append(self.sh.gpa, b) catch {};
                         match_index = self.sh.hist.searchBackwardContains(self.sh.hist.count(), query.items);
+                    } else {
+                        // Another control key ends the search on the match
+                        // and then does its usual job, as in Bash.
+                        self.takeMatch(match_index, at);
+                        _ = self.handleControlOrByte(b);
+                        return;
                     },
                 },
                 .utf8 => |sequence| {
@@ -1457,10 +1834,27 @@ pub const Editor = struct {
                     match_index = self.sh.hist.searchBackwardContains(self.sh.hist.count(), query.items);
                 },
                 .resize => self.updateWidth(),
-                .escape, .eof => return,
+                .eof => return,
+                // Esc keeps the match for editing, and a movement key keeps
+                // it and moves from where the query matched, as in Bash.
+                .escape => {
+                    self.takeMatch(match_index, at);
+                    return;
+                },
+                .left, .right, .up, .down, .home, .end, .word_left, .word_right, .delete => {
+                    self.takeMatch(match_index, at);
+                    _ = self.handleInsertKey(key);
+                    return;
+                },
                 else => {},
             }
         }
+    }
+
+    fn takeMatch(self: *Editor, match_index: ?usize, at: usize) void {
+        const index = match_index orelse return;
+        self.setLine(self.sh.hist.get(index));
+        self.cursor = at;
     }
 };
 
@@ -1765,4 +2159,106 @@ test "control characters render in caret notation" {
 
     try testing.expectEqualStrings("a^Ib", ed.visible("a\tb"));
     try testing.expectEqual(@as(usize, 4), wcwidth.width("a\tb"));
+}
+
+test "layout wraps the way the terminal does" {
+    // A row filled to the margin waits there; the next character wraps.
+    try testing.expectEqual(Pos{ .row = 0, .col = 4 }, layout(.{}, "abcd", 4, .buffer));
+    try testing.expectEqual(Pos{ .row = 1, .col = 1 }, layout(.{}, "abcde", 4, .buffer));
+    try testing.expectEqual(Pos{ .row = 1, .col = 0 }, layout(.{}, "abcd", 4, .buffer).settled(4));
+    // A wide character that does not fit leaves the last column empty.
+    try testing.expectEqual(Pos{ .row = 1, .col = 2 }, layout(.{}, "abc\u{4e2d}", 4, .buffer));
+    // A combining mark takes no room.
+    try testing.expectEqual(Pos{ .row = 0, .col = 2 }, layout(.{}, "e\u{301}z", 4, .buffer));
+    // Caret notation is two characters that wrap independently.
+    try testing.expectEqual(Pos{ .row = 1, .col = 1 }, layout(.{}, "abc\t", 4, .buffer));
+    // A prompt's escape sequences and control bytes take no room.
+    try testing.expectEqual(Pos{ .row = 0, .col = 2 }, layout(.{}, "\x1b[1;32m$\x1b[0m \x1b]0;t\x07", 4, .prompt));
+}
+
+test "the cursor shows on the cell of the character after it" {
+    // Before a wide character that wraps: the start of the next row.
+    const text = "abc\u{4e2d}";
+    try testing.expectEqual(Pos{ .row = 1, .col = 0 }, cursorCell(layout(.{}, text[0..3], 4, .buffer), text, 3, 4));
+    // At the end of a full row: the start of the next one.
+    try testing.expectEqual(Pos{ .row = 1, .col = 0 }, cursorCell(layout(.{}, "abcd", 4, .buffer), "abcd", 4, 4));
+    try testing.expectEqual(Pos{ .row = 0, .col = 2 }, cursorCell(layout(.{}, "ab", 4, .buffer), "abcd", 2, 4));
+}
+
+test "writeRows keeps the window and every escape sequence" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // Rows: "abcd" | "ef" | "gh" | "ij".
+    writeRows(&out.writer, "abcdef\r\n\x1b[1mgh\r\nij", 4, 1, 2);
+    try testing.expectEqualStrings("ef\r\n\x1b[1mgh\r", out.writer.buffered());
+}
+
+test "continuation prompts indent by open blocks" {
+    var nesting: Nesting = .{};
+    nesting.feed("if true {");
+    try testing.expectEqual(@as(usize, 1), nesting.depth);
+    nesting.feed("for x in a b; do # a { in a comment");
+    try testing.expectEqual(@as(usize, 2), nesting.depth);
+    nesting.feed("echo \"} (\" '{' done=1 ${#x}");
+    try testing.expectEqual(@as(usize, 2), nesting.depth);
+    nesting.feed("done; }");
+    try testing.expectEqual(@as(usize, 0), nesting.depth);
+    nesting.feed("fi )");
+    try testing.expectEqual(@as(usize, 0), nesting.depth);
+    nesting.feed("echo 'open");
+    nesting.feed("{ still quoted' {");
+    try testing.expectEqual(@as(usize, 1), nesting.depth);
+}
+
+test "up and down move by screen row in a wrapped line" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    try sh.hist.add(sh.gpa, "echo old");
+    var ed = Editor.init(&sh, -1, -1);
+    defer ed.deinit();
+    ed.width = 10;
+    ed.prompt_text = "$ ";
+
+    // Rows: "$ echo aaa" | "aaaaaaaaaa" | "aaa".
+    ed.setLine("echo aaaaaaaaaaaaaaaa");
+    ed.moveVertical(-1);
+    try testing.expectEqual(@as(usize, 11), ed.cursor);
+    ed.moveVertical(-1);
+    try testing.expectEqual(@as(usize, 1), ed.cursor);
+    ed.moveVertical(1);
+    try testing.expectEqual(@as(usize, 11), ed.cursor);
+    // The last row is shorter: the cursor goes to its end.
+    ed.cursor = 15;
+    ed.moveVertical(1);
+    try testing.expectEqual(ed.buf.items.len, ed.cursor);
+    // From the first row, Up browses history, and keeps browsing while the
+    // recalled entry is unedited.
+    ed.cursor = 3;
+    ed.moveVertical(-1);
+    try testing.expectEqualStrings("echo old", ed.buf.items);
+    ed.moveVertical(1);
+    try testing.expectEqualStrings("echo aaaaaaaaaaaaaaaa", ed.buf.items);
+}
+
+test "line keys act on the current line of a multi-line command" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+    var ed = Editor.init(&sh, -1, -1);
+    defer ed.deinit();
+
+    ed.setLine("if true {\necho one\n}");
+    ed.cursor = 12;
+    _ = ed.handleKey(.{ .byte = 1 }); // Ctrl-A
+    try testing.expectEqual(@as(usize, 10), ed.cursor);
+    _ = ed.handleKey(.{ .byte = 5 }); // Ctrl-E
+    try testing.expectEqual(@as(usize, 18), ed.cursor);
+    _ = ed.handleKey(.{ .byte = 11 }); // Ctrl-K at the end joins the next line
+    try testing.expectEqualStrings("if true {\necho one}", ed.buf.items);
+    ed.cursor = 15;
+    _ = ed.handleKey(.{ .byte = 21 }); // Ctrl-U kills to the line start
+    try testing.expectEqualStrings("if true {\none}", ed.buf.items);
+    _ = ed.handleKey(.{ .byte = 21 }); // and then joins the previous line
+    try testing.expectEqualStrings("if true {one}", ed.buf.items);
+    _ = ed.handleKey(.{ .alt = '\r' }); // Alt-Enter splits it again
+    try testing.expectEqualStrings("if true {\none}", ed.buf.items);
 }

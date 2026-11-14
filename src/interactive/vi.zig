@@ -156,18 +156,18 @@ fn command(ed: *Editor, c: u8) Outcome {
             enterInsert(ed);
         },
         'I' => {
-            ed.cursor = 0;
+            ed.cursor = ed.lineStartOf(ed.cursor);
             enterInsert(ed);
         },
         'A' => {
-            ed.cursor = len;
+            ed.cursor = ed.lineEndOf(ed.cursor);
             enterInsert(ed);
         },
         'x' => ed.killRange(ed.cursor, advance(ed.buf.items, ed.cursor, n), .forward, false),
         'X' => ed.killRange(retreat(ed.buf.items, ed.cursor, n), ed.cursor, .backward, false),
-        'D' => ed.killRange(ed.cursor, len, .forward, false),
+        'D' => ed.killRange(ed.cursor, ed.lineEndOf(ed.cursor), .forward, false),
         'C' => {
-            ed.killRange(ed.cursor, len, .forward, false);
+            ed.killRange(ed.cursor, ed.lineEndOf(ed.cursor), .forward, false);
             enterInsert(ed);
         },
         'S' => {
@@ -187,11 +187,18 @@ fn command(ed: *Editor, c: u8) Outcome {
         'p' => put(ed, n, true),
         'P' => put(ed, n, false),
         'u' => ed.undo(),
-        'k', '-' => {
+        // j and k move by screen row in a multi-line or wrapped command and
+        // browse history from its first or last row, as zsh's vi mode does.
+        'k', 'j' => for (0..n) |_| {
+            const index = ed.hist_index;
+            ed.moveVertical(if (c == 'k') -1 else 1);
+            if (!std.meta.eql(index, ed.hist_index)) ed.cursor = 0;
+        },
+        '-' => {
             for (0..n) |_| ed.historyPrev();
             ed.cursor = 0;
         },
-        'j', '+' => {
+        '+' => {
             for (0..n) |_| ed.historyNext();
             ed.cursor = 0;
         },
@@ -215,6 +222,10 @@ fn clampCursor(ed: *Editor) void {
     if (ed.vi.mode != .normal) return;
     const len = ed.buf.items.len;
     if (len > 0 and ed.cursor >= len) ed.cursor = wcwidth.prevCluster(ed.buf.items, len);
+    // Nor on the newline that ends a line of a multi-line command.
+    if (ed.cursor < len and ed.buf.items[ed.cursor] == '\n' and ed.cursor > ed.lineStartOf(ed.cursor)) {
+        ed.cursor = wcwidth.prevCluster(ed.buf.items, ed.cursor);
+    }
 }
 
 // --- motions ------------------------------------------------------------------
@@ -295,9 +306,13 @@ fn motion(ed: *Editor, c: u8, n: usize, for_operator: bool) ?Motion {
     switch (c) {
         'h', 0x7f, 0x08 => pos = retreat(text, pos, n),
         'l', ' ' => pos = advance(text, pos, n),
-        '0' => pos = 0,
-        '^' => pos = firstNonBlank(text),
-        '$' => pos = text.len,
+        // Line motions act on the current line of a multi-line command.
+        '0' => pos = ed.lineStartOf(pos),
+        '^' => {
+            const start = ed.lineStartOf(pos);
+            pos = start + firstNonBlank(text[start..ed.lineEndOf(pos)]);
+        },
+        '$' => pos = ed.lineEndOf(pos),
         'w', 'W' => for (0..n) |_| {
             pos = nextWordStart(text, pos, c == 'W');
         },

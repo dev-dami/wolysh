@@ -474,10 +474,11 @@ fn runRepl(sh: *Shell, gpa: std.mem.Allocator, no_config: bool) u8 {
         prompt.write(&prompt_allocating.writer, sh) catch {};
         prompt_allocating.writer.writeAll(session.promptEnd()) catch {};
         // The editor redraws only the prompt's last line, so earlier lines of
-        // a multi-line prompt are printed once, up front.
+        // a multi-line prompt are printed once, up front (and again by Ctrl-L).
         const full_prompt = prompt_allocating.writer.buffered();
         const last_line = if (std.mem.lastIndexOfScalar(u8, full_prompt, '\n')) |newline| newline + 1 else 0;
         sys.writeStr(2, full_prompt[0..last_line]);
+        editor_state.prompt_head = full_prompt[0..last_line];
         const source = editor_state.readCommand(
             full_prompt[last_line..],
             exec.isComplete,

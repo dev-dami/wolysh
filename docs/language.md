@@ -153,11 +153,14 @@ run exited non-zero is suggested only when no successful command matches.
 
 | Key | Action |
 | --- | --- |
-| Up / Down | Browse history |
-| `Ctrl-R` | Search history |
+| Up / Down | Move up or down a screen row; browse history from the first or last row |
+| `Ctrl-P` / `Ctrl-N` | Browse history |
+| `Ctrl-R` | Search history (Esc or an arrow key keeps the match for editing) |
 | Tab | Complete commands, paths, and variables |
-| Right / End | Accept suggestion or move right |
-| `Ctrl-A` / `Ctrl-E` | Start / end of line |
+| Right | Accept suggestion or move right |
+| Home / End, `Ctrl-A` / `Ctrl-E` | Start / end of the current line; End and `Ctrl-E` at the end accept the suggestion |
+| `Ctrl-U` / `Ctrl-K` | Kill to the start / end of the current line |
+| Alt-Enter | Insert a new line without running the command |
 | `Ctrl-C` / `Ctrl-D` | Cancel line / exit on empty input |
 | `Ctrl-Z` | Suspend the foreground job |
 
