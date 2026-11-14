@@ -348,7 +348,7 @@ pub fn complete(sh: *Shell, arena: Allocator, line: []const u8, cursor: usize) !
                 for (matches) |match| try items.append(arena, try std.fmt.allocPrint(arena, "{s} ", .{match.name}));
             }
         }
-        try completePaths(sh, arena, ctx.raw, .all, &items);
+        try completePaths(sh, arena, ctx.raw, .runnable, &items);
     } else {
         sort = try completeArgument(sh, arena, line, cursor, ctx, &items, &kind);
     }
@@ -618,7 +618,11 @@ fn visible(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
 
 // --- paths -------------------------------------------------------------------------------
 
-const PathKind = enum { all, dirs };
+/// Which entries a path completion offers. `runnable` is for a command
+/// position: directories, and executables once the word names a directory
+/// (`./run`), since only then can a file there run. A plain file never can,
+/// as fish also judges.
+const PathKind = enum { all, dirs, runnable };
 
 fn entryIsDir(arena: Allocator, dir: []const u8, entry: fs.Entry) bool {
     switch (entry.kind) {
@@ -655,6 +659,11 @@ fn completePaths(sh: *Shell, arena: Allocator, raw: []const u8, kind: PathKind, 
         if (!startsWithIgnoreCase(entry.name, base)) continue;
         const is_dir = entryIsDir(arena, dir, entry);
         if (kind == .dirs and !is_dir) continue;
+        if (kind == .runnable and !is_dir) {
+            if (slash == null) continue;
+            const full = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, entry.name }, 0);
+            if (!fs.isExecutable(full)) continue;
+        }
 
         const name = if (quote_char) |q| try quoteInside(arena, entry.name, q) else try quote(arena, entry.name);
         const suffix: []const u8 = if (is_dir) "/" else if (quote_char) |q| (if (q == '"') "\" " else "' ") else " ";
@@ -1561,6 +1570,30 @@ test "completion finds files and commands" {
     const dirs = try complete(&sh, arena, "cd s", 4);
     try testing.expectEqual(@as(usize, 1), dirs.items.len);
     try testing.expectEqualStrings("src/", dirs.items[0]);
+}
+
+test "a command position offers directories and runnable files, not plain files" {
+    var sh = try Shell.initBare(testing.allocator);
+    defer sh.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // README.md cannot run, so it is not offered as a command.
+    for ((try complete(&sh, arena, "READ", 4)).items) |item| {
+        try testing.expect(!std.mem.startsWith(u8, item, "README"));
+    }
+    // A directory still is, to reach what is inside it.
+    var found_src = false;
+    for ((try complete(&sh, arena, "sr", 2)).items) |item| {
+        if (std.mem.eql(u8, item, "src/")) found_src = true;
+    }
+    try testing.expect(found_src);
+    // Inside a directory, only executables and directories.
+    for ((try complete(&sh, arena, "./src/l", 7)).items) |item| {
+        try testing.expect(!std.mem.endsWith(u8, item, ".zig "));
+    }
 }
 
 test "completion of variables" {

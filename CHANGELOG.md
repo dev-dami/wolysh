@@ -26,6 +26,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   terminal width, is capped at about a third of the screen with an
   "…and N more" row, and is erased as soon as another key is pressed, so a
   second Tab no longer prints the list again.
+- Completing a command name no longer offers plain files such as
+  `README.md`, which cannot run. Directories are still offered, and inside a
+  directory (`./`) so are executables, as fish does.
 
 - Inline suggestions rank history by context. Among commands that start with
   what you typed, wsh prefers one entered in the current directory right after
