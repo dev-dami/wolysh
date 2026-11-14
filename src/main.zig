@@ -567,8 +567,9 @@ fn recordHistory(sh: *Shell, source: []const u8, reported: *bool) ?[]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(sh.gpa);
     defer arena_state.deinit();
     const control_text = prompt.textVar(sh, arena_state.allocator(), "HISTCONTROL") catch null;
-    const entry = (sh.hist.recordEntered(sh.gpa, source, history.Control.parse(control_text), sh.cwd) catch return null) orelse return null;
-    if (sh.history_path.len == 0) return entry;
+    const entered = (sh.hist.recordEntered(sh.gpa, source, history.Control.parse(control_text), sh.cwd) catch return null) orelse return null;
+    const entry = entered.entry;
+    if (sh.history_path.len == 0 or !entered.fresh) return entry;
     sh.hist.appendToFile(sh.gpa, sh.history_path, entry) catch {
         if (reported.*) return entry;
         reported.* = true;

@@ -27,6 +27,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `eval` skips a leading `--` and rejects other options, as Bash does. Among
   other things, this makes `eval "$(starship init bash)"` start without an
   error.
+- Shells sharing a history file take turns changing it. Before, a shell
+  trimming the file could drop a command another shell had just saved.
 
 ## [0.6.0] - 2026-10-31
 

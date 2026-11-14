@@ -80,6 +80,11 @@ pub fn fingerprint(text: []const u8) u32 {
     return if (hash == 0) 1 else hash;
 }
 
+/// What `recordEntered` did with a line: `entry` is the stored entry to pass
+/// to `finishEntered`; it is `fresh` when the line was added rather than
+/// matched to the entry it repeats.
+pub const Entered = struct { entry: []const u8, fresh: bool };
+
 pub const History = struct {
     /// Oldest first, like the history file.
     entries: std.ArrayList([]u8) = .empty,
@@ -155,17 +160,32 @@ pub const History = struct {
     /// the directory, the previous command's fingerprint and a sequence
     /// number for its status line. A line that is not kept still becomes the
     /// previous command.
-    pub fn recordEntered(self: *History, allocator: std.mem.Allocator, line: []const u8, control: Control, cwd: []const u8) !?[]const u8 {
+    pub fn recordEntered(self: *History, allocator: std.mem.Allocator, line: []const u8, control: Control, cwd: []const u8) !?Entered {
         const prev = self.last_fp;
         self.last_fp = fingerprint(std.mem.trim(u8, line, " \t\r\n"));
-        const entry = (try self.record(allocator, line, control)) orelse return null;
+        const entry = (try self.record(allocator, line, control)) orelse {
+            // An immediate repeat that `ignoredups` skipped still ran: its
+            // status goes to the entry it repeats, as `load` lets a repeat in
+            // the file stand for its latest run.
+            if (!self.isRepeat(line, control)) return null;
+            return .{ .entry = self.entries.items[self.entries.items.len - 1], .fresh = false };
+        };
         const m = &self.meta.items[self.meta.items.len - 1];
         m.cwd = if (cwd.len == 0) "" else try allocator.dupe(u8, cwd);
         m.prev = prev;
         self.last_seq +%= 1;
         if (self.last_seq == 0) self.last_seq = 1;
         m.seq = self.last_seq;
-        return entry;
+        return .{ .entry = entry, .fresh = true };
+    }
+
+    /// True when `record` skipped `line` only because it repeats the newest
+    /// entry.
+    fn isRepeat(self: *const History, line: []const u8, control: Control) bool {
+        if (!control.ignoredups or self.entries.items.len == 0) return false;
+        if (control.ignorespace and line.len != 0 and (line[0] == ' ' or line[0] == '\t')) return false;
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        return trimmed.len != 0 and std.mem.eql(u8, self.entries.items[self.entries.items.len - 1], trimmed);
     }
 
     /// Notes how the entered `entry` ended and, when it went to the history
@@ -298,7 +318,7 @@ pub const History = struct {
         if (start >= self.entries.items.len) return;
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
-        for (start..self.entries.items.len) |index| try writeEntryLine(allocator, &out, self.entries.items[index], self.metaForCopy(index));
+        for (start..self.entries.items.len) |index| try self.writeCopy(allocator, &out, index);
         try appendRaw(allocator, path, out.items);
     }
 
@@ -307,26 +327,27 @@ pub const History = struct {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         try out.appendSlice(allocator, header ++ "\n");
-        for (self.entries.items, 0..) |entry, index| {
-            const m = self.metaForCopy(index);
-            try writeEntryLine(allocator, &out, entry, m);
-            if (m.failed) try out.appendSlice(allocator, "=\t1\t0\n");
-        }
+        for (0..self.entries.items.len) |index| try self.writeCopy(allocator, &out, index);
+        const lock = lockFor(allocator, path);
+        defer unlock(lock);
         try replaceFile(allocator, path, out.items);
     }
 
-    /// An entry's metadata for writing outside the live append path. The
-    /// sequence number is dropped, since no status line will follow; a known
-    /// failure is kept as an untagged status line instead (see `writeFile`).
-    fn metaForCopy(self: *const History, index: usize) Meta {
-        var m = self.meta.items[index];
-        m.seq = 0;
-        return m;
+    /// Entry `index` for a copy of the history: its line, tag included so the
+    /// status of a command still running finds it (`history -w; false`),
+    /// then a known failure as an untagged status line. Only the failure is
+    /// kept, as that is all ranking uses.
+    fn writeCopy(self: *const History, allocator: std.mem.Allocator, out: *std.ArrayList(u8), index: usize) !void {
+        const m = self.meta.items[index];
+        try writeEntryLine(allocator, out, self.entries.items[index], m);
+        if (m.failed) try out.appendSlice(allocator, "=\t1\t0\n");
     }
 
     /// Rewrites the file with its newest `limit` entries, re-reading it first
     /// so entries other shells appended are kept.
     pub fn trimFile(self: *History, allocator: std.mem.Allocator, path: []const u8) Error!void {
+        const lock = lockFor(allocator, path);
+        defer unlock(lock);
         const data = (readFile(allocator, path) catch return error.HistoryFileUnwritable) orelse return;
         defer allocator.free(data);
         var lines = try fileLines(allocator, data);
@@ -334,6 +355,17 @@ pub const History = struct {
         const start = lines.list.items.len -| self.limit;
         try rewriteLines(allocator, path, &lines, start, null);
         self.file_entries = lines.list.items.len - start;
+    }
+
+    /// The newest entry after `index` with the same text, or null.
+    fn newestCopy(self: *const History, index: usize) ?usize {
+        const text = self.entries.items[index];
+        var j = self.entries.items.len;
+        while (j > index + 1) {
+            j -= 1;
+            if (std.mem.eql(u8, self.entries.items[j], text)) return j;
+        }
+        return null;
     }
 
     /// Index of the newest entry at or before `before` that starts with
@@ -369,8 +401,8 @@ pub const History = struct {
         // best[failed * 3 + tier]
         var best = [_]?usize{null} ** 6;
         // The newest occurrence of each matching text decides whether it
-        // failed; older copies follow it. Bounded, so a huge history stays
-        // cheap; past the bound a copy is judged on its own run.
+        // failed; older copies follow it. The newest 64 texts are cached;
+        // past that, newer entries are searched for the text.
         var newest: [64]usize = undefined;
         var newest_len: usize = 0;
         var i = self.entries.items.len;
@@ -389,9 +421,11 @@ pub const History = struct {
                     break;
                 }
             }
-            if (!seen and newest_len < newest.len) {
-                newest[newest_len] = i;
-                newest_len += 1;
+            if (!seen) {
+                if (newest_len < newest.len) {
+                    newest[newest_len] = i;
+                    newest_len += 1;
+                } else if (self.newestCopy(i)) |n| failed = self.meta.items[n].failed;
             }
             const same_dir = m.cwd.len != 0 and std.mem.eql(u8, m.cwd, cwd);
             const same_prev = self.last_fp != 0 and m.prev == self.last_fp;
@@ -618,6 +652,10 @@ fn appendRaw(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) 
     if (bytes.len == 0) return;
     const z = try allocator.dupeZ(u8, path);
     defer allocator.free(z);
+    // Under the lock, the format check and an upgrade's read and replace
+    // cannot interleave with another shell's append.
+    const lock = lockFor(allocator, path);
+    defer unlock(lock);
 
     var converted = false;
     while (true) {
@@ -659,7 +697,7 @@ pub fn appendEntries(allocator: std.mem.Allocator, path: []const u8, entries: []
     try appendRaw(allocator, path, out.items);
 }
 
-/// Rewrites a v2 or plain file as v3.
+/// Rewrites a v2 or plain file as v3. The caller holds the lock.
 fn upgrade(allocator: std.mem.Allocator, path: []const u8) Error!void {
     const data = (readFile(allocator, path) catch return error.HistoryFileUnwritable) orelse return;
     defer allocator.free(data);
@@ -675,6 +713,8 @@ pub fn forgetInFile(allocator: std.mem.Allocator, path: []const u8, texts: []con
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const lock = lockFor(allocator, path);
+    defer unlock(lock);
     const data = (readFile(arena, path) catch return error.HistoryFileUnwritable) orelse return 0;
     var lines = try fileLines(arena, data);
     const total = lines.list.items.len;
@@ -703,6 +743,8 @@ pub fn writeEntries(allocator: std.mem.Allocator, path: []const u8, entries: []c
     defer out.deinit(allocator);
     try out.appendSlice(allocator, header ++ "\n");
     for (entries) |entry| try writeEntryLine(allocator, &out, entry, .{});
+    const lock = lockFor(allocator, path);
+    defer unlock(lock);
     try replaceFile(allocator, path, out.items);
 }
 
@@ -728,6 +770,34 @@ fn rewriteLines(allocator: std.mem.Allocator, path: []const u8, lines: *const Li
         }
     }
     try replaceFile(allocator, path, out.items);
+}
+
+/// Takes an exclusive `flock` on the directory holding the history file at
+/// `path`, so shells change the file one at a time: appends, upgrades and
+/// rewrites all go through it, and a rewrite cannot drop an entry another
+/// shell appended after the rewrite read the file. The directory is locked
+/// rather than the file, which a rewrite replaces, or a lock file, which
+/// would litter the directory. Null when it cannot be locked; the caller
+/// goes on unlocked, as before.
+fn lockFor(allocator: std.mem.Allocator, path: []const u8) ?i32 {
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const z = allocator.dupeZ(u8, dir) catch return null;
+    defer allocator.free(z);
+    const rc = linux.openat(linux.AT.FDCWD, z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    while (true) switch (linux.errno(linux.flock(fd, std.posix.LOCK.EX))) {
+        .SUCCESS => return fd,
+        .INTR => continue,
+        else => {
+            _ = linux.close(fd);
+            return null;
+        },
+    };
+}
+
+fn unlock(lock: ?i32) void {
+    if (lock) |fd| _ = linux.close(fd);
 }
 
 /// Replaces the file through a temporary file and `rename`, so readers and a
@@ -853,7 +923,7 @@ test "suggestions rank by directory, previous command and status" {
 
     // Entered in /srv after `cd /srv`, in /srv after something else, and in /tmp.
     _ = try h.recordEntered(a, "cd /srv", .{}, "/home");
-    const after_cd = (try h.recordEntered(a, "make deploy", .{}, "/srv")).?;
+    const after_cd = (try h.recordEntered(a, "make deploy", .{}, "/srv")).?.entry;
     try h.finishEntered(a, "", after_cd, 0, 5);
     _ = try h.recordEntered(a, "ls", .{}, "/srv");
     _ = try h.recordEntered(a, "make test", .{}, "/srv");
@@ -878,9 +948,9 @@ test "a command whose latest run failed is suggested last" {
     var h = History{};
     defer h.deinit(a);
 
-    const ok = (try h.recordEntered(a, "git push origin", .{}, "/r")).?;
+    const ok = (try h.recordEntered(a, "git push origin", .{}, "/r")).?.entry;
     try h.finishEntered(a, "", ok, 0, 1);
-    const typo = (try h.recordEntered(a, "git psuh", .{}, "/r")).?;
+    const typo = (try h.recordEntered(a, "git psuh", .{}, "/r")).?.entry;
     try h.finishEntered(a, "", typo, 1, 1);
     try std.testing.expectEqualStrings("git push origin", h.get(h.suggest("git p", "/r", .context).?));
     // Failed but alone: still offered.
@@ -889,10 +959,10 @@ test "a command whose latest run failed is suggested last" {
     // An older successful copy follows the newest run's failure.
     var g = History{};
     defer g.deinit(a);
-    const first = (try g.recordEntered(a, "npm test", .{}, "/w")).?;
+    const first = (try g.recordEntered(a, "npm test", .{}, "/w")).?.entry;
     try g.finishEntered(a, "", first, 0, 1);
     _ = try g.recordEntered(a, "npm install", .{}, "/x");
-    const again = (try g.recordEntered(a, "npm test", .{}, "/w")).?;
+    const again = (try g.recordEntered(a, "npm test", .{}, "/w")).?.entry;
     try g.finishEntered(a, "", again, 1, 1);
     try std.testing.expectEqualStrings("npm install", g.get(g.suggest("npm ", "/w", .context).?));
 }
@@ -917,10 +987,10 @@ test "v3 history keeps metadata and status lines across rewrites" {
     var w = History{};
     defer w.deinit(a);
     try w.load(a, path);
-    const entry = (try w.recordEntered(a, "make\ttest", .{}, "/a\tdir")).?;
+    const entry = (try w.recordEntered(a, "make\ttest", .{}, "/a\tdir")).?.entry;
     try w.appendToFile(a, path, entry);
     try w.finishEntered(a, path, entry, 2, 40);
-    const done = (try w.recordEntered(a, "echo done", .{}, "/b")).?;
+    const done = (try w.recordEntered(a, "echo done", .{}, "/b")).?.entry;
     try w.appendToFile(a, path, done);
 
     var r = History{};
@@ -950,4 +1020,166 @@ test "v3 history keeps metadata and status lines across rewrites" {
     try again.load(a, path);
     try std.testing.expect(again.meta.items[2].failed);
     try std.testing.expectEqualStrings("/a\tdir", again.meta.items[2].cwd);
+}
+
+/// A scratch directory for a file test, removed with its files.
+const TestDir = struct {
+    dir_buf: [128]u8 = undefined,
+    path_buf: [192]u8 = undefined,
+    dir: []const u8 = "",
+
+    fn init(self: *TestDir, name: []const u8) !void {
+        self.dir = try std.fmt.bufPrint(&self.dir_buf, "zig-cache-history-{s}-{d}", .{ name, sys.getpid() });
+        var z_buf: [160]u8 = undefined;
+        const z = try std.fmt.bufPrintZ(&z_buf, "{s}", .{self.dir});
+        _ = linux.mkdirat(linux.AT.FDCWD, z.ptr, 0o700);
+    }
+
+    fn file(self: *TestDir, name: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(&self.path_buf, "{s}/{s}", .{ self.dir, name });
+    }
+
+    fn deinit(self: *TestDir, names: []const []const u8) void {
+        var buf: [192]u8 = undefined;
+        for (names) |name| if (std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ self.dir, name })) |p| {
+            _ = fs.removeFile(p);
+        } else |_| {};
+        if (std.fmt.bufPrintZ(&buf, "{s}", .{self.dir})) |top| _ = linux.unlinkat(linux.AT.FDCWD, top.ptr, linux.AT.REMOVEDIR) else |_| {}
+    }
+};
+
+test "a skipped repeat still records how it ended" {
+    const a = std.testing.allocator;
+    var t = TestDir{};
+    try t.init("repeat");
+    defer t.deinit(&.{"history"});
+    const path = try a.dupe(u8, try t.file("history"));
+    defer a.free(path);
+
+    var h = History{};
+    defer h.deinit(a);
+    const first = (try h.recordEntered(a, "make", .{}, "/w")).?;
+    try std.testing.expect(first.fresh);
+    try h.appendToFile(a, path, first.entry);
+    try h.finishEntered(a, path, first.entry, 0, 1);
+    // The repeat is not stored again, but its failure counts.
+    const repeat = (try h.recordEntered(a, "make", .{}, "/w")).?;
+    try std.testing.expect(!repeat.fresh);
+    try std.testing.expectEqual(@as(usize, 1), h.count());
+    try h.finishEntered(a, path, repeat.entry, 2, 1);
+    try std.testing.expect(h.meta.items[0].failed);
+
+    var r = History{};
+    defer r.deinit(a);
+    try r.load(a, path);
+    try std.testing.expectEqual(@as(usize, 1), r.count());
+    try std.testing.expect(r.meta.items[0].failed);
+}
+
+test "copies of the history keep failures and the live entry's tag" {
+    const a = std.testing.allocator;
+    var t = TestDir{};
+    try t.init("copies");
+    defer t.deinit(&.{ "history", "backup" });
+    const path = try a.dupe(u8, try t.file("history"));
+    defer a.free(path);
+    const backup = try a.dupe(u8, try t.file("backup"));
+    defer a.free(backup);
+
+    var h = History{};
+    defer h.deinit(a);
+    const bad = (try h.recordEntered(a, "false", .{}, "/w")).?;
+    try h.appendToFile(a, path, bad.entry);
+    try h.finishEntered(a, path, bad.entry, 1, 1);
+
+    // `history -a backup` keeps the failure.
+    try h.appendRangeToFile(a, backup, 0);
+    var b = History{};
+    defer b.deinit(a);
+    try b.load(a, backup);
+    try std.testing.expect(b.meta.items[0].failed);
+
+    // `history -w; false`: the line is rewritten while it runs, and its
+    // status still finds it.
+    const live = (try h.recordEntered(a, "history -w; false", .{}, "/w")).?;
+    try h.appendToFile(a, path, live.entry);
+    try h.writeFile(a, path);
+    try h.finishEntered(a, path, live.entry, 1, 1);
+    var r = History{};
+    defer r.deinit(a);
+    try r.load(a, path);
+    try std.testing.expectEqual(@as(usize, 2), r.count());
+    try std.testing.expect(r.meta.items[0].failed);
+    try std.testing.expect(r.meta.items[1].failed);
+}
+
+test "a command's latest failure counts however many other matches are newer" {
+    const a = std.testing.allocator;
+    var h = History{};
+    defer h.deinit(a);
+
+    const ok = (try h.recordEntered(a, "c ok", .{}, "/w")).?;
+    try h.finishEntered(a, "", ok.entry, 0, 1);
+    _ = try h.recordEntered(a, "ls", .{}, "/x");
+    const bad = (try h.recordEntered(a, "c ok", .{}, "/x")).?;
+    try h.finishEntered(a, "", bad.entry, 1, 1);
+    var i: usize = 0;
+    while (i < 70) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const e = (try h.recordEntered(a, try std.fmt.bufPrint(&buf, "c {d}", .{i}), .{}, "/z")).?;
+        try h.finishEntered(a, "", e.entry, 0, 1);
+    }
+    try std.testing.expectEqualStrings("c 69", h.get(h.suggest("c ", "/w", .context).?));
+}
+
+test "shells appending while the file is upgraded lose nothing" {
+    const a = std.testing.allocator;
+    var t = TestDir{};
+    try t.init("race");
+    defer t.deinit(&.{"history"});
+    const path = try a.dupe(u8, try t.file("history"));
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+
+    const shells = 8;
+    const each = 40;
+    var round: usize = 0;
+    while (round < 5) : (round += 1) {
+        // A big v2 file makes the upgrade's read and replace slow enough to
+        // race with the other shells' appends.
+        var seed: std.ArrayList(u8) = .empty;
+        defer seed.deinit(a);
+        try seed.appendSlice(a, header_v2 ++ "\n");
+        for (0..2000) |n| try seed.print(a, "seed {d}\n", .{n});
+        try std.testing.expect(fs.writeFile(path_z, seed.items));
+
+        var pids: [shells]linux.pid_t = undefined;
+        for (&pids, 0..) |*pid, s| {
+            const rc = linux.fork();
+            if (rc == 0) {
+                var h = History{ .limit = 1_000_000 };
+                var ok = true;
+                for (0..each) |n| {
+                    var buf: [32]u8 = undefined;
+                    const line = std.fmt.bufPrint(&buf, "shell {d} {d}", .{ s, n }) catch unreachable;
+                    h.appendToFile(std.heap.page_allocator, path, line) catch {
+                        ok = false;
+                    };
+                }
+                linux.exit(if (ok) 0 else 1);
+            }
+            pid.* = @intCast(rc);
+        }
+        for (pids) |pid| {
+            var status: u32 = 0;
+            _ = linux.wait4(pid, &status, 0, null);
+            try std.testing.expectEqual(@as(u32, 0), status);
+        }
+
+        var r = History{ .limit = 1_000_000 };
+        defer r.deinit(a);
+        try r.load(a, path);
+        try std.testing.expectEqual(@as(usize, 2000 + shells * each), r.count());
+    }
 }
